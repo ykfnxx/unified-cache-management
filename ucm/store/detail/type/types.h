@@ -32,6 +32,7 @@ namespace UC::Detail {
 
 using BlockId = std::array<std::byte, 16>; /* 16-byte block hash */
 using TaskHandle = std::size_t;            /* Opaque task token (0 = invalid) */
+using TensorType = std::size_t;            /* Logical token-layer tensor type */
 
 /**
  * @brief Hasher of BlockId
@@ -63,6 +64,26 @@ struct TaskDesc : std::vector<Shard> {
     using vector::vector; /* Inherit all ctors */
     std::string brief;    /* Description of Task */
     /** Optional: prerequisite handle for dump. Cache stream waits before D2H. */
+    uintptr_t prerequisiteHandle{0};
+};
+
+/**
+ * @brief Describes one token-layer tensor item.
+ */
+struct TokenLayerShard {
+    BlockId owner;              /* Parent block identifier */
+    std::size_t layer;          /* Layer index inside the block */
+    std::size_t tokenOffset;    /* Token offset inside the block */
+    TensorType tensorType;      /* Logical tensor type, e.g. K or V */
+    std::vector<void*> addrs;   /* Source or destination tensor addresses */
+};
+
+/**
+ * @brief Batch descriptor for token-layer load or dump operations.
+ */
+struct TokenLayerTaskDesc : std::vector<TokenLayerShard> {
+    using vector::vector; /* Inherit all ctors */
+    std::string brief;    /* Description of Task */
     uintptr_t prerequisiteHandle{0};
 };
 

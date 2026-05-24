@@ -87,6 +87,20 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
         flat = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
         self.store_.Prefetch(flat)
 
+    def lookup_tokens_on_layer(
+        self,
+        block_ids: List[bytes],
+        layer_ids: List[int],
+        token_offsets: List[int],
+        tensor_types: List[int],
+    ) -> List[bool]:
+        ids = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
+        layers = array.array("Q", layer_ids)
+        offsets = array.array("Q", token_offsets)
+        types = array.array("Q", tensor_types)
+        res = self.store_.LookupTokens(ids, layers, offsets, types)
+        return np.frombuffer(res, dtype=bool)
+
     def _tensor_normalize(self, tensors: List[List[torch.Tensor]]) -> np.ndarray:
         n_rows = len(tensors)
         n_cols = len(tensors[0])
@@ -135,6 +149,25 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
         task_id = self.store_.Load(ids, indexes, addrs)
         return UcmPipelineStoreTransTask(task_id)
 
+    def load_tokens_on_layer(
+        self,
+        block_ids: List[bytes],
+        layer_ids: List[int],
+        token_offsets: List[int],
+        tensor_types: List[int],
+        dst_addr: List[List[int]] | np.ndarray,
+    ) -> Task:
+        ids = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
+        layers = array.array("Q", layer_ids)
+        offsets = array.array("Q", token_offsets)
+        types = array.array("Q", tensor_types)
+        if isinstance(dst_addr, np.ndarray):
+            addrs = dst_addr
+        else:
+            addrs = np.array(dst_addr, dtype=np.uint64)
+        task_id = self.store_.LoadTokens(ids, layers, offsets, types, addrs)
+        return UcmPipelineStoreTransTask(task_id)
+
     def dump_data(
         self,
         block_ids: List[bytes],
@@ -149,6 +182,26 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
         else:
             addrs = np.array(src_addr, dtype=np.uint64)
         task_id = self.store_.Dump(ids, indexes, addrs, prerequisite_handle)
+        return UcmPipelineStoreTransTask(task_id)
+
+    def dump_tokens_on_layer(
+        self,
+        block_ids: List[bytes],
+        layer_ids: List[int],
+        token_offsets: List[int],
+        tensor_types: List[int],
+        src_addr: List[List[int]] | np.ndarray,
+        prerequisite_handle: int = 0,
+    ) -> Task:
+        ids = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
+        layers = array.array("Q", layer_ids)
+        offsets = array.array("Q", token_offsets)
+        types = array.array("Q", tensor_types)
+        if isinstance(src_addr, np.ndarray):
+            addrs = src_addr
+        else:
+            addrs = np.array(src_addr, dtype=np.uint64)
+        task_id = self.store_.DumpTokens(ids, layers, offsets, types, addrs, prerequisite_handle)
         return UcmPipelineStoreTransTask(task_id)
 
     def wait(self, task: Task) -> None:
@@ -247,6 +300,25 @@ def _cache_fake_pipeline_builder(
     pipeline.Stack("Cache", str(store_dir / "cache/libcachestore.so"), config)
 
 
+def _memory_empty_pipeline_builder(
+    config: Dict[str, object], pipeline: ucmpipelinestore.PipelineStore
+):
+    store_dir = Path(__file__).resolve().parent.parent
+    pipeline.Stack("Empty", str(store_dir / "empty/libemptystore.so"), config)
+    pipeline.Stack("Memory", str(store_dir / "memory/libmemorystore.so"), config)
+
+
+def _memory_posix_pipeline_builder(
+    config: Dict[str, object], pipeline: ucmpipelinestore.PipelineStore
+):
+    store_dir = Path(__file__).resolve().parent.parent
+    posix_config = copy.deepcopy(config)
+    if config.get("device_id", -1) >= 0:
+        posix_config |= {"tensor_size": config["shard_size"]}
+    pipeline.Stack("Posix", str(store_dir / "posix/libposixstore.so"), posix_config)
+    pipeline.Stack("Memory", str(store_dir / "memory/libmemorystore.so"), config)
+
+
 UcmPipelineStoreBuilder.register("Cache|Ds3fs", _cache_ds3fs_pipeline_builder)
 UcmPipelineStoreBuilder.register("Cache|Empty", _cache_empty_pipeline_builder)
 UcmPipelineStoreBuilder.register("Cache|Posix", _cache_posix_pipeline_builder)
@@ -257,3 +329,5 @@ UcmPipelineStoreBuilder.register(
     "Cache|Compress|Posix", _build_cache_compress_posix_pipeline
 )
 UcmPipelineStoreBuilder.register("Cache|Fake", _cache_fake_pipeline_builder)
+UcmPipelineStoreBuilder.register("Memory|Empty", _memory_empty_pipeline_builder)
+UcmPipelineStoreBuilder.register("Memory|Posix", _memory_posix_pipeline_builder)

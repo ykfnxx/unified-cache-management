@@ -108,6 +108,17 @@ public:
     virtual void Prefetch(const Detail::BlockId* blocks, size_t num) = 0;
 
     /**
+     * @brief Check whether token-layer tensor items exist in storage.
+     *
+     * Implementations that do not support token-layer access return
+     * Status::Unsupported() by default.
+     */
+    virtual Expected<std::vector<uint8_t>> LookupTokens(const Detail::TokenLayerTaskDesc& task)
+    {
+        return Status::Unsupported();
+    }
+
+    /**
      * @brief Start an asynchronous load (storage → device) transfer.
      *
      * @param task Description of shards to be loaded.
@@ -118,6 +129,14 @@ public:
     virtual Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) = 0;
 
     /**
+     * @brief Start an asynchronous token-layer load transfer.
+     */
+    virtual Expected<Detail::TaskHandle> LoadTokens(Detail::TokenLayerTaskDesc task)
+    {
+        return Status::Unsupported();
+    }
+
+    /**
      * @brief Start an asynchronous dump (device → storage) transfer.
      *
      * @param task Description of shards to be stored.
@@ -126,6 +145,14 @@ public:
      *   - On failure: relevant Status code.
      */
     virtual Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) = 0;
+
+    /**
+     * @brief Start an asynchronous token-layer dump transfer.
+     */
+    virtual Expected<Detail::TaskHandle> DumpTokens(Detail::TokenLayerTaskDesc task)
+    {
+        return Status::Unsupported();
+    }
 
     /**
      * @brief Poll for task completion without blocking.

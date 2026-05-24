@@ -92,6 +92,63 @@ class PipelineStore {
         }
         return desc;
     }
+    static Detail::TokenLayerTaskDesc MakeTokenLayerTaskDesc(const pybind11::buffer& ids,
+                                                             const pybind11::buffer& layers,
+                                                             const pybind11::buffer& tokenOffsets,
+                                                             const pybind11::buffer& tensorTypes,
+                                                             const pybind11::buffer& addrs)
+    {
+        BufferArrayView<Detail::BlockId> idArr{ids};
+        BufferArrayView<size_t> layerArr{layers};
+        BufferArrayView<size_t> tokenOffsetArr{tokenOffsets};
+        BufferArrayView<Detail::TensorType> tensorTypeArr{tensorTypes};
+        Buffer2DArrayView<void*> addrArr{addrs};
+        if (idArr.num != layerArr.num || idArr.num != tokenOffsetArr.num ||
+            idArr.num != tensorTypeArr.num || idArr.num != addrArr.rows) {
+            ThrowIfFailed(Status::InvalidParam("invalid dim: {},{},{},{},{}", idArr.num,
+                                               layerArr.num, tokenOffsetArr.num,
+                                               tensorTypeArr.num, addrArr.rows));
+        }
+        Detail::TokenLayerTaskDesc desc;
+        desc.reserve(idArr.num);
+        for (size_t i = 0; i < idArr.num; i++) {
+            Detail::TokenLayerShard shard;
+            shard.owner = *idArr[i];
+            shard.layer = *layerArr[i];
+            shard.tokenOffset = *tokenOffsetArr[i];
+            shard.tensorType = *tensorTypeArr[i];
+            shard.addrs.assign(addrArr[i], addrArr[i] + addrArr.cols);
+            desc.push_back(std::move(shard));
+        }
+        return desc;
+    }
+    static Detail::TokenLayerTaskDesc MakeTokenLayerLookupDesc(const pybind11::buffer& ids,
+                                                               const pybind11::buffer& layers,
+                                                               const pybind11::buffer& tokenOffsets,
+                                                               const pybind11::buffer& tensorTypes)
+    {
+        BufferArrayView<Detail::BlockId> idArr{ids};
+        BufferArrayView<size_t> layerArr{layers};
+        BufferArrayView<size_t> tokenOffsetArr{tokenOffsets};
+        BufferArrayView<Detail::TensorType> tensorTypeArr{tensorTypes};
+        if (idArr.num != layerArr.num || idArr.num != tokenOffsetArr.num ||
+            idArr.num != tensorTypeArr.num) {
+            ThrowIfFailed(Status::InvalidParam("invalid dim: {},{},{},{}", idArr.num,
+                                               layerArr.num, tokenOffsetArr.num,
+                                               tensorTypeArr.num));
+        }
+        Detail::TokenLayerTaskDesc desc;
+        desc.reserve(idArr.num);
+        for (size_t i = 0; i < idArr.num; i++) {
+            Detail::TokenLayerShard shard;
+            shard.owner = *idArr[i];
+            shard.layer = *layerArr[i];
+            shard.tokenOffset = *tokenOffsetArr[i];
+            shard.tensorType = *tensorTypeArr[i];
+            desc.push_back(std::move(shard));
+        }
+        return desc;
+    }
 
 public:
     ~PipelineStore()
@@ -134,12 +191,35 @@ public:
         BufferArrayView<Detail::BlockId> idArr{ids};
         StoreBack()->Prefetch(idArr.data, idArr.num);
     }
+    pybind11::bytes LookupTokens(const pybind11::buffer& ids, const pybind11::buffer& layers,
+                                 const pybind11::buffer& tokenOffsets,
+                                 const pybind11::buffer& tensorTypes)
+    {
+        auto desc = MakeTokenLayerLookupDesc(ids, layers, tokenOffsets, tensorTypes);
+        auto res = StoreBack()->LookupTokens(desc);
+        if (res) {
+            auto& v = res.Value();
+            return pybind11::bytes(reinterpret_cast<const char*>(v.data()), v.size());
+        }
+        throw std::runtime_error{res.Error().ToString()};
+    }
     Detail::TaskHandle Load(const pybind11::buffer& ids, const pybind11::buffer& indexes,
                             const pybind11::buffer& addrs)
     {
         auto desc = MakeTaskDesc(ids, indexes, addrs);
         desc.brief = "Load";
         auto res = StoreBack()->Load(std::move(desc));
+        if (res) { return res.Value(); }
+        throw std::runtime_error{res.Error().ToString()};
+    }
+    Detail::TaskHandle LoadTokens(const pybind11::buffer& ids, const pybind11::buffer& layers,
+                                  const pybind11::buffer& tokenOffsets,
+                                  const pybind11::buffer& tensorTypes,
+                                  const pybind11::buffer& addrs)
+    {
+        auto desc = MakeTokenLayerTaskDesc(ids, layers, tokenOffsets, tensorTypes, addrs);
+        desc.brief = "LoadTokens";
+        auto res = StoreBack()->LoadTokens(std::move(desc));
         if (res) { return res.Value(); }
         throw std::runtime_error{res.Error().ToString()};
     }
@@ -150,6 +230,19 @@ public:
         desc.brief = "Dump";
         desc.prerequisiteHandle = prerequisite_handle;
         auto res = StoreBack()->Dump(desc);
+        if (res) { return res.Value(); }
+        throw std::runtime_error{res.Error().ToString()};
+    }
+    Detail::TaskHandle DumpTokens(const pybind11::buffer& ids, const pybind11::buffer& layers,
+                                  const pybind11::buffer& tokenOffsets,
+                                  const pybind11::buffer& tensorTypes,
+                                  const pybind11::buffer& addrs,
+                                  uintptr_t prerequisite_handle = 0)
+    {
+        auto desc = MakeTokenLayerTaskDesc(ids, layers, tokenOffsets, tensorTypes, addrs);
+        desc.brief = "DumpTokens";
+        desc.prerequisiteHandle = prerequisite_handle;
+        auto res = StoreBack()->DumpTokens(std::move(desc));
         if (res) { return res.Value(); }
         throw std::runtime_error{res.Error().ToString()};
     }
@@ -186,10 +279,20 @@ PYBIND11_MODULE(ucmpipelinestore, m)
     s.def("Lookup", &PipelineStore::Lookup, py::arg("ids").noconvert());
     s.def("LookupOnPrefix", &PipelineStore::LookupOnPrefix, py::arg("ids").noconvert());
     s.def("Prefetch", &PipelineStore::Prefetch, py::arg("ids").noconvert());
+    s.def("LookupTokens", &PipelineStore::LookupTokens, py::arg("ids").noconvert(),
+          py::arg("layers").noconvert(), py::arg("token_offsets").noconvert(),
+          py::arg("tensor_types").noconvert());
     s.def("Load", &PipelineStore::Load, py::arg("ids").noconvert(), py::arg("indexes").noconvert(),
           py::arg("addrs").noconvert());
+    s.def("LoadTokens", &PipelineStore::LoadTokens, py::arg("ids").noconvert(),
+          py::arg("layers").noconvert(), py::arg("token_offsets").noconvert(),
+          py::arg("tensor_types").noconvert(), py::arg("addrs").noconvert());
     s.def("Dump", &PipelineStore::Dump, py::arg("ids").noconvert(), py::arg("indexes").noconvert(),
           py::arg("addrs").noconvert(), py::arg("prerequisite_handle") = 0);
+    s.def("DumpTokens", &PipelineStore::DumpTokens, py::arg("ids").noconvert(),
+          py::arg("layers").noconvert(), py::arg("token_offsets").noconvert(),
+          py::arg("tensor_types").noconvert(), py::arg("addrs").noconvert(),
+          py::arg("prerequisite_handle") = 0);
     s.def("Check", &PipelineStore::Check);
     s.def("Wait", &PipelineStore::Wait);
 }

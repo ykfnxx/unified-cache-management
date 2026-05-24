@@ -6,6 +6,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(UCM_ROOT_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+if(APPLE AND NOT CMAKE_OSX_SYSROOT)
+    execute_process(
+        COMMAND xcrun --show-sdk-path
+        OUTPUT_VARIABLE UCM_APPLE_SDK_PATH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(UCM_APPLE_SDK_PATH)
+        set(CMAKE_OSX_SYSROOT ${UCM_APPLE_SDK_PATH} CACHE PATH "macOS SDK path" FORCE)
+    endif()
+endif()
+if(APPLE AND CMAKE_OSX_SYSROOT)
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-isystem${CMAKE_OSX_SYSROOT}/usr/include/c++/v1>")
+endif()
 
 option(BUILD_UCM_STORE "build ucm store module." ON)
 option(BUILD_UCM_SPARSE "build ucm sparse module." OFF)
@@ -30,9 +44,13 @@ if(BUILD_UCM_MINDIE)
     add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=${UCM_CXX11_ABI})
 endif()
 
-set(FLAGS_PUBLIC "-Wall -Werror -fPIC -Wl,-z,relro,-z,now")
+set(FLAGS_PUBLIC "-Wall -Werror -fPIC")
+if(NOT APPLE)
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,relro,-z,now -s")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-z,relro,-z,now -s")
+endif()
 set(FLAGS_DEBUG "-O0 -g")
-set(FLAGS_RELEASE "-s -O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2")
+set(FLAGS_RELEASE "-O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2")
 string(TOLOWER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_LOWER)
 if(CMAKE_BUILD_TYPE_LOWER STREQUAL "debug")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FLAGS_PUBLIC} ${FLAGS_DEBUG}")

@@ -137,7 +137,7 @@ std::shared_ptr<spdlog::logger> Logger::Make()
     const std::string envLevel = name + "_LOGGER_LEVEL";
     try {
         auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-        auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+        auto file_sink = std::make_shared<spdlog::sinks::compress_rotating_file_sink_mt>(
             log_path, this->max_size_, this->max_files_);
         std::vector<spdlog::sink_ptr> sinks;
         sinks.push_back(console_sink);

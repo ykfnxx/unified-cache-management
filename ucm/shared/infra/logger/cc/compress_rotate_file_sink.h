@@ -21,8 +21,8 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
-#ifndef UNIFIEDCACHE_INFRA_LOGGER_SPDLOG_rotating_file_sink_H
-#define UNIFIEDCACHE_INFRA_LOGGER_SPDLOG_rotating_file_sink_H
+#ifndef UNIFIEDCACHE_INFRA_LOGGER_COMPRESS_ROTATING_FILE_SINK_H
+#define UNIFIEDCACHE_INFRA_LOGGER_COMPRESS_ROTATING_FILE_SINK_H
 
 #include <chrono>
 #include <fstream>
@@ -31,7 +31,7 @@
 #include <spdlog/details/null_mutex.h>
 #include <spdlog/details/os.h>
 #include <spdlog/details/synchronous_factory.h>
-#include <spdlog/sinks/rotating_file_sink.h>
+#include <spdlog/sinks/base_sink.h>
 #include <string>
 #include <vector>
 #include <zlib.h>
@@ -39,13 +39,14 @@
 namespace spdlog {
 namespace sinks {
 
-template <>
-class rotating_file_sink<std::mutex> final : public base_sink<std::mutex> {
+template <typename Mutex>
+class compress_rotating_file_sink final : public base_sink<Mutex> {
 public:
     static constexpr size_t MaxFiles = 200000;
-    SPDLOG_INLINE rotating_file_sink(filename_t base_filename, std::size_t max_size,
-                                     std::size_t max_files, bool rotate_on_open = false,
-                                     const file_event_handlers &event_handlers = {})
+    SPDLOG_INLINE compress_rotating_file_sink(filename_t base_filename, std::size_t max_size,
+                                              std::size_t max_files,
+                                              bool rotate_on_open = false,
+                                              const file_event_handlers &event_handlers = {})
         : base_filename_(std::move(base_filename)),
           max_size_(max_size),
           max_files_(max_files),
@@ -76,7 +77,7 @@ private:
     SPDLOG_INLINE void sink_it_(const details::log_msg &msg)
     {
         memory_buf_t formatted;
-        base_sink<std::mutex>::formatter_->format(msg, formatted);
+        base_sink<Mutex>::formatter_->format(msg, formatted);
         auto new_size = current_size_ + formatted.size();
 
         if (new_size > max_size_) {
@@ -196,8 +197,8 @@ private:
     std::vector<filename_t> compressed_files_;
 };
 
-using rotating_file_sink_mt = rotating_file_sink<std::mutex>;
-using rotating_file_sink_st = rotating_file_sink<details::null_mutex>;
+using compress_rotating_file_sink_mt = compress_rotating_file_sink<std::mutex>;
+using compress_rotating_file_sink_st = compress_rotating_file_sink<details::null_mutex>;
 
 }  // namespace sinks
 
@@ -211,7 +212,7 @@ std::shared_ptr<logger> compress_rotating_logger_mt(const std::string &logger_na
                                                     bool rotate_on_open = false,
                                                     const file_event_handlers &event_handlers = {})
 {
-    return Factory::template create<sinks::rotating_file_sink_mt>(
+    return Factory::template create<sinks::compress_rotating_file_sink_mt>(
         logger_name, filename, max_file_size, max_files, rotate_on_open, event_handlers);
 }
 
@@ -222,7 +223,7 @@ std::shared_ptr<logger> compress_rotating_logger_st(const std::string &logger_na
                                                     bool rotate_on_open = false,
                                                     const file_event_handlers &event_handlers = {})
 {
-    return Factory::template create<sinks::rotating_file_sink_st>(
+    return Factory::template create<sinks::compress_rotating_file_sink_st>(
         logger_name, filename, max_file_size, max_files, rotate_on_open, event_handlers);
 }
 }  // namespace spdlog

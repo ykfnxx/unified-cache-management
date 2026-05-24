@@ -25,7 +25,10 @@
 #define UNIFIEDCACHE_INFRA_CPU_AFFINITY_H
 
 #include <cerrno>
+#if defined(__linux__)
 #include <sched.h>
+#endif
+#include <sys/types.h>
 #include <thread>
 #include <vector>
 #include "status/status.h"
@@ -34,6 +37,7 @@ namespace UC {
 
 class CpuAffinity {
 public:
+#if defined(__linux__)
     static Status SetCpuAffinity4CurrentThread(const cpu_set_t& mask)
     {
         if (CPU_COUNT(&mask) == 0) { return Status::InvalidParam(); }
@@ -42,12 +46,19 @@ public:
         std::this_thread::yield();
         return Status::OK();
     }
+#endif
     static Status SetCpuAffinity4CurrentThread(const std::vector<ssize_t> cores)
     {
+#if defined(__linux__)
         cpu_set_t mask;
         CPU_ZERO(&mask);
         for (const auto core : cores) { CPU_SET(core, &mask); }
         return SetCpuAffinity4CurrentThread(mask);
+#else
+        if (cores.empty()) { return Status::InvalidParam(); }
+        std::this_thread::yield();
+        return Status::OK();
+#endif
     }
 };
 

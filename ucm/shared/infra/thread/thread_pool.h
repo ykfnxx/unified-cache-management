@@ -31,9 +31,14 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#if defined(__APPLE__)
+#include <pthread.h>
+#elif defined(__linux__)
 #include <sys/syscall.h>
-#include <thread>
 #include <unistd.h>
+#endif
+#include <sys/types.h>
+#include <thread>
 #include <vector>
 #include "cpu_affinity.h"
 
@@ -198,7 +203,7 @@ private:
     }
     void WorkerLoop(std::promise<bool>& prom, std::shared_ptr<Worker> worker)
     {
-        worker->tid = syscall(SYS_gettid);
+        worker->tid = CurrentThreadId();
         WorkerArgs args = nullptr;
         auto success = true;
         if (this->initFn_) { success = this->initFn_(args); }
@@ -226,6 +231,19 @@ private:
             worker->tp.store({}, std::memory_order_relaxed);
         }
         if (this->exitFn_) { this->exitFn_(args); }
+    }
+
+    static ssize_t CurrentThreadId()
+    {
+#if defined(__linux__)
+        return static_cast<ssize_t>(syscall(SYS_gettid));
+#elif defined(__APPLE__)
+        uint64_t tid = 0;
+        (void)pthread_threadid_np(nullptr, &tid);
+        return static_cast<ssize_t>(tid);
+#else
+        return 0;
+#endif
     }
 
     void MonitorLoop()

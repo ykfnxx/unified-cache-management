@@ -22,20 +22,16 @@ class DumpQueue {
     using WaiterPtr = std::shared_ptr<Latch>;
     using TaskPair = std::pair<TaskPtr, WaiterPtr>;
     using TaskIdSet = HashSet<Detail::TaskHandle>;
+    struct BackendShard {
+        Detail::BlockId block{};
+        size_t layer{0};
+        std::vector<std::byte> full{};
+    };
     struct DumpTask {
         Detail::TaskHandle taskHandle;
-        Detail::TaskDesc hostTask;
-        Detail::TokenLayerTaskDesc hostTokenTask;
-        std::vector<std::byte> hostBuffer;
+        Detail::TaskHandle backendTaskHandle{0};
+        std::vector<BackendShard> backendShards;
         WaiterPtr waiter;
-    };
-    struct CopyTask {
-        Detail::TaskHandle taskHandle;
-        std::vector<size_t> sizes;
-        std::vector<void*> deviceAddrs;
-        bool waitPrerequisite{false};
-        uintptr_t prerequisiteHandle{0};
-        DumpTask dumpTask;
     };
 
 public:
@@ -44,35 +40,32 @@ public:
     void Submit(TaskPtr task, WaiterPtr waiter);
 
 private:
-    void DispatchStage();
+    void DispatchStage(std::promise<Status>& started);
     void DispatchOneTask(TaskPair&& pair);
-    void TransferStage(std::promise<Status>& started);
-    void TransferOneTask(CopyTask&& task);
+    Status DumpTaskDesc(TaskPtr task, WaiterPtr waiter);
+    Status DumpTokenTaskDesc(TaskPtr task, WaiterPtr waiter);
     Status SetupTransferStreams();
     std::shared_ptr<Trans::Stream> NextStream() noexcept;
     Status WaitEventOnStreams(void* event) noexcept;
     Status SynchronizeStreams() noexcept;
     void BackendDumpStage();
-    Status DeviceToHostGatherAsync(std::shared_ptr<Trans::Stream> stream, void** device,
-                                   const std::vector<size_t>& sizes, void* host);
 
 private:
     alignas(64) std::atomic_bool stop_{false};
     TaskIdSet* failureSet_{nullptr};
     TransBuffer* buffer_{nullptr};
+    StoreV1* backend_{nullptr};
     int32_t deviceId_{0};
+    size_t shardSize_{0};
     std::vector<size_t> tensorSizes_{};
     std::unordered_map<Detail::TensorType, std::vector<size_t>> tensorSizesByType_{};
     size_t streamNumber_{1};
     bool useGdr_{false};
     std::vector<ssize_t> cpuAffinityCores_{};
     SpscRingQueue<TaskPair> waiting_;
-    SpscRingQueue<CopyTask> running_;
     SpscRingQueue<DumpTask> dumping_;
     std::thread dispatcher_;
-    std::thread transfer_;
     std::thread dumper_;
-    std::vector<DumpTask> holder_;
     size_t streamIndex_{0};
     std::vector<std::shared_ptr<Trans::Stream>> streams_;
 };

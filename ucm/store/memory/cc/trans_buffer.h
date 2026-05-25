@@ -62,6 +62,8 @@ public:
     Status ReadFull(const BlockId& block, size_t layer, std::vector<std::byte>& full);
     Status ReadToken(const Detail::TokenLayerShard& item, std::vector<std::byte>& data);
     Status CommitFull(const BlockId& block, size_t layer, const std::vector<std::byte>& full);
+    Status CommitToken(const Detail::TokenLayerShard& item, const std::vector<std::byte>& data,
+                       std::vector<std::byte>* full = nullptr);
     Status Load(Detail::TaskDesc& task);
     Status Dump(const Detail::TaskDesc& task);
     Status LoadTokens(Detail::TokenLayerTaskDesc& task);

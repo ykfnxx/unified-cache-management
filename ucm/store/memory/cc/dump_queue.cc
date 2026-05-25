@@ -15,25 +15,12 @@ size_t Sum(const std::vector<size_t>& sizes)
 {
     return std::accumulate(sizes.begin(), sizes.end(), size_t{0});
 }
-
-std::vector<void*> BuildHostAddrs(std::vector<std::byte>& buffer, const std::vector<size_t>& sizes)
-{
-    std::vector<void*> addrs;
-    addrs.reserve(sizes.size());
-    size_t offset = 0;
-    for (const auto size : sizes) {
-        addrs.push_back(buffer.data() + offset);
-        offset += size;
-    }
-    return addrs;
-}
 }  // namespace
 
 DumpQueue::~DumpQueue()
 {
     stop_.store(true);
     if (dispatcher_.joinable()) { dispatcher_.join(); }
-    if (transfer_.joinable()) { transfer_.join(); }
     if (dumper_.joinable()) { dumper_.join(); }
 }
 
@@ -41,21 +28,20 @@ Status DumpQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
 {
     failureSet_ = failureSet;
     buffer_ = buffer;
+    backend_ = config.storeBackend;
     deviceId_ = config.deviceId;
+    shardSize_ = config.shardSize;
     tensorSizes_ = config.tensorSizes;
     tensorSizesByType_ = config.tensorSizesByType;
     streamNumber_ = config.streamNumber;
     useGdr_ = config.useGdr;
     cpuAffinityCores_ = config.cpuAffinityCores;
     waiting_.Setup(config.waitingQueueDepth);
-    running_.Setup(config.runningQueueDepth);
     dumping_.Setup(config.runningQueueDepth);
-    holder_.reserve(1024);
-    dispatcher_ = std::thread{&DumpQueue::DispatchStage, this};
+    dumper_ = std::thread{&DumpQueue::BackendDumpStage, this};
     std::promise<Status> started;
     auto fut = started.get_future();
-    transfer_ = std::thread{&DumpQueue::TransferStage, this, std::ref(started)};
-    dumper_ = std::thread{&DumpQueue::BackendDumpStage, this};
+    dispatcher_ = std::thread{&DumpQueue::DispatchStage, this, std::ref(started)};
     return fut.get();
 }
 
@@ -69,10 +55,13 @@ void DumpQueue::Submit(TaskPtr task, WaiterPtr waiter)
     waiter->Done();
 }
 
-void DumpQueue::DispatchStage()
+void DumpQueue::DispatchStage(std::promise<Status>& started)
 {
+    auto s = SetupTransferStreams();
+    started.set_value(s);
+    if (s.Failure()) { return; }
     if (!cpuAffinityCores_.empty()) {
-        auto s = CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
+        s = CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
         if (s.Failure()) { UC_WARN("Failed({}) to set affinity.", s); }
     }
     waiting_.ConsumerLoop(stop_, &DumpQueue::DispatchOneTask, this);
@@ -86,97 +75,145 @@ void DumpQueue::DispatchOneTask(TaskPair&& pair)
         waiter->Done();
         return;
     }
-    if (task->type == TransTask::Type::DUMP) {
-        const auto nShard = task->desc.size();
-        if (nShard == 0) {
-            waiter->Done();
-            return;
-        }
-        for (size_t i = 0; i < nShard; ++i) {
-            const auto& shard = task->desc[i];
-            DumpTask dumpTask;
-            dumpTask.taskHandle = task->id;
-            dumpTask.hostTask.brief = task->desc.brief;
-            dumpTask.hostBuffer.resize(Sum(tensorSizes_));
-            auto hostAddrs = BuildHostAddrs(dumpTask.hostBuffer, tensorSizes_);
-            dumpTask.hostTask.push_back({shard.owner, shard.index, hostAddrs});
-            dumpTask.waiter = (i + 1 < nShard) ? nullptr : waiter;
-            running_.Push({task->id, tensorSizes_, shard.addrs,
-                           i == 0 && task->desc.prerequisiteHandle != 0,
-                           task->desc.prerequisiteHandle, std::move(dumpTask)});
-        }
-        return;
+    auto s = task->type == TransTask::Type::DUMP ? DumpTaskDesc(task, waiter)
+                                                 : DumpTokenTaskDesc(task, waiter);
+    if (s.Success()) { return; }
+    UC_ERROR("Failed({}) to run memory dump task({}).", s, task->id);
+    failureSet_->Insert(task->id);
+    waiter->Done();
+}
+
+Status DumpQueue::DumpTaskDesc(TaskPtr task, WaiterPtr waiter)
+{
+    const auto nShard = task->desc.size();
+    if (nShard == 0) {
+        waiter->Done();
+        return Status::OK();
+    }
+    if (task->desc.prerequisiteHandle != 0) {
+        auto s = WaitEventOnStreams(reinterpret_cast<void*>(task->desc.prerequisiteHandle));
+        if (s.Failure()) { return s; }
     }
 
+    DumpTask dumpTask;
+    dumpTask.taskHandle = task->id;
+    dumpTask.waiter = waiter;
+    dumpTask.backendShards.reserve(nShard);
+    for (const auto& shard : task->desc) {
+        BackendShard backendShard;
+        backendShard.block = shard.owner;
+        backendShard.layer = shard.index;
+        backendShard.full.resize(shardSize_);
+        size_t offset = 0;
+        for (size_t i = 0; i < tensorSizes_.size(); ++i) {
+            auto stream = NextStream();
+            if (!stream) { return Status::Error("invalid memory dump stream"); }
+            auto pHost = static_cast<void*>(backendShard.full.data() + offset);
+            auto s = stream->DeviceToHostAsync(shard.addrs[i], pHost, tensorSizes_[i]);
+            if (s.Failure()) { return s; }
+            offset += tensorSizes_[i];
+        }
+        dumpTask.backendShards.push_back(std::move(backendShard));
+    }
+    auto s = SynchronizeStreams();
+    if (s.Failure()) { return s; }
+
+    Detail::TaskDesc backendTask;
+    backendTask.brief = "Memory2Backend";
+    for (auto& shard : dumpTask.backendShards) {
+        s = buffer_->CommitFull(shard.block, shard.layer, shard.full);
+        if (s.Failure()) { return s; }
+        if (!backend_) { continue; }
+        backendTask.push_back({shard.block, shard.layer, {shard.full.data()}});
+    }
+    if (backendTask.empty()) {
+        waiter->Done();
+        return Status::OK();
+    }
+    auto res = backend_->Dump(std::move(backendTask));
+    if (!res) { return res.Error(); }
+    dumpTask.backendTaskHandle = res.Value();
+    dumping_.Push(std::move(dumpTask));
+    return Status::OK();
+}
+
+Status DumpQueue::DumpTokenTaskDesc(TaskPtr task, WaiterPtr waiter)
+{
     const auto nItem = task->tokenDesc.size();
     if (nItem == 0) {
         waiter->Done();
-        return;
+        return Status::OK();
     }
-    for (size_t i = 0; i < nItem; ++i) {
-        const auto& item = task->tokenDesc[i];
-        const auto& sizes = tensorSizesByType_.at(item.tensorType);
-        DumpTask dumpTask;
-        dumpTask.taskHandle = task->id;
-        dumpTask.hostTokenTask.brief = task->tokenDesc.brief;
-        dumpTask.hostBuffer.resize(Sum(sizes));
-        auto hostAddrs = BuildHostAddrs(dumpTask.hostBuffer, sizes);
-        dumpTask.hostTokenTask.push_back(
-            {item.owner, item.layer, item.tokenOffset, item.tensorType, hostAddrs});
-        dumpTask.waiter = (i + 1 < nItem) ? nullptr : waiter;
-        running_.Push({task->id, sizes, item.addrs,
-                       i == 0 && task->tokenDesc.prerequisiteHandle != 0,
-                       task->tokenDesc.prerequisiteHandle, std::move(dumpTask)});
+    if (task->tokenDesc.prerequisiteHandle != 0) {
+        auto s = WaitEventOnStreams(reinterpret_cast<void*>(task->tokenDesc.prerequisiteHandle));
+        if (s.Failure()) { return s; }
     }
-}
 
-void DumpQueue::TransferStage(std::promise<Status>& started)
-{
-    auto s = SetupTransferStreams();
-    started.set_value(s);
-    if (s.Failure()) { return; }
-    if (!cpuAffinityCores_.empty()) {
-        s = CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
-        if (s.Failure()) { UC_WARN("Failed({}) to set affinity.", s); }
-    }
-    running_.ConsumerLoop(stop_, &DumpQueue::TransferOneTask, this);
-}
+    struct TokenCopy {
+        Detail::TokenLayerShard item;
+        std::vector<std::byte> data;
+    };
 
-void DumpQueue::TransferOneTask(CopyTask&& task)
-{
-    if (failureSet_->Contains(task.taskHandle)) {
-        if (task.dumpTask.waiter) { task.dumpTask.waiter->Done(); }
-        return;
+    std::vector<TokenCopy> tokenCopies;
+    tokenCopies.reserve(nItem);
+    for (const auto& item : task->tokenDesc) {
+        auto iter = tensorSizesByType_.find(item.tensorType);
+        if (iter == tensorSizesByType_.end()) {
+            return Status::InvalidParam("invalid tensor type({})", item.tensorType);
+        }
+        TokenCopy tokenCopy;
+        tokenCopy.item = item;
+        tokenCopy.data.resize(Sum(iter->second));
+        size_t offset = 0;
+        for (size_t i = 0; i < iter->second.size(); ++i) {
+            auto stream = NextStream();
+            if (!stream) { return Status::Error("invalid memory dump stream"); }
+            auto pHost = static_cast<void*>(tokenCopy.data.data() + offset);
+            auto s = stream->DeviceToHostAsync(item.addrs[i], pHost, iter->second[i]);
+            if (s.Failure()) { return s; }
+            offset += iter->second[i];
+        }
+        tokenCopies.push_back(std::move(tokenCopy));
     }
-    auto s = Status::OK();
-    if (task.waitPrerequisite) {
-        s = WaitEventOnStreams(reinterpret_cast<void*>(task.prerequisiteHandle));
+    auto s = SynchronizeStreams();
+    if (s.Failure()) { return s; }
+
+    DumpTask dumpTask;
+    dumpTask.taskHandle = task->id;
+    dumpTask.waiter = waiter;
+    Detail::TaskDesc backendTask;
+    backendTask.brief = "Memory2Backend";
+    for (auto& tokenCopy : tokenCopies) {
+        std::vector<std::byte> full;
+        s = buffer_->CommitToken(tokenCopy.item, tokenCopy.data, &full);
+        if (s.Failure()) { return s; }
+        if (full.empty() || !backend_) { continue; }
+        bool replaced = false;
+        for (auto& shard : dumpTask.backendShards) {
+            if (shard.block != tokenCopy.item.owner || shard.layer != tokenCopy.item.layer) {
+                continue;
+            }
+            shard.full = std::move(full);
+            replaced = true;
+            break;
+        }
+        if (!replaced) {
+            dumpTask.backendShards.push_back(
+                {tokenCopy.item.owner, tokenCopy.item.layer, std::move(full)});
+        }
     }
-    auto copyStream = NextStream();
-    if (s.Success() && !copyStream) { s = Status::Error("invalid memory dump stream"); }
-    if (s.Success()) {
-        s = DeviceToHostGatherAsync(copyStream, task.deviceAddrs.data(), task.sizes,
-                                    task.dumpTask.hostBuffer.data());
+    if (dumpTask.backendShards.empty()) {
+        waiter->Done();
+        return Status::OK();
     }
-    if (s.Success() && !task.dumpTask.waiter) {
-        holder_.push_back(std::move(task.dumpTask));
-        return;
+    for (auto& shard : dumpTask.backendShards) {
+        backendTask.push_back({shard.block, shard.layer, {shard.full.data()}});
     }
-    if (s.Success()) {
-        holder_.push_back(std::move(task.dumpTask));
-        s = SynchronizeStreams();
-    }
-    if (s.Failure()) {
-        UC_ERROR("Failed({}) to run memory dump transfer task({}).", s, task.taskHandle);
-        failureSet_->Insert(task.taskHandle);
-        auto waiter = task.dumpTask.waiter;
-        if (!waiter && !holder_.empty()) { waiter = holder_.back().waiter; }
-        holder_.clear();
-        if (waiter) { waiter->Done(); }
-        return;
-    }
-    for (auto& dumpTask : holder_) { dumping_.Push(std::move(dumpTask)); }
-    holder_.clear();
+    auto res = backend_->Dump(std::move(backendTask));
+    if (!res) { return res.Error(); }
+    dumpTask.backendTaskHandle = res.Value();
+    dumping_.Push(std::move(dumpTask));
+    return Status::OK();
 }
 
 Status DumpQueue::SetupTransferStreams()
@@ -245,27 +282,14 @@ void DumpQueue::BackendDumpStage()
             if (task.waiter) { task.waiter->Done(); }
             return;
         }
-        auto s = task.hostTask.empty() ? buffer_->DumpTokens(task.hostTokenTask)
-                                       : buffer_->Dump(task.hostTask);
+        auto s = backend_->Wait(task.backendTaskHandle);
         if (s.Failure()) {
-            UC_ERROR("Failed({}) to run memory backend dump task({}).", s, task.taskHandle);
+            UC_ERROR("Failed({}) to wait backend({}) for memory dump task({}).", s,
+                     task.backendTaskHandle, task.taskHandle);
             failureSet_->Insert(task.taskHandle);
         }
         if (task.waiter) { task.waiter->Done(); }
     });
-}
-
-Status DumpQueue::DeviceToHostGatherAsync(std::shared_ptr<Trans::Stream> stream, void** device,
-                                          const std::vector<size_t>& sizes, void* host)
-{
-    size_t offset = 0;
-    for (size_t i = 0; i < sizes.size(); ++i) {
-        auto pHost = static_cast<void*>(static_cast<int8_t*>(host) + offset);
-        auto s = stream->DeviceToHostAsync(device[i], pHost, sizes[i]);
-        if (s.Failure()) { return s; }
-        offset += sizes[i];
-    }
-    return Status::OK();
 }
 
 }  // namespace UC::MemoryStore

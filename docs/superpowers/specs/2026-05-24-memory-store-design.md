@@ -61,8 +61,8 @@ intent. The main implementation anchors are:
 | API surface | Implements only the standard `StoreV1` methods. Token-layer methods still use the default unsupported behavior on `StoreV1`. | Implements `LookupTokens`, `LoadTokens`, and `DumpTokens` in addition to the standard methods. |
 | Internal storage unit | Stores full `(block_id, shard_index)` shards in buffer slots. | Stores token chunks keyed by `(block_id, layer_id, chunk_id, tensor_type)` and separately tracks `(block_id, layer_id)` in a `fullReady` set. |
 | Lookup path | `BufferManager` checks the local buffer first, then falls back to backend lookup on miss. `cacheLoadBackendOnly` can explicitly bypass local hits. | `Lookup`, `LookupOnPrefix`, and `LookupTokens` are local-memory checks only. Backend fetch on miss happens only through `Load` or `LoadTokens`. |
-| Transfer model | Explicit host/device transfer pipeline with `device_id`, copy streams, optional GDR, dispatch threads, and transfer/backend stages. | Keeps the staged queues, but owns its transfer streams inside `MemoryStore` and drives them directly through the shared `Trans::Device` / `Trans::Stream` APIs. Load uses dispatch + transfer stages; dump uses dispatch + transfer + backend-host stages. User-address transfer still goes through `Trans::Stream` `HostToDeviceAsync` / `DeviceToHostAsync`. |
-| Backend interaction | Backend shard load/dump is submitted asynchronously and waited in queue stages. | Full-shard and token-layer load misses now degrade to full-shard backend `Load` that is submitted in the load queue and waited in the transfer stage. Full-shard dump still waits synchronously inside `DumpFullToBackend` from the backend-host stage. |
+| Transfer model | Explicit host/device transfer pipeline with `device_id`, copy streams, optional GDR, dispatch threads, and transfer/backend stages. | Keeps staged queues, but owns its transfer streams inside `MemoryStore` and drives them directly through the shared `Trans::Device` / `Trans::Stream` APIs. Load uses dispatch + transfer stages; dump uses dispatch + backend-wait stages. User-address transfer goes through `Trans::Stream` `HostToDeviceAsync` / `DeviceToHostAsync` directly inside the queue code. |
+| Backend interaction | Backend shard load/dump is submitted asynchronously and waited in queue stages. | Full-shard and token-layer load misses degrade to full-shard backend `Load` submitted in the load queue and waited in the transfer stage. Full-shard and token-layer dump now also submit backend `Dump` from the dump queue and wait in a later backend-wait stage; `TransBuffer` no longer hides backend `Dump`/`Wait` on the async queue path. |
 | Config surface | Depends on `device_id`, `share_buffer_enable`, `cache_buffer_capacity_gb`, `running_queue_depth`, `stream_number`, `use_gdr`, `cpu_affinity_cores`, and related cache-transfer settings. | Currently uses `device_id`, `cache_stream_number` / `memory_stream_number`, `use_gdr`, `cpu_affinity_cores`, `shard_size`, `block_size`, `tensor_size(_list)`, `memory_token_chunk_size`, `memory_buffer_capacity_gb`, `memory_required_tensor_types`, `memory_tensor_size_by_type_*`, `waiting_queue_depth`, `running_queue_depth`, and `timeout_ms`. |
 
 ### Practical Notes About the Current Code
@@ -79,16 +79,15 @@ intent. The main implementation anchors are:
    are not fully equivalent on standard lookup behavior.
 
 3. `MemoryStore` now aligns more closely with `CacheStore` on transfer
-   ownership and queue staging, but it still does not fully match
-   `CacheStore` on backend execution flow.
+   ownership, queue staging, and backend execution flow.
    The load and dump queues own caller-buffer/device transfers directly through
    `Trans::Device` and `Trans::Stream`, while `TransBuffer` stays on the host
-   side for chunk assembly, full-shard assembly, and backend interaction.
+   side for chunk assembly and full-shard assembly.
    `MemoryStore` load now also submits backend full-shard `Load` in the queue
    and waits in the transfer stage before committing the full shard back into
-   local chunk state. Dump is still different: `MemoryStore` continues to call
-   backend `Dump` and synchronously wait inside `DumpFullToBackend` from the
-   backend-host stage.
+   local chunk state. Dump now mirrors that structure more closely: dispatch
+   performs D2H and local commit, then submits backend `Dump`; a later
+   backend-wait stage performs `Wait` for the submitted backend task.
 
 4. The current `MemoryStore` implementation does not implement the explicit
    `memory_full_shard_layout` configuration described later in this design doc.
@@ -100,10 +99,11 @@ intent. The main implementation anchors are:
 5. The concurrency model in `MemoryStore` is still narrower than in
    `CacheStore`, but it is no longer single-stage.
    Today load is split into dispatch + transfer stages, and dump is split into
-   dispatch + transfer + backend-host stages, while `TransBuffer` remains
-   protected by a single mutex. `CacheStore` still relies on buffer handles and
-   queue-managed async backend handling for both load and dump, while
-   `MemoryStore` has only converged on the async load side so far.
+   dispatch + backend-wait stages, while `TransBuffer` remains protected by a
+   single mutex. `CacheStore` still relies on buffer handles, while
+   `MemoryStore` still serializes local token/full-shard state updates through
+   `TransBuffer`, but both load and dump now use queue-managed async backend
+   handling.
 
 6. Eviction happens at different physical units.
    `MemoryStore` evicts token chunks. `CacheStore` evicts shard buffer slots.
@@ -113,8 +113,9 @@ intent. The main implementation anchors are:
 This comparison should be treated as the baseline for future work: the current
 `MemoryStore` preserves backend full-shard compatibility, keeps queue-owned
 `Trans::Stream` transfer flow, and no longer stores the whole `Config` object
-inside `TransBuffer`, but it still does not replicate `CacheStore` in backend
-wait flow, concurrency staging, or lookup behavior.
+inside `TransBuffer`. It still differs from `CacheStore` in lookup behavior,
+buffer ownership model, and how much local state is serialized behind
+`TransBuffer`.
 
 ## Architecture
 

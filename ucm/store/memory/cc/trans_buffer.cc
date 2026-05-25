@@ -139,6 +139,27 @@ Status TransBuffer::CommitFull(const BlockId& block, size_t layer,
     return Status::OK();
 }
 
+Status TransBuffer::CommitToken(const Detail::TokenLayerShard& item,
+                                const std::vector<std::byte>& data, std::vector<std::byte>* full)
+{
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto s = ValidateTokenKey(item);
+    if (s.Failure()) { return s; }
+    if (data.size() != TypePayloadSize(item.tensorType)) {
+        return Status::InvalidParam("invalid token payload size({},{})", data.size(),
+                                    TypePayloadSize(item.tensorType));
+    }
+    auto* p = TokenData(item, true);
+    std::memcpy(p, data.data(), data.size());
+    MarkTokenReady(item);
+    if (!UpdateFullReady(item.owner, item.layer)) {
+        if (full) { full->clear(); }
+        return Status::OK();
+    }
+    if (!full) { return Status::OK(); }
+    return AssembleFullShard(item.owner, item.layer, *full);
+}
+
 Status TransBuffer::Load(Detail::TaskDesc& task)
 {
     std::lock_guard<std::mutex> guard(mutex_);
@@ -158,14 +179,12 @@ Status TransBuffer::Load(Detail::TaskDesc& task)
 
 Status TransBuffer::Dump(const Detail::TaskDesc& task)
 {
-    std::lock_guard<std::mutex> guard(mutex_);
     for (const auto& shard : task) {
         std::vector<std::byte> full(shardSize_);
         auto s = CopyFromAddrs(shard.addrs, tensorSizes_, full.data());
         if (s.Failure()) { return s; }
-        s = SplitFullShard(shard.owner, shard.index, full);
+        s = CommitFull(shard.owner, shard.index, full);
         if (s.Failure()) { return s; }
-        fullReady_.insert({shard.owner, shard.index});
         s = DumpFullToBackend(shard.owner, shard.index, full);
         if (s.Failure()) { return s; }
     }
@@ -190,18 +209,16 @@ Status TransBuffer::LoadTokens(Detail::TokenLayerTaskDesc& task)
 
 Status TransBuffer::DumpTokens(const Detail::TokenLayerTaskDesc& task)
 {
-    std::lock_guard<std::mutex> guard(mutex_);
     for (const auto& item : task) {
+        std::vector<std::byte> full;
         auto s = ValidateItem(item);
         if (s.Failure()) { return s; }
-        auto* p = TokenData(item, true);
-        s = CopyFromAddrs(item.addrs, TypeTensorSizes(item.tensorType), p);
+        std::vector<std::byte> data(TypePayloadSize(item.tensorType));
+        s = CopyFromAddrs(item.addrs, TypeTensorSizes(item.tensorType), data.data());
         if (s.Failure()) { return s; }
-        MarkTokenReady(item);
-        if (!UpdateFullReady(item.owner, item.layer)) { continue; }
-        std::vector<std::byte> full;
-        s = AssembleFullShard(item.owner, item.layer, full);
+        s = CommitToken(item, data, &full);
         if (s.Failure()) { return s; }
+        if (full.empty()) { continue; }
         s = DumpFullToBackend(item.owner, item.layer, full);
         if (s.Failure()) { return s; }
     }

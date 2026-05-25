@@ -280,6 +280,103 @@ TEST(UCMMemoryStoreLayoutCrossTest, StandardDumpThenTokenLoadUsesLayerMajorKvLay
     EXPECT_EQ(kToken1, expected);
 }
 
+TEST(UCMMemoryStoreLayoutCrossTest, OrdinaryStandardDumpThenTokenLoadUsesLogicalLayerAndTensorType)
+{
+    using namespace UC::MemoryStore;
+
+    MemoryStore store;
+    Config config;
+    config.storeBackend = 0;
+    config.deviceId = 0;
+    config.shardSize = 16;
+    config.blockSize = 16;
+    config.tensorSizeList = {4, 4, 4, 4};
+    config.memoryTokenChunkSize = 2;
+    config.memoryBufferCapacity = 1ULL << 20;
+    config.requiredTensorTypes = {0, 1};
+    config.tensorSizesByType = {{0, {2}}, {1, {2}}};
+    ASSERT_EQ(store.Setup(config), UC::Status::OK());
+
+    auto block = MakeBlockId(53);
+    std::array<std::byte, 4> kLayer0{std::byte{1}, std::byte{2}, std::byte{3},
+                                     std::byte{4}};
+    std::array<std::byte, 4> kLayer1{std::byte{5}, std::byte{6}, std::byte{7},
+                                     std::byte{8}};
+    std::array<std::byte, 4> vLayer0{std::byte{9}, std::byte{10}, std::byte{11},
+                                     std::byte{12}};
+    std::array<std::byte, 4> vLayer1{std::byte{13}, std::byte{14}, std::byte{15},
+                                     std::byte{16}};
+    UC::Detail::TaskDesc dump;
+    dump.push_back(UC::Detail::Shard{block, 0, {kLayer0.data(), kLayer1.data(),
+                                                vLayer0.data(), vLayer1.data()}});
+    auto dumpTask = store.Dump(dump);
+    ASSERT_TRUE(dumpTask.HasValue());
+    ASSERT_EQ(store.Wait(dumpTask.Value()), UC::Status::OK());
+
+    std::array<std::byte, 2> kLayer1Token0{};
+    std::array<std::byte, 2> vLayer1Token1{};
+    UC::Detail::TokenLayerTaskDesc loadTokens;
+    loadTokens.push_back(
+        UC::Detail::TokenLayerShard{block, 1, 0, 0, {kLayer1Token0.data()}});
+    loadTokens.push_back(
+        UC::Detail::TokenLayerShard{block, 1, 1, 1, {vLayer1Token1.data()}});
+    auto loadTask = store.LoadTokens(loadTokens);
+    ASSERT_TRUE(loadTask.HasValue());
+    ASSERT_EQ(store.Wait(loadTask.Value()), UC::Status::OK());
+
+    std::array<std::byte, 2> expectedK{std::byte{5}, std::byte{6}};
+    std::array<std::byte, 2> expectedV{std::byte{15}, std::byte{16}};
+    EXPECT_EQ(kLayer1Token0, expectedK);
+    EXPECT_EQ(vLayer1Token1, expectedV);
+}
+
+TEST(UCMMemoryStoreLayoutCrossTest, LayerwiseStandardDumpThenTokenLoadMapsTensorTypeToShard)
+{
+    using namespace UC::MemoryStore;
+
+    MemoryStore store;
+    Config config;
+    config.storeBackend = 0;
+    config.deviceId = 0;
+    config.shardSize = 4;
+    config.blockSize = 16;
+    config.tensorSizeList = {4};
+    config.memoryTokenChunkSize = 2;
+    config.memoryBufferCapacity = 1ULL << 20;
+    config.requiredTensorTypes = {0, 1};
+    config.tensorSizesByType = {{0, {2}}, {1, {2}}};
+    ASSERT_EQ(store.Setup(config), UC::Status::OK());
+
+    auto block = MakeBlockId(54);
+    std::array<std::byte, 4> kLayer0{std::byte{1}, std::byte{2}, std::byte{3},
+                                     std::byte{4}};
+    std::array<std::byte, 4> kLayer1{std::byte{5}, std::byte{6}, std::byte{7},
+                                     std::byte{8}};
+    std::array<std::byte, 4> vLayer0{std::byte{9}, std::byte{10}, std::byte{11},
+                                     std::byte{12}};
+    std::array<std::byte, 4> vLayer1{std::byte{13}, std::byte{14}, std::byte{15},
+                                     std::byte{16}};
+    UC::Detail::TaskDesc dump;
+    dump.push_back(UC::Detail::Shard{block, 0, {kLayer0.data()}});
+    dump.push_back(UC::Detail::Shard{block, 1, {kLayer1.data()}});
+    dump.push_back(UC::Detail::Shard{block, 2, {vLayer0.data()}});
+    dump.push_back(UC::Detail::Shard{block, 3, {vLayer1.data()}});
+    auto dumpTask = store.Dump(dump);
+    ASSERT_TRUE(dumpTask.HasValue());
+    ASSERT_EQ(store.Wait(dumpTask.Value()), UC::Status::OK());
+
+    std::array<std::byte, 2> vLayer1Token1{};
+    UC::Detail::TokenLayerTaskDesc loadToken;
+    loadToken.push_back(
+        UC::Detail::TokenLayerShard{block, 1, 1, 1, {vLayer1Token1.data()}});
+    auto loadTask = store.LoadTokens(loadToken);
+    ASSERT_TRUE(loadTask.HasValue());
+    ASSERT_EQ(store.Wait(loadTask.Value()), UC::Status::OK());
+
+    std::array<std::byte, 2> expected{std::byte{15}, std::byte{16}};
+    EXPECT_EQ(vLayer1Token1, expected);
+}
+
 TEST(UCMMemoryStoreLayoutCrossTest, TokenDumpThenStandardLoadAssemblesLayerMajorKvLayout)
 {
     using namespace UC::MemoryStore;

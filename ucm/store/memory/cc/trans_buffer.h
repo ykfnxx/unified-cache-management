@@ -61,19 +61,25 @@ public:
     Status Dump(const Detail::TaskDesc& task);
     Status LoadTokens(Detail::TokenLayerTaskDesc& task);
     Status DumpTokens(const Detail::TokenLayerTaskDesc& task);
+    Expected<size_t> PhysicalShardIndex(const Detail::TokenLayerShard& item) const;
     Status ReadFull(const BlockId& block, size_t layer, std::vector<std::byte>& full);
     Status ReadToken(const Detail::TokenLayerShard& item, std::vector<std::byte>& data);
     Status CommitFull(const BlockId& block, size_t layer, const std::vector<std::byte>& full);
     Status CommitToken(const Detail::TokenLayerShard& item, const std::vector<std::byte>& data,
-                       std::vector<std::byte>* full = nullptr);
+                       std::vector<std::byte>* full = nullptr, size_t* physicalShard = nullptr);
 
 private:
+    enum class LayoutMode : uint8_t { ORDINARY, LAYERWISE };
     static size_t Sum(const std::vector<size_t>& values);
     static Status CopyFromAddrs(const std::vector<void*>& addrs, const std::vector<size_t>& sizes,
                                 std::byte* dst);
     static Status CopyToAddrs(const std::byte* src, const std::vector<size_t>& sizes,
                               const std::vector<void*>& addrs);
+    Status SetupLayout();
+    Status ValidatePhysicalShard(size_t physicalShard) const;
     size_t LayerNumber() const noexcept;
+    size_t PhysicalShardIndexNoCheck(size_t layer, TensorType type) const;
+    Status DecodeLayerwiseShard(size_t physicalShard, size_t& layer, TensorType& type) const;
     size_t TypePayloadSize(TensorType type) const;
     const std::vector<size_t>& TypeTensorSizes(TensorType type) const;
     Status ValidateTokenKey(const Detail::TokenLayerShard& item) const;
@@ -87,7 +93,7 @@ private:
     bool TokenReadyNoLock(const Detail::TokenLayerShard& item) const;
     void MarkTokenReady(const Detail::TokenLayerShard& item);
     bool IsFullReadyNoLock(const BlockId& block, size_t layer) const;
-    bool UpdateFullReady(const BlockId& block, size_t layer);
+    bool UpdateFullReady(const BlockId& block, size_t physicalShard);
     Status SplitFullShard(const BlockId& block, size_t layer, const std::vector<std::byte>& full);
     Status AssembleFullShard(const BlockId& block, size_t layer, std::vector<std::byte>& full);
     Status LoadFullFromBackend(const BlockId& block, size_t layer);
@@ -102,6 +108,10 @@ private:
     std::vector<Detail::TensorType> requiredTensorTypes_{};
     std::unordered_map<Detail::TensorType, std::vector<size_t>> tensorSizesByType_{};
     size_t tokensPerBlock_{0};
+    LayoutMode layoutMode_{LayoutMode::ORDINARY};
+    size_t physicalShardNumber_{1};
+    size_t logicalLayerNumber_{1};
+    std::unordered_map<TensorType, size_t> tensorTypeRank_{};
     mutable std::mutex mutex_{};
     std::list<ChunkKey> lru_;
     std::unordered_map<ChunkKey, Chunk, ChunkHasher> chunks_;

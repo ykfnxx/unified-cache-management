@@ -229,11 +229,58 @@ Status MemoryStore::CheckConfig(Config& config)
         }
         perTokenSize += Sum(iter->second);
     }
-    if (perTokenSize == 0 || config.shardSize % perTokenSize != 0) {
+    if (perTokenSize == 0) {
         return Status::InvalidParam("invalid token payload size({}) on shard({})", perTokenSize,
                                     config.shardSize);
     }
-    config.tokensPerBlock = config.shardSize / perTokenSize;
+    const auto typeCount = config.requiredTensorTypes.size();
+    const auto physicalShardNumber = config.blockSize / config.shardSize;
+    if (physicalShardNumber == 1) {
+        size_t logicalLayerNumber = 1;
+        if (config.tensorSizeList.size() >= typeCount &&
+            config.tensorSizeList.size() % typeCount == 0) {
+            logicalLayerNumber = config.tensorSizeList.size() / typeCount;
+        }
+        const auto layerTokenSize = logicalLayerNumber * perTokenSize;
+        if (layerTokenSize == 0 || config.shardSize % layerTokenSize != 0) {
+            return Status::InvalidParam("invalid ordinary token layout({},{})",
+                                        config.shardSize, layerTokenSize);
+        }
+        config.tokensPerBlock = config.shardSize / layerTokenSize;
+        if (config.tensorSizeList.size() == logicalLayerNumber * typeCount) {
+            size_t offset = 0;
+            for (const auto type : config.requiredTensorTypes) {
+                const auto expected = config.tokensPerBlock * Sum(config.tensorSizesByType.at(type));
+                for (size_t layer = 0; layer < logicalLayerNumber; ++layer) {
+                    if (config.tensorSizeList[offset] != expected) {
+                        return Status::InvalidParam("invalid tensor size for type-layer({},{})",
+                                                    config.tensorSizeList[offset], expected);
+                    }
+                    ++offset;
+                }
+            }
+        }
+        return Status::OK();
+    }
+    if (physicalShardNumber % typeCount != 0) {
+        return Status::InvalidParam("invalid physical shard number({})", physicalShardNumber);
+    }
+    size_t tokensPerBlock = 0;
+    for (const auto type : config.requiredTensorTypes) {
+        const auto typePayloadSize = Sum(config.tensorSizesByType.at(type));
+        if (typePayloadSize == 0 || config.shardSize % typePayloadSize != 0) {
+            return Status::InvalidParam("invalid layerwise token layout({},{})",
+                                        config.shardSize, typePayloadSize);
+        }
+        const auto typeTokens = config.shardSize / typePayloadSize;
+        if (tokensPerBlock == 0) {
+            tokensPerBlock = typeTokens;
+        } else if (tokensPerBlock != typeTokens) {
+            return Status::InvalidParam("inconsistent token number({},{})", tokensPerBlock,
+                                        typeTokens);
+        }
+    }
+    config.tokensPerBlock = tokensPerBlock;
     return Status::OK();
 }
 

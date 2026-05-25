@@ -46,14 +46,18 @@ Status TransBuffer::Setup(const Config& config)
     requiredTensorTypes_ = config.requiredTensorTypes;
     tensorSizesByType_ = config.tensorSizesByType;
     tokensPerBlock_ = config.tokensPerBlock;
+    auto s = SetupLayout();
+    if (s.Failure()) { return s; }
     size_t maxPayload = 1;
     for (const auto& [_, sizes] : tensorSizesByType_) {
         maxPayload = std::max(maxPayload, Sum(sizes));
     }
     const auto chunkBytes = std::max<size_t>(1, maxPayload * memoryTokenChunkSize_);
     maxChunks_ = std::max<size_t>(1, config.memoryBufferCapacity / chunkBytes);
-    UC_INFO("MemoryStore buffer setup with tokens_per_block={}, chunk_tokens={}, chunks={}.",
-            tokensPerBlock_, memoryTokenChunkSize_, maxChunks_);
+    UC_INFO("MemoryStore buffer setup with layers={}, physical_shards={}, tokens_per_block={}, "
+            "chunk_tokens={}, chunks={}.",
+            logicalLayerNumber_, physicalShardNumber_, tokensPerBlock_, memoryTokenChunkSize_,
+            maxChunks_);
     return Status::OK();
 }
 
@@ -125,8 +129,10 @@ Status TransBuffer::LoadTokens(Detail::TokenLayerTaskDesc& task)
 {
     std::lock_guard<std::mutex> guard(mutex_);
     for (const auto& item : task) {
+        auto physicalShard = PhysicalShardIndex(item);
+        if (!physicalShard) { return physicalShard.Error(); }
         if (!TokenReadyNoLock(item)) {
-            auto s = LoadFullFromBackend(item.owner, item.layer);
+            auto s = LoadFullFromBackend(item.owner, physicalShard.Value());
             if (s.Failure()) { return s; }
         }
         auto* p = TokenData(item, false);
@@ -149,7 +155,9 @@ Status TransBuffer::DumpTokens(const Detail::TokenLayerTaskDesc& task)
         s = CommitToken(item, data, &full);
         if (s.Failure()) { return s; }
         if (full.empty()) { continue; }
-        s = DumpFullToBackend(item.owner, item.layer, full);
+        auto physicalShard = PhysicalShardIndex(item);
+        if (!physicalShard) { return physicalShard.Error(); }
+        s = DumpFullToBackend(item.owner, physicalShard.Value(), full);
         if (s.Failure()) { return s; }
     }
     return Status::OK();
@@ -185,7 +193,8 @@ Status TransBuffer::CommitFull(const BlockId& block, size_t layer, const std::ve
 }
 
 Status TransBuffer::CommitToken(const Detail::TokenLayerShard& item,
-                                const std::vector<std::byte>& data, std::vector<std::byte>* full)
+                                const std::vector<std::byte>& data, std::vector<std::byte>* full,
+                                size_t* physicalShard)
 {
     std::lock_guard<std::mutex> guard(mutex_);
     auto s = ValidateTokenKey(item);
@@ -197,12 +206,14 @@ Status TransBuffer::CommitToken(const Detail::TokenLayerShard& item,
     auto* p = TokenData(item, true);
     std::memcpy(p, data.data(), data.size());
     MarkTokenReady(item);
-    if (!UpdateFullReady(item.owner, item.layer)) {
+    const auto shard = PhysicalShardIndexNoCheck(item.layer, item.tensorType);
+    if (!UpdateFullReady(item.owner, shard)) {
         if (full) { full->clear(); }
         return Status::OK();
     }
     if (!full) { return Status::OK(); }
-    return AssembleFullShard(item.owner, item.layer, *full);
+    if (physicalShard) { *physicalShard = shard; }
+    return AssembleFullShard(item.owner, shard, *full);
 }
 
 size_t TransBuffer::Sum(const std::vector<size_t>& values)
@@ -242,7 +253,74 @@ Status TransBuffer::CopyToAddrs(const std::byte* src, const std::vector<size_t>&
     return Status::OK();
 }
 
-size_t TransBuffer::LayerNumber() const noexcept { return blockSize_ / shardSize_; }
+Status TransBuffer::SetupLayout()
+{
+    if (shardSize_ == 0 || blockSize_ == 0 || blockSize_ % shardSize_ != 0) {
+        return Status::InvalidParam("invalid block layout");
+    }
+    if (requiredTensorTypes_.empty()) {
+        return Status::InvalidParam("invalid memory required tensor types");
+    }
+    physicalShardNumber_ = blockSize_ / shardSize_;
+    tensorTypeRank_.clear();
+    for (size_t i = 0; i < requiredTensorTypes_.size(); ++i) {
+        tensorTypeRank_[requiredTensorTypes_[i]] = i;
+    }
+    if (physicalShardNumber_ == 1) {
+        layoutMode_ = LayoutMode::ORDINARY;
+        logicalLayerNumber_ = 1;
+        if (tensorSizeList_.size() >= requiredTensorTypes_.size() &&
+            tensorSizeList_.size() % requiredTensorTypes_.size() == 0) {
+            logicalLayerNumber_ = tensorSizeList_.size() / requiredTensorTypes_.size();
+        }
+    } else {
+        layoutMode_ = LayoutMode::LAYERWISE;
+        if (physicalShardNumber_ % requiredTensorTypes_.size() != 0) {
+            return Status::InvalidParam("invalid physical shard number({})",
+                                        physicalShardNumber_);
+        }
+        logicalLayerNumber_ = physicalShardNumber_ / requiredTensorTypes_.size();
+    }
+    if (logicalLayerNumber_ == 0) { return Status::InvalidParam("invalid layer number"); }
+    return Status::OK();
+}
+
+Status TransBuffer::ValidatePhysicalShard(size_t physicalShard) const
+{
+    if (physicalShard >= physicalShardNumber_) {
+        return Status::InvalidParam("invalid shard index({})", physicalShard);
+    }
+    return Status::OK();
+}
+
+size_t TransBuffer::LayerNumber() const noexcept { return logicalLayerNumber_; }
+
+size_t TransBuffer::PhysicalShardIndexNoCheck(size_t layer, TensorType type) const
+{
+    if (layoutMode_ == LayoutMode::ORDINARY) { return 0; }
+    return tensorTypeRank_.at(type) * logicalLayerNumber_ + layer;
+}
+
+Expected<size_t> TransBuffer::PhysicalShardIndex(const Detail::TokenLayerShard& item) const
+{
+    auto s = ValidateTokenKey(item);
+    if (s.Failure()) { return s; }
+    return PhysicalShardIndexNoCheck(item.layer, item.tensorType);
+}
+
+Status TransBuffer::DecodeLayerwiseShard(size_t physicalShard, size_t& layer,
+                                         TensorType& type) const
+{
+    auto s = ValidatePhysicalShard(physicalShard);
+    if (s.Failure()) { return s; }
+    if (layoutMode_ != LayoutMode::LAYERWISE) {
+        return Status::InvalidParam("invalid layerwise shard on ordinary layout");
+    }
+    const auto typeRank = physicalShard / logicalLayerNumber_;
+    layer = physicalShard % logicalLayerNumber_;
+    type = requiredTensorTypes_.at(typeRank);
+    return Status::OK();
+}
 
 size_t TransBuffer::TypePayloadSize(TensorType type) const
 {
@@ -324,7 +402,7 @@ void TransBuffer::EvictOne()
     auto key = lru_.back();
     lru_.pop_back();
     chunks_.erase(key);
-    fullReady_.erase({key.block, key.layer});
+    fullReady_.erase({key.block, PhysicalShardIndexNoCheck(key.layer, key.tensorType)});
 }
 
 std::byte* TransBuffer::TokenData(const Detail::TokenLayerShard& item, bool create)
@@ -360,31 +438,64 @@ bool TransBuffer::IsFullReadyNoLock(const BlockId& block, size_t layer) const
     return fullReady_.count({block, layer}) > 0;
 }
 
-bool TransBuffer::UpdateFullReady(const BlockId& block, size_t layer)
+bool TransBuffer::UpdateFullReady(const BlockId& block, size_t physicalShard)
 {
-    for (size_t token = 0; token < tokensPerBlock_; ++token) {
-        for (const auto type : requiredTensorTypes_) {
+    if (ValidatePhysicalShard(physicalShard).Failure()) { return false; }
+    if (layoutMode_ == LayoutMode::LAYERWISE) {
+        size_t layer = 0;
+        TensorType type = 0;
+        if (DecodeLayerwiseShard(physicalShard, layer, type).Failure()) { return false; }
+        for (size_t token = 0; token < tokensPerBlock_; ++token) {
             Detail::TokenLayerShard item{block, layer, token, type, {}};
             if (!TokenReadyNoLock(item)) { return false; }
         }
+        fullReady_.insert({block, physicalShard});
+        return true;
     }
-    fullReady_.insert({block, layer});
+    for (size_t layer = 0; layer < logicalLayerNumber_; ++layer) {
+        for (const auto type : requiredTensorTypes_) {
+            for (size_t token = 0; token < tokensPerBlock_; ++token) {
+                Detail::TokenLayerShard item{block, layer, token, type, {}};
+                if (!TokenReadyNoLock(item)) { return false; }
+            }
+        }
+    }
+    fullReady_.insert({block, physicalShard});
     return true;
 }
 
 Status TransBuffer::SplitFullShard(const BlockId& block, size_t layer,
                                    const std::vector<std::byte>& full)
 {
+    auto s = ValidatePhysicalShard(layer);
+    if (s.Failure()) { return s; }
     if (full.size() != shardSize_) { return Status::InvalidParam("invalid shard"); }
     size_t offset = 0;
-    for (const auto type : requiredTensorTypes_) {
+    if (layoutMode_ == LayoutMode::LAYERWISE) {
+        size_t logicalLayer = 0;
+        TensorType type = 0;
+        s = DecodeLayerwiseShard(layer, logicalLayer, type);
+        if (s.Failure()) { return s; }
         for (size_t token = 0; token < tokensPerBlock_; ++token) {
-            Detail::TokenLayerShard item{block, layer, token, type, {}};
+            Detail::TokenLayerShard item{block, logicalLayer, token, type, {}};
             auto* p = TokenData(item, true);
             const auto size = TypePayloadSize(type);
             std::memcpy(p, full.data() + offset, size);
             MarkTokenReady(item);
             offset += size;
+        }
+        return Status::OK();
+    }
+    for (const auto type : requiredTensorTypes_) {
+        for (size_t logicalLayer = 0; logicalLayer < logicalLayerNumber_; ++logicalLayer) {
+            for (size_t token = 0; token < tokensPerBlock_; ++token) {
+                Detail::TokenLayerShard item{block, logicalLayer, token, type, {}};
+                auto* p = TokenData(item, true);
+                const auto size = TypePayloadSize(type);
+                std::memcpy(p, full.data() + offset, size);
+                MarkTokenReady(item);
+                offset += size;
+            }
         }
     }
     return Status::OK();
@@ -393,16 +504,35 @@ Status TransBuffer::SplitFullShard(const BlockId& block, size_t layer,
 Status TransBuffer::AssembleFullShard(const BlockId& block, size_t layer,
                                       std::vector<std::byte>& full)
 {
+    auto s = ValidatePhysicalShard(layer);
+    if (s.Failure()) { return s; }
     full.resize(shardSize_);
     size_t offset = 0;
-    for (const auto type : requiredTensorTypes_) {
+    if (layoutMode_ == LayoutMode::LAYERWISE) {
+        size_t logicalLayer = 0;
+        TensorType type = 0;
+        s = DecodeLayerwiseShard(layer, logicalLayer, type);
+        if (s.Failure()) { return s; }
         for (size_t token = 0; token < tokensPerBlock_; ++token) {
-            Detail::TokenLayerShard item{block, layer, token, type, {}};
+            Detail::TokenLayerShard item{block, logicalLayer, token, type, {}};
             if (!TokenReadyNoLock(item)) { return Status::NotFound(); }
             auto* p = TokenData(item, false);
             const auto size = TypePayloadSize(type);
             std::memcpy(full.data() + offset, p, size);
             offset += size;
+        }
+        return Status::OK();
+    }
+    for (const auto type : requiredTensorTypes_) {
+        for (size_t logicalLayer = 0; logicalLayer < logicalLayerNumber_; ++logicalLayer) {
+            for (size_t token = 0; token < tokensPerBlock_; ++token) {
+                Detail::TokenLayerShard item{block, logicalLayer, token, type, {}};
+                if (!TokenReadyNoLock(item)) { return Status::NotFound(); }
+                auto* p = TokenData(item, false);
+                const auto size = TypePayloadSize(type);
+                std::memcpy(full.data() + offset, p, size);
+                offset += size;
+            }
         }
     }
     return Status::OK();

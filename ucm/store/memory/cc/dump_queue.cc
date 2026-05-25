@@ -173,12 +173,13 @@ Status DumpQueue::DumpTokenTaskDesc(Trans::Stream* stream, TaskPtr task, WaiterP
     backendTask.brief = "Memory2Backend";
     for (auto& tokenCopy : tokenCopies) {
         std::vector<std::byte> full;
-        s = buffer_->CommitToken(tokenCopy.item, tokenCopy.data, &full);
+        size_t physicalShard = 0;
+        s = buffer_->CommitToken(tokenCopy.item, tokenCopy.data, &full, &physicalShard);
         if (s.Failure()) { return s; }
         if (full.empty() || !backend_) { continue; }
         bool replaced = false;
         for (auto& shard : dumpTask.backendShards) {
-            if (shard.block != tokenCopy.item.owner || shard.layer != tokenCopy.item.layer) {
+            if (shard.block != tokenCopy.item.owner || shard.layer != physicalShard) {
                 continue;
             }
             shard.full = std::move(full);
@@ -187,7 +188,7 @@ Status DumpQueue::DumpTokenTaskDesc(Trans::Stream* stream, TaskPtr task, WaiterP
         }
         if (!replaced) {
             dumpTask.backendShards.push_back(
-                {tokenCopy.item.owner, tokenCopy.item.layer, std::move(full)});
+                {tokenCopy.item.owner, physicalShard, std::move(full)});
         }
     }
     if (dumpTask.backendShards.empty()) {

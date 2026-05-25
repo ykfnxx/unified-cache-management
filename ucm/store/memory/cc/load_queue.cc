@@ -73,6 +73,7 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
             copyTask.type = CopyType::FULL;
             copyTask.block = shard.owner;
             copyTask.layer = shard.index;
+            copyTask.physicalShard = shard.index;
             copyTask.sizes = tensorSizeList_;
             copyTask.deviceAddrs = shard.addrs;
             copyTask.waiter = (i + 1 < nShard) ? nullptr : waiter;
@@ -114,10 +115,16 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
         for (size_t i = 0; i < nItem; ++i) {
             const auto& item = task->tokenDesc[i];
             auto& copyTask = copyTasks[i];
+            auto physicalShard = buffer_->PhysicalShardIndex(item);
+            if (!physicalShard) {
+                s = physicalShard.Error();
+                break;
+            }
             copyTask.taskHandle = task->id;
             copyTask.type = CopyType::TOKEN;
             copyTask.block = item.owner;
             copyTask.layer = item.layer;
+            copyTask.physicalShard = physicalShard.Value();
             copyTask.tokenOffset = item.tokenOffset;
             copyTask.tensorType = item.tensorType;
             copyTask.sizes = tensorSizesByType_.at(item.tensorType);
@@ -127,7 +134,8 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
             s = buffer_->ReadToken(item, copyTask.hostBuffer);
             if (s == Status::NotFound() && backend_) {
                 copyTask.backendBuffer.resize(shardSize_);
-                backendTask.push_back({item.owner, item.layer, {copyTask.backendBuffer.data()}});
+                backendTask.push_back(
+                    {item.owner, physicalShard.Value(), {copyTask.backendBuffer.data()}});
                 copyTask.backendResultNeedsCommit = true;
                 s = Status::OK();
             }
@@ -219,7 +227,7 @@ Status LoadQueue::WaitBackendTaskReady(CopyTask& task)
         auto s = buffer_->CommitFull(task.block, task.layer, task.hostBuffer);
         if (s.Failure()) { return s; }
     } else {
-        auto s = buffer_->CommitFull(task.block, task.layer, task.backendBuffer);
+        auto s = buffer_->CommitFull(task.block, task.physicalShard, task.backendBuffer);
         if (s.Failure()) { return s; }
         Detail::TokenLayerShard item{task.block, task.layer, task.tokenOffset, task.tensorType,
                                      task.deviceAddrs};

@@ -31,6 +31,7 @@ class LoadQueue {
         CopyType type{CopyType::FULL};
         Detail::BlockId block{};
         size_t layer{0};
+        size_t physicalShard{0};
         size_t tokenOffset{0};
         Detail::TensorType tensorType{0};
         Detail::TaskHandle backendTaskHandle{0};

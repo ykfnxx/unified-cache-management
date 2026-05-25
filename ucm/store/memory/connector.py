@@ -29,33 +29,36 @@ from typing import Dict, List
 import numpy as np
 import torch
 
-from ucm.store.cache import ucmcachestore
+from ucm.store.memory import ucmmemorystore
 from ucm.store.ucmstore_v1 import Task, UcmKVStoreBaseV1
 
 
 @dataclass
-class CacheTransTask(Task):
+class MemoryTransTask(Task):
     task_id: int
 
 
-class UcmCacheStore(UcmKVStoreBaseV1):
+class UcmMemoryStore(UcmKVStoreBaseV1):
     def __init__(self, config: Dict[str, object]) -> None:
         super().__init__(config)
         key_mapping = {
             "store_backend": "storeBackend",
             "unique_id": "uniqueId",
             "device_id": "deviceId",
-            "tensor_size": "tensorSize",
             "shard_size": "shardSize",
             "block_size": "blockSize",
-            "buffer_number": "bufferNumber",
-            "share_buffer_enable": "shareBufferEnable",
+            "tensor_size_list": "tensorSizeList",
+            "memory_token_chunk_size": "memoryTokenChunkSize",
+            "memory_buffer_capacity": "memoryBufferCapacity",
             "waiting_queue_depth": "waitingQueueDepth",
             "running_queue_depth": "runningQueueDepth",
             "timeout_ms": "timeoutMs",
+            "memory_required_tensor_types": "requiredTensorTypes",
+            "memory_tensor_sizes_by_type": "tensorSizesByType",
+            "memory_tokens_per_block": "tokensPerBlock",
         }
-        self.store = ucmcachestore.CacheStore()
-        param = ucmcachestore.CacheStore.Config()
+        self.store = ucmmemorystore.MemoryStore()
+        param = ucmmemorystore.MemoryStore.Config()
         for key, value in config.items():
             attr = key_mapping.get(key)
             if attr and hasattr(param, attr):
@@ -78,6 +81,20 @@ class UcmCacheStore(UcmKVStoreBaseV1):
         flat = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
         self.store.Prefetch(flat)
 
+    def lookup_tokens_on_layer(
+        self,
+        block_ids: List[bytes],
+        layer_ids: List[int],
+        token_offsets: List[int],
+        tensor_types: List[int],
+    ) -> List[bool]:
+        ids = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
+        layers = array.array("Q", layer_ids)
+        offsets = array.array("Q", token_offsets)
+        types = array.array("Q", tensor_types)
+        res = self.store.LookupTokens(ids, layers, offsets, types)
+        return np.frombuffer(res, dtype=bool)
+
     def _tensor_normalize(self, tensors: List[List[torch.Tensor]]) -> np.ndarray:
         n_rows = len(tensors)
         n_cols = len(tensors[0])
@@ -97,7 +114,7 @@ class UcmCacheStore(UcmKVStoreBaseV1):
         indexes = array.array("Q", shard_index)
         addrs = self._tensor_normalize(dst_tensor)
         task_id = self.store.Load(ids, indexes, addrs)
-        return CacheTransTask(task_id)
+        return MemoryTransTask(task_id)
 
     def dump(
         self,
@@ -109,7 +126,7 @@ class UcmCacheStore(UcmKVStoreBaseV1):
         indexes = array.array("Q", shard_index)
         addrs = self._tensor_normalize(src_tensor)
         task_id = self.store.Dump(ids, indexes, addrs)
-        return CacheTransTask(task_id)
+        return MemoryTransTask(task_id)
 
     def load_data(
         self,
@@ -124,7 +141,7 @@ class UcmCacheStore(UcmKVStoreBaseV1):
         else:
             addrs = np.array(dst_addr, dtype=np.uint64)
         task_id = self.store.Load(ids, indexes, addrs)
-        return CacheTransTask(task_id)
+        return MemoryTransTask(task_id)
 
     def dump_data(
         self,
@@ -140,7 +157,48 @@ class UcmCacheStore(UcmKVStoreBaseV1):
         else:
             addrs = np.array(src_addr, dtype=np.uint64)
         task_id = self.store.Dump(ids, indexes, addrs, prerequisite_handle)
-        return CacheTransTask(task_id)
+        return MemoryTransTask(task_id)
+
+    def load_tokens_on_layer(
+        self,
+        block_ids: List[bytes],
+        layer_ids: List[int],
+        token_offsets: List[int],
+        tensor_types: List[int],
+        dst_addr: List[List[int]] | np.ndarray,
+    ) -> Task:
+        ids = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
+        layers = array.array("Q", layer_ids)
+        offsets = array.array("Q", token_offsets)
+        types = array.array("Q", tensor_types)
+        if isinstance(dst_addr, np.ndarray):
+            addrs = dst_addr
+        else:
+            addrs = np.array(dst_addr, dtype=np.uint64)
+        task_id = self.store.LoadTokens(ids, layers, offsets, types, addrs)
+        return MemoryTransTask(task_id)
+
+    def dump_tokens_on_layer(
+        self,
+        block_ids: List[bytes],
+        layer_ids: List[int],
+        token_offsets: List[int],
+        tensor_types: List[int],
+        src_addr: List[List[int]] | np.ndarray,
+        prerequisite_handle: int = 0,
+    ) -> Task:
+        ids = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
+        layers = array.array("Q", layer_ids)
+        offsets = array.array("Q", token_offsets)
+        types = array.array("Q", tensor_types)
+        if isinstance(src_addr, np.ndarray):
+            addrs = src_addr
+        else:
+            addrs = np.array(src_addr, dtype=np.uint64)
+        task_id = self.store.DumpTokens(
+            ids, layers, offsets, types, addrs, prerequisite_handle
+        )
+        return MemoryTransTask(task_id)
 
     def wait(self, task: Task) -> None:
         return self.store.Wait(task.task_id)

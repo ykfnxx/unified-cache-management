@@ -66,3 +66,6 @@ UcmConnectorFactoryV1.register_connector(
 UcmConnectorFactoryV1.register_connector(
     "UcmFakeStore", "ucm.store.fake.connector", "UcmFakeStore"
 )
+UcmConnectorFactoryV1.register_connector(
+    "UcmMemoryStore", "ucm.store.memory.connector", "UcmMemoryStore"
+)

@@ -21,43 +21,59 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
-#include "cache_store.h"
+#include "memory_store.h"
 #include "template/store_binder.h"
 
-PYBIND11_MODULE(ucmcachestore, module)
+PYBIND11_MODULE(ucmmemorystore, module)
 {
     namespace py = pybind11;
-    using namespace UC::CacheStore;
-    using CacheStorePy = UC::Detail::StoreBinder<CacheStore, Config>;
+    using namespace UC::MemoryStore;
+    using MemoryStorePy = UC::Detail::StoreBinder<MemoryStore, Config>;
+
     module.attr("project") = UCM_PROJECT_NAME;
     module.attr("version") = UCM_PROJECT_VERSION;
     module.attr("commit_id") = UCM_COMMIT_ID;
     module.attr("build_type") = UCM_BUILD_TYPE;
-    auto store = py::class_<CacheStorePy, std::unique_ptr<CacheStorePy>>(module, "CacheStore");
+
+    auto store = py::class_<MemoryStorePy, std::unique_ptr<MemoryStorePy>>(module, "MemoryStore");
     auto config = py::class_<Config>(store, "Config");
     config.def(py::init<>());
     config.def_readwrite("storeBackend", &Config::storeBackend);
     config.def_readwrite("uniqueId", &Config::uniqueId);
     config.def_readwrite("deviceId", &Config::deviceId);
-    config.def_readwrite("tensorSize", &Config::tensorSize);
     config.def_readwrite("shardSize", &Config::shardSize);
     config.def_readwrite("blockSize", &Config::blockSize);
-    config.def_readwrite("bufferNumber", &Config::bufferNumber);
-    config.def_readwrite("shareBufferEnable", &Config::shareBufferEnable);
+    config.def_readwrite("tensorSizeList", &Config::tensorSizeList);
+    config.def_readwrite("memoryTokenChunkSize", &Config::memoryTokenChunkSize);
+    config.def_readwrite("memoryBufferCapacity", &Config::memoryBufferCapacity);
     config.def_readwrite("waitingQueueDepth", &Config::waitingQueueDepth);
     config.def_readwrite("runningQueueDepth", &Config::runningQueueDepth);
     config.def_readwrite("timeoutMs", &Config::timeoutMs);
+    config.def_readwrite("requiredTensorTypes", &Config::requiredTensorTypes);
+    config.def_readwrite("tensorSizesByType", &Config::tensorSizesByType);
+    config.def_readwrite("tokensPerBlock", &Config::tokensPerBlock);
+
     store.def(py::init<>());
-    store.def("Self", &CacheStorePy::Self);
-    store.def("Setup", &CacheStorePy::Setup);
-    store.def("Lookup", &CacheStorePy::Lookup, py::arg("ids").noconvert());
-    store.def("LookupOnPrefix", &CacheStorePy::LookupOnPrefix, py::arg("ids").noconvert());
-    store.def("Prefetch", &CacheStorePy::Prefetch, py::arg("ids").noconvert());
-    store.def("Load", &CacheStorePy::Load, py::arg("ids").noconvert(),
+    store.def("Self", &MemoryStorePy::Self);
+    store.def("Setup", &MemoryStorePy::Setup);
+    store.def("Lookup", &MemoryStorePy::Lookup, py::arg("ids").noconvert());
+    store.def("LookupOnPrefix", &MemoryStorePy::LookupOnPrefix, py::arg("ids").noconvert());
+    store.def("Prefetch", &MemoryStorePy::Prefetch, py::arg("ids").noconvert());
+    store.def("LookupTokens", &MemoryStorePy::LookupTokens, py::arg("ids").noconvert(),
+              py::arg("layer_ids").noconvert(), py::arg("token_offsets").noconvert(),
+              py::arg("tensor_types").noconvert());
+    store.def("Load", &MemoryStorePy::Load, py::arg("ids").noconvert(),
               py::arg("indexes").noconvert(), py::arg("addrs").noconvert());
-    store.def("Dump", &CacheStorePy::Dump, py::arg("ids").noconvert(),
+    store.def("LoadTokens", &MemoryStorePy::LoadTokens, py::arg("ids").noconvert(),
+              py::arg("layer_ids").noconvert(), py::arg("token_offsets").noconvert(),
+              py::arg("tensor_types").noconvert(), py::arg("addrs").noconvert());
+    store.def("Dump", &MemoryStorePy::Dump, py::arg("ids").noconvert(),
               py::arg("indexes").noconvert(), py::arg("addrs").noconvert(),
               py::arg("prerequisite_handle") = 0);
-    store.def("Check", &CacheStorePy::Check);
-    store.def("Wait", &CacheStorePy::Wait);
+    store.def("DumpTokens", &MemoryStorePy::DumpTokens, py::arg("ids").noconvert(),
+              py::arg("layer_ids").noconvert(), py::arg("token_offsets").noconvert(),
+              py::arg("tensor_types").noconvert(), py::arg("addrs").noconvert(),
+              py::arg("prerequisite_handle") = 0);
+    store.def("Check", &MemoryStorePy::Check);
+    store.def("Wait", &MemoryStorePy::Wait);
 }

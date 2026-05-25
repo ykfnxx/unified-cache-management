@@ -99,6 +99,20 @@ class UcmKVStoreBaseV1(ABC):
         """
         pass
 
+    def lookup_tokens_on_layer(
+        self,
+        block_ids: List[bytes],
+        layer_ids: List[int],
+        token_offsets: List[int],
+        tensor_types: List[int],
+    ) -> List[bool]:
+        """Check presence of token-layer items in external storage.
+
+        Stores without token-layer support may keep the default unsupported
+        implementation.
+        """
+        raise NotImplementedError("lookup_tokens_on_layer is unsupported for this store")
+
     @abstractmethod
     def load(
         self,
@@ -165,6 +179,7 @@ class UcmKVStoreBaseV1(ABC):
         block_ids: List[bytes],
         shard_index: List[int],
         src_addr: List[List[int]] | np.ndarray,
+        prerequisite_handle: int = 0,
     ) -> Task:
         """Low-level dump: copy KV data from device pointers.
 
@@ -172,11 +187,35 @@ class UcmKVStoreBaseV1(ABC):
             block_ids: Block hashes to store.
             shard_index: Shard index for each block.
             src_addr: Double-list of ``int`` pointers to device buffers.
+            prerequisite_handle: Optional event handle for Python-C++ stream sync.
 
         Returns:
             A ``Task`` handle for the asynchronous copy.
         """
         pass
+
+    def load_tokens_on_layer(
+        self,
+        block_ids: List[bytes],
+        layer_ids: List[int],
+        token_offsets: List[int],
+        tensor_types: List[int],
+        dst_addr: List[List[int]] | np.ndarray,
+    ) -> Task:
+        """Low-level fetch for token-layer items."""
+        raise NotImplementedError("load_tokens_on_layer is unsupported for this store")
+
+    def dump_tokens_on_layer(
+        self,
+        block_ids: List[bytes],
+        layer_ids: List[int],
+        token_offsets: List[int],
+        tensor_types: List[int],
+        src_addr: List[List[int]] | np.ndarray,
+        prerequisite_handle: int = 0,
+    ) -> Task:
+        """Low-level dump for token-layer items."""
+        raise NotImplementedError("dump_tokens_on_layer is unsupported for this store")
 
     @abstractmethod
     def wait(self, task: Task) -> None:

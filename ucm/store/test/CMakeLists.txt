@@ -8,4 +8,14 @@ if(BUILD_UNIT_TESTS)
         gtest_main gtest gmock
     )
     gtest_discover_tests(ucmstore.test)
+
+    file(GLOB_RECURSE UCMMEMORY_TEST_SOURCE_FILES "./case/memory/*.cc")
+    add_executable(ucmmemory.test ${UCMMEMORY_TEST_SOURCE_FILES})
+    target_include_directories(ucmmemory.test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/case)
+    target_link_libraries(ucmmemory.test PRIVATE
+        memorystore
+        storeintf
+        gtest_main gtest gmock
+    )
+    gtest_discover_tests(ucmmemory.test)
 endif()

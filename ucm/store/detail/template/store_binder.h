@@ -66,6 +66,7 @@ private:
 
 public:
     StoreBinder() : store_{std::make_unique<Store>()} {}
+    virtual ~StoreBinder() = default;
     uintptr_t Self() { return (uintptr_t)(void*)store_.get(); }
     void Setup(const Config& config) { ThrowIfFailed(store_->Setup(config)); }
     pybind11::bytes Lookup(const pybind11::buffer& ids)
@@ -90,6 +91,18 @@ public:
         BufferArrayView<BlockId> idArr{ids};
         store_->Prefetch(idArr.data, idArr.num);
     }
+    pybind11::bytes LookupTokens(const pybind11::buffer& ids, const pybind11::buffer& layerIds,
+                                 const pybind11::buffer& tokenOffsets,
+                                 const pybind11::buffer& tensorTypes)
+    {
+        auto desc = MakeTokenTaskDesc(ids, layerIds, tokenOffsets, tensorTypes);
+        auto res = store_->LookupTokens(desc);
+        if (res) {
+            auto& v = res.Value();
+            return pybind11::bytes(reinterpret_cast<const char*>(v.data()), v.size());
+        }
+        throw std::runtime_error{res.Error().ToString()};
+    }
     TaskHandle Load(const pybind11::buffer& ids, const pybind11::buffer& indexes,
                     const pybind11::buffer& addrs)
     {
@@ -99,12 +112,35 @@ public:
         if (res) { return res.Value(); }
         throw std::runtime_error{res.Error().ToString()};
     }
+    TaskHandle LoadTokens(const pybind11::buffer& ids, const pybind11::buffer& layerIds,
+                          const pybind11::buffer& tokenOffsets,
+                          const pybind11::buffer& tensorTypes, const pybind11::buffer& addrs)
+    {
+        auto desc = MakeTokenTaskDesc(ids, layerIds, tokenOffsets, tensorTypes, addrs);
+        desc.brief = "LoadTokens";
+        auto res = store_->LoadTokens(std::move(desc));
+        if (res) { return res.Value(); }
+        throw std::runtime_error{res.Error().ToString()};
+    }
     TaskHandle Dump(const pybind11::buffer& ids, const pybind11::buffer& indexes,
-                    const pybind11::buffer& addrs)
+                    const pybind11::buffer& addrs, uintptr_t prerequisiteHandle = 0)
     {
         auto desc = MakeTaskDesc(ids, indexes, addrs);
         desc.brief = "Dump";
+        desc.prerequisiteHandle = prerequisiteHandle;
         auto res = store_->Dump(desc);
+        if (res) { return res.Value(); }
+        throw std::runtime_error{res.Error().ToString()};
+    }
+    TaskHandle DumpTokens(const pybind11::buffer& ids, const pybind11::buffer& layerIds,
+                          const pybind11::buffer& tokenOffsets,
+                          const pybind11::buffer& tensorTypes, const pybind11::buffer& addrs,
+                          uintptr_t prerequisiteHandle = 0)
+    {
+        auto desc = MakeTokenTaskDesc(ids, layerIds, tokenOffsets, tensorTypes, addrs);
+        desc.brief = "DumpTokens";
+        desc.prerequisiteHandle = prerequisiteHandle;
+        auto res = store_->DumpTokens(std::move(desc));
         if (res) { return res.Value(); }
         throw std::runtime_error{res.Error().ToString()};
     }
@@ -141,6 +177,48 @@ private:
             shard.index = *idxArr[i];
             shard.addrs.assign(addrArr[i], addrArr[i] + addrArr.cols);
             desc.push_back(std::move(shard));
+        }
+        return desc;
+    }
+    TokenLayerTaskDesc MakeTokenTaskDesc(const pybind11::buffer& ids,
+                                         const pybind11::buffer& layerIds,
+                                         const pybind11::buffer& tokenOffsets,
+                                         const pybind11::buffer& tensorTypes)
+    {
+        BufferArrayView<BlockId> idArr{ids};
+        BufferArrayView<size_t> layerArr{layerIds};
+        BufferArrayView<size_t> tokenArr{tokenOffsets};
+        BufferArrayView<TensorType> typeArr{tensorTypes};
+        if (idArr.num != layerArr.num || idArr.num != tokenArr.num || idArr.num != typeArr.num) {
+            ThrowIfFailed(Status::InvalidParam("invalid dim: {},{},{},{}", idArr.num,
+                                               layerArr.num, tokenArr.num, typeArr.num));
+        }
+        TokenLayerTaskDesc desc;
+        desc.reserve(idArr.num);
+        for (size_t i = 0; i < idArr.num; ++i) {
+            TokenLayerShard shard;
+            shard.owner = *idArr[i];
+            shard.layer = *layerArr[i];
+            shard.tokenOffset = *tokenArr[i];
+            shard.tensorType = *typeArr[i];
+            desc.push_back(std::move(shard));
+        }
+        return desc;
+    }
+    TokenLayerTaskDesc MakeTokenTaskDesc(const pybind11::buffer& ids,
+                                         const pybind11::buffer& layerIds,
+                                         const pybind11::buffer& tokenOffsets,
+                                         const pybind11::buffer& tensorTypes,
+                                         const pybind11::buffer& addrs)
+    {
+        auto desc = MakeTokenTaskDesc(ids, layerIds, tokenOffsets, tensorTypes);
+        Buffer2DArrayView<void*> addrArr{addrs};
+        if (desc.size() != addrArr.rows) {
+            ThrowIfFailed(
+                Status::InvalidParam("invalid dim: {},{}", desc.size(), addrArr.rows));
+        }
+        for (size_t i = 0; i < desc.size(); ++i) {
+            desc[i].addrs.assign(addrArr[i], addrArr[i] + addrArr.cols);
         }
         return desc;
     }

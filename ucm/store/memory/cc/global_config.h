@@ -15,6 +15,7 @@ namespace UC::MemoryStore {
 struct Config {
     StoreV1* storeBackend{nullptr};
     std::string uniqueId{};
+    int32_t deviceId{0};
     size_t shardSize{0};
     size_t blockSize{0};
     std::vector<size_t> tensorSizes{};
@@ -22,6 +23,9 @@ struct Config {
     size_t memoryBufferCapacity{1ULL << 30};
     size_t waitingQueueDepth{8192};
     size_t timeoutMs{30000};
+    size_t streamNumber{1};
+    bool useGdr{false};
+    std::vector<ssize_t> cpuAffinityCores{};
     std::vector<Detail::TensorType> requiredTensorTypes{};
     std::unordered_map<Detail::TensorType, std::vector<size_t>> tensorSizesByType{};
     size_t tokensPerBlock{0};

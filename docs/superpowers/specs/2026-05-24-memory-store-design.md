@@ -42,6 +42,78 @@ layerwise mode, `shard_index` is the layer id, and backend stores see full
 
 The new `MemoryStore` must preserve this downstream backend format.
 
+## Current Implementation vs. CacheStore
+
+This comparison is based on the current code, not only on the original design
+intent. The main implementation anchors are:
+
+- `ucm/store/cache/cc/cache_store.cc`
+- `ucm/store/cache/cc/buffer_manager.h`
+- `ucm/store/cache/cc/load_queue.cc`
+- `ucm/store/cache/cc/dump_queue.cc`
+- `ucm/store/memory/cc/memory_store.cc`
+- `ucm/store/memory/cc/trans_buffer.cc`
+- `ucm/store/memory/cc/load_queue.cc`
+- `ucm/store/memory/cc/dump_queue.cc`
+
+| Aspect | Current CacheStore implementation | Current MemoryStore implementation |
+| --- | --- | --- |
+| API surface | Implements only the standard `StoreV1` methods. Token-layer methods still use the default unsupported behavior on `StoreV1`. | Implements `LookupTokens`, `LoadTokens`, and `DumpTokens` in addition to the standard methods. |
+| Internal storage unit | Stores full `(block_id, shard_index)` shards in buffer slots. | Stores token chunks keyed by `(block_id, layer_id, chunk_id, tensor_type)` and separately tracks `(block_id, layer_id)` in a `fullReady` set. |
+| Lookup path | `BufferManager` checks the local buffer first, then falls back to backend lookup on miss. `cacheLoadBackendOnly` can explicitly bypass local hits. | `Lookup`, `LookupOnPrefix`, and `LookupTokens` are local-memory checks only. Backend fetch on miss happens only through `Load` or `LoadTokens`. |
+| Transfer model | Explicit host/device transfer pipeline with `device_id`, copy streams, optional GDR, dispatch threads, and transfer/backend stages. | Load and dump queues create `CopyStream` instances inside their worker threads. User-address transfers between caller buffers and memory buffers use `Trans::Stream` `HostToDeviceAsync` / `DeviceToHostAsync`. |
+| Backend interaction | Backend shard load/dump is submitted asynchronously and waited in queue stages. | Token misses degrade to full-shard backend `Load`, and `TransBuffer` waits synchronously inside `LoadFullFromBackend`. Full-shard dump also waits synchronously inside `DumpFullToBackend`. |
+| Config surface | Depends on `device_id`, `share_buffer_enable`, `cache_buffer_capacity_gb`, `running_queue_depth`, `stream_number`, `use_gdr`, `cpu_affinity_cores`, and related cache-transfer settings. | Currently uses `device_id`, `cache_stream_number` / `memory_stream_number`, `use_gdr`, `shard_size`, `block_size`, `tensor_size(_list)`, `memory_token_chunk_size`, `memory_buffer_capacity_gb`, `memory_required_tensor_types`, `memory_tensor_size_by_type_*`, `waiting_queue_depth`, and `timeout_ms`. |
+
+### Practical Notes About the Current Code
+
+1. `MemoryStore` is already a separate data model, not a minor variation of
+   `CacheStore`.
+   `CacheStore` is centered on full-shard buffers, while `MemoryStore` is
+   centered on typed token chunks and derives full-shard readiness from those
+   chunks.
+
+2. Standard `Lookup` semantics are currently more local in `MemoryStore`.
+   `CacheStore::Lookup` can continue into backend lookup after a local miss.
+   `MemoryStore::Lookup` only checks local `fullReady_` state, so the two stores
+   are not fully equivalent on standard lookup behavior.
+
+3. `MemoryStore` now aligns more closely with `CacheStore` on transfer
+   ownership, but it still does not match `CacheStore` on backend execution
+   flow.
+   The load and dump queues own caller-buffer/device transfers through
+   `CopyStream` and `Trans::Stream`, while `TransBuffer` stays on the host side
+   for chunk assembly, full-shard assembly, and backend interaction.
+   `CacheStore` still keeps backend wait inside its queue-driven transfer
+   pipeline, while `MemoryStore` calls backend `Load` or `Dump` and then
+   synchronously waits inside `LoadFullFromBackend` or `DumpFullToBackend`
+   before continuing token/full-shard conversion.
+
+4. The current `MemoryStore` implementation does not implement the explicit
+   `memory_full_shard_layout` configuration described later in this design doc.
+   `SplitFullShard` and `AssembleFullShard` currently assume the full-shard byte
+   layout is token-major, with `memory_required_tensor_types` concatenated in
+   order inside each token. This is a stricter assumption than `CacheStore`
+   makes.
+
+5. The concurrency model in `MemoryStore` is still narrower than in
+   `CacheStore`.
+   Today it has one load queue, one dump queue, worker-local `CopyStream`
+   instances for caller-buffer transfers, and a single mutex-protected
+   `TransBuffer`. `CacheStore` further splits dispatch, copy, and backend wait
+   stages and relies on running queues, buffer handles, and streams.
+
+6. Eviction happens at different physical units.
+   `MemoryStore` evicts token chunks. `CacheStore` evicts shard buffer slots.
+   This difference directly affects hit semantics, invalidation granularity, and
+   readiness tracking even when both stores still expose a standard shard view.
+
+This comparison should be treated as the baseline for future work: the current
+`MemoryStore` preserves backend full-shard compatibility, keeps queue-owned
+`Trans::Stream` transfer flow, and no longer stores the whole `Config` object
+inside `TransBuffer`, but it still does not replicate `CacheStore` in backend
+wait flow, concurrency staging, or lookup behavior.
+
 ## Architecture
 
 Create a new shared library:

@@ -53,8 +53,7 @@ class TransBuffer {
     };
 
 public:
-    Status Setup(Config config);
-    const Config& GetConfig() const noexcept { return config_; }
+    Status Setup(const Config& config);
     Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num);
     Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num);
     Expected<std::vector<uint8_t>> LookupTokens(const Detail::TokenLayerTaskDesc& task);
@@ -90,7 +89,14 @@ private:
     Status DumpFullToBackend(const BlockId& block, size_t layer, std::vector<std::byte>& full);
 
 private:
-    Config config_{};
+    StoreV1* storeBackend_{nullptr};
+    size_t shardSize_{0};
+    size_t blockSize_{0};
+    std::vector<size_t> tensorSizes_{};
+    size_t memoryTokenChunkSize_{16};
+    std::vector<Detail::TensorType> requiredTensorTypes_{};
+    std::unordered_map<Detail::TensorType, std::vector<size_t>> tensorSizesByType_{};
+    size_t tokensPerBlock_{0};
     mutable std::mutex mutex_{};
     std::list<ChunkKey> lru_;
     std::unordered_map<ChunkKey, Chunk, ChunkHasher> chunks_;

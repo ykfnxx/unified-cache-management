@@ -4,9 +4,29 @@
  * Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
  * */
 #include "load_queue.h"
+#include <numeric>
 #include "logger/logger.h"
 
 namespace UC::MemoryStore {
+
+namespace {
+size_t Sum(const std::vector<size_t>& sizes)
+{
+    return std::accumulate(sizes.begin(), sizes.end(), size_t{0});
+}
+
+std::vector<void*> BuildHostAddrs(std::vector<std::byte>& buffer, const std::vector<size_t>& sizes)
+{
+    std::vector<void*> addrs;
+    addrs.reserve(sizes.size());
+    size_t offset = 0;
+    for (const auto size : sizes) {
+        addrs.push_back(buffer.data() + offset);
+        offset += size;
+    }
+    return addrs;
+}
+}  // namespace
 
 LoadQueue::~LoadQueue()
 {
@@ -18,9 +38,16 @@ Status LoadQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
 {
     failureSet_ = failureSet;
     buffer_ = buffer;
+    deviceId_ = config.deviceId;
+    tensorSizes_ = config.tensorSizes;
+    tensorSizesByType_ = config.tensorSizesByType;
+    streamNumber_ = config.streamNumber;
+    useGdr_ = config.useGdr;
     waiting_.Setup(config.waitingQueueDepth);
-    dispatcher_ = std::thread{&LoadQueue::DispatchStage, this};
-    return Status::OK();
+    std::promise<Status> started;
+    auto fut = started.get_future();
+    dispatcher_ = std::thread{&LoadQueue::DispatchStage, this, std::ref(started)};
+    return fut.get();
 }
 
 void LoadQueue::Submit(TaskPtr task, WaiterPtr waiter)
@@ -33,12 +60,16 @@ void LoadQueue::Submit(TaskPtr task, WaiterPtr waiter)
     waiter->Done();
 }
 
-void LoadQueue::DispatchStage()
+void LoadQueue::DispatchStage(std::promise<Status>& started)
 {
-    waiting_.ConsumerLoop(stop_, &LoadQueue::DispatchOneTask, this);
+    CopyStream stream;
+    auto s = stream.Setup(deviceId_, streamNumber_, useGdr_);
+    started.set_value(s);
+    if (s.Failure()) { return; }
+    waiting_.ConsumerLoop(stop_, &LoadQueue::DispatchOneTask, this, stream);
 }
 
-void LoadQueue::DispatchOneTask(TaskPair&& pair)
+void LoadQueue::DispatchOneTask(CopyStream& stream, TaskPair&& pair)
 {
     auto& task = pair.first;
     auto& waiter = pair.second;
@@ -47,16 +78,58 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
         return;
     }
     auto s = Status::OK();
-    if (task->type == TransTask::Type::LOAD) {
-        s = buffer_->Load(task->desc);
+    auto copyStream = stream.NextStream();
+    if (!copyStream) {
+        s = Status::Error("invalid memory load stream");
+    } else if (task->type == TransTask::Type::LOAD) {
+        Detail::TaskDesc hostTask;
+        hostTask.brief = task->desc.brief;
+        for (const auto& shard : task->desc) {
+            std::vector<std::byte> hostBuffer(Sum(tensorSizes_));
+            auto hostAddrs = BuildHostAddrs(hostBuffer, tensorSizes_);
+            hostTask.clear();
+            hostTask.push_back({shard.owner, shard.index, hostAddrs});
+            s = buffer_->Load(hostTask);
+            if (s.Failure()) { break; }
+            s = HostToDeviceScatterAsync(copyStream, hostBuffer.data(), tensorSizes_,
+                                         const_cast<void**>(shard.addrs.data()));
+            if (s.Failure()) { break; }
+        }
     } else {
-        s = buffer_->LoadTokens(task->tokenDesc);
+        Detail::TokenLayerTaskDesc hostTask;
+        hostTask.brief = task->tokenDesc.brief;
+        for (const auto& item : task->tokenDesc) {
+            const auto& sizes = tensorSizesByType_.at(item.tensorType);
+            std::vector<std::byte> hostBuffer(Sum(sizes));
+            auto hostAddrs = BuildHostAddrs(hostBuffer, sizes);
+            hostTask.clear();
+            hostTask.push_back(
+                {item.owner, item.layer, item.tokenOffset, item.tensorType, hostAddrs});
+            s = buffer_->LoadTokens(hostTask);
+            if (s.Failure()) { break; }
+            s = HostToDeviceScatterAsync(copyStream, hostBuffer.data(), sizes,
+                                         const_cast<void**>(item.addrs.data()));
+            if (s.Failure()) { break; }
+        }
     }
     if (s.Failure()) {
         UC_ERROR("Failed({}) to run memory load task({}).", s, task->id);
         failureSet_->Insert(task->id);
     }
     waiter->Done();
+}
+
+Status LoadQueue::HostToDeviceScatterAsync(std::shared_ptr<Trans::Stream> stream, void* host,
+                                           const std::vector<size_t>& sizes, void** device)
+{
+    size_t offset = 0;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        auto pHost = static_cast<void*>(static_cast<int8_t*>(host) + offset);
+        auto s = stream->HostToDeviceAsync(pHost, device[i], sizes[i]);
+        if (s.Failure()) { return s; }
+        offset += sizes[i];
+    }
+    return stream->Synchronized();
 }
 
 }  // namespace UC::MemoryStore

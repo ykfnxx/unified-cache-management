@@ -23,8 +23,11 @@
  * */
 #include <array>
 #include <cstring>
-#include <memory>
 #include <gtest/gtest.h>
+#include <memory>
+#include <type_traits>
+#include "copy_stream.h"
+#include "trans_buffer.h"
 #include "ucmstore_v1.h"
 
 extern "C" UC::StoreV1* MakeMemoryStore();
@@ -76,6 +79,7 @@ TEST(UCMMemoryStoreTest, TokenDumpLoadRoundTripUsesTensorType)
     auto store = std::unique_ptr<UC::StoreV1>(MakeMemoryStore());
     UC::Detail::Dictionary config;
     config.Set<UC::StoreV1*>("store_backend", nullptr);
+    config.SetNumber("device_id", 0);
     config.SetNumber("shard_size", 16);
     config.SetNumber("block_size", 16);
     config.SetNumber("memory_token_chunk_size", 2);
@@ -104,4 +108,26 @@ TEST(UCMMemoryStoreTest, TokenDumpLoadRoundTripUsesTensorType)
     ASSERT_TRUE(loadTask.HasValue());
     ASSERT_EQ(store->Wait(loadTask.Value()), UC::Status::OK());
     EXPECT_EQ(std::memcmp(src.data(), dst.data(), src.size()), 0);
+}
+
+TEST(UCMMemoryStoreStructureTest, CopyStreamMovesThroughTransferStream)
+{
+    UC::MemoryStore::CopyStream copyStream;
+    ASSERT_EQ(copyStream.Setup(0, 1, false), UC::Status::OK());
+
+    std::array<std::byte, 4> src{std::byte{9}, std::byte{8}, std::byte{7}, std::byte{6}};
+    std::array<std::byte, 4> dst{};
+    auto stream = copyStream.NextStream();
+    ASSERT_NE(stream, nullptr);
+    ASSERT_EQ(stream->HostToDeviceAsync(src.data(), dst.data(), src.size()), UC::Status::OK());
+    ASSERT_EQ(copyStream.Synchronize(), UC::Status::OK());
+    EXPECT_EQ(std::memcmp(src.data(), dst.data(), src.size()), 0);
+}
+
+TEST(UCMMemoryStoreStructureTest, TransBufferSetupDoesNotTakeConfigByValue)
+{
+    using SetupSignature = decltype(&UC::MemoryStore::TransBuffer::Setup);
+    using ExpectedSignature =
+        UC::Status (UC::MemoryStore::TransBuffer::*)(const UC::MemoryStore::Config&);
+    EXPECT_TRUE((std::is_same_v<SetupSignature, ExpectedSignature>));
 }

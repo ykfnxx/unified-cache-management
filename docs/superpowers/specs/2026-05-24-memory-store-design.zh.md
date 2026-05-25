@@ -39,6 +39,66 @@ builder 会先 stack `Posix`，再 stack `Cache`。外部公开调用落到栈�
 
 新的 `MemoryStore` 必须保持这个后置 backend 格式。
 
+## 当前实现与 CacheStore 的差异
+
+下面的对比基于当前代码，而不是只基于最初方案。对应实现主要在：
+
+- `ucm/store/cache/cc/cache_store.cc`
+- `ucm/store/cache/cc/buffer_manager.h`
+- `ucm/store/cache/cc/load_queue.cc`
+- `ucm/store/cache/cc/dump_queue.cc`
+- `ucm/store/memory/cc/memory_store.cc`
+- `ucm/store/memory/cc/trans_buffer.cc`
+- `ucm/store/memory/cc/load_queue.cc`
+- `ucm/store/memory/cc/dump_queue.cc`
+
+| 维度 | CacheStore 当前实现 | MemoryStore 当前实现 |
+| --- | --- | --- |
+| API 面 | 只实现标准 `StoreV1` 接口。token-layer 方法仍然走 `StoreV1` 默认 unsupported。 | 在标准接口之外，额外实现 `LookupTokens`、`LoadTokens`、`DumpTokens`。 |
+| 内部数据粒度 | 以内存 buffer slot 保存完整 `(block_id, shard_index)` shard。 | 以 `(block_id, layer_id, chunk_id, tensor_type)` 为 key 保存 token chunk，并额外维护 `(block_id, layer_id)` 的 `fullReady` 集合。 |
+| Lookup 路径 | `BufferManager` 先查本地 buffer；miss 时继续查 backend，`cacheLoadBackendOnly` 还可以显式绕过本地命中。 | `Lookup` / `LookupOnPrefix` / `LookupTokens` 都只查本地内存状态，不访问 backend。backend miss 补齐只发生在 `Load` / `LoadTokens`。 |
+| 传输模型 | 明确区分 host/device 传输，依赖 `device_id`、copy stream、可选 GDR、dispatch 线程和 transfer/backend 线程。 | load/dump 队列会在线程内创建 `CopyStream`，用户地址与 memory buffer 之间的数据搬运通过 `Trans::Stream` 的 `HostToDeviceAsync` / `DeviceToHostAsync` 完成。 |
+| backend 交互 | backend load/dump 以 shard 为单位异步提交，`Wait` 发生在 queue stage。 | token miss 会退化成整 shard 的 backend `Load`，并在 `TransBuffer` 内同步 `Wait`；full shard dump 也是在 `TransBuffer` 内同步 `Wait`。 |
+| 配置面 | 依赖 `device_id`、`share_buffer_enable`、`cache_buffer_capacity_gb`、`running_queue_depth`、`stream_number`、`use_gdr`、`cpu_affinity_cores` 等。 | 当前使用 `device_id`、`cache_stream_number` / `memory_stream_number`、`use_gdr`、`shard_size`、`block_size`、`tensor_size(_list)`、`memory_token_chunk_size`、`memory_buffer_capacity_gb`、`memory_required_tensor_types`、`memory_tensor_size_by_type_*`、`waiting_queue_depth`、`timeout_ms`。 |
+
+### 当前实现上的具体说明
+
+1. `MemoryStore` 已经不是 `CacheStore` 的“轻微变体”，而是独立的数据模型。
+   `CacheStore` 的核心对象是完整 shard buffer；`MemoryStore` 的核心对象是 typed token
+   chunk，再从 chunk 派生 full-shard ready 状态。
+
+2. `MemoryStore` 的标准 `Lookup` 语义目前比 `CacheStore` 更“本地化”。
+   `CacheStore::Lookup` 会在本地 miss 后继续问 backend；`MemoryStore::Lookup`
+   只看本地 `fullReady_`。因此标准 `Lookup` 在两个 store 间并不完全等价。
+
+3. `MemoryStore` 现在在“谁负责传输”这件事上更接近 `CacheStore`，但 backend 执行流仍然
+   不相同。
+   当前 load/dump queue 负责通过 `CopyStream` 和 `Trans::Stream` 处理调用方地址与设备/host
+   buffer 之间的搬运；`TransBuffer` 退回到 host 侧，只负责 chunk/full-shard 拼装与 backend
+   交互。
+   `CacheStore` 仍然把 backend wait 放在线程队列阶段，围绕异步 shard transfer 工作；
+   `MemoryStore` 则在 `LoadFullFromBackend` / `DumpFullToBackend` 中直接同步等待 backend
+   完成，然后再继续 token/full-shard 转换。
+
+4. `MemoryStore` 当前没有实现设计文档里提到的显式 `memory_full_shard_layout`
+   配置。现有 `SplitFullShard` / `AssembleFullShard` 直接假设 full shard 的字节布局是：
+   按 token 顺序遍历，每个 token 内再按 `memory_required_tensor_types` 顺序拼接。
+   这意味着它并不是像 `CacheStore` 一样对任意 shard layout 配置开放。
+
+5. `MemoryStore` 的并发模型仍然比 `CacheStore` 更保守。
+   当前只有 load queue 和 dump queue 两条工作线程，线程内通过 `CopyStream` 做用户地址
+   传输，底层 `TransBuffer` 由单 mutex 串行保护；`CacheStore` 则进一步拆成 dispatch、
+   copy、backend wait 等阶段，并引入 running queue、buffer handle、stream 并发。
+
+6. `MemoryStore` 的淘汰单位是 token chunk，而 `CacheStore` 的淘汰单位是 shard buffer slot。
+   这意味着 `MemoryStore` 在命中、驱逐和 ready 判定上都天然带有 token/type 粒度，
+   即使它对外还保留了标准 shard 视图。
+
+这部分对比应该作为后续继续演进 `MemoryStore` 时的基线：当前实现已经保证了
+backend full-shard 兼容，调用方数据搬运已经收敛到 queue 持有的 `Trans::Stream`
+流程里，`TransBuffer` 也不再保留整个 `Config`；但它仍没有在 backend wait 流程、
+并发拆分或 lookup 语义上完全复制 `CacheStore`。
+
 ## 架构
 
 新增一个共享库：

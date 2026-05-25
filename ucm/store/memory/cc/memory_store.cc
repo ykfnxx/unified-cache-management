@@ -10,7 +10,6 @@
 namespace UC::MemoryStore {
 
 class MemoryStore : public StoreV1 {
-    Config config_{};
     TransBuffer buffer_;
     TransManager transMgr_;
 
@@ -33,8 +32,7 @@ public:
             UC_ERROR("Failed({}) to setup memory transfer manager.", s);
             return s;
         }
-        config_ = std::move(config);
-        ShowConfig(config_);
+        ShowConfig(config);
         return Status::OK();
     }
 
@@ -50,9 +48,7 @@ public:
     Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num) override
     {
         auto res = buffer_.LookupOnPrefix(blocks, num);
-        if (!res) {
-            UC_ERROR("Failed({}) to lookup memory prefix blocks({}).", res.Error(), num);
-        }
+        if (!res) { UC_ERROR("Failed({}) to lookup memory prefix blocks({}).", res.Error(), num); }
         return res;
     }
 
@@ -116,6 +112,7 @@ private:
         Config config;
         dict.Get("store_backend", config.storeBackend);
         dict.Get("unique_id", config.uniqueId);
+        dict.GetNumber("device_id", config.deviceId);
         size_t tensorSize = 0;
         dict.GetNumber("tensor_size", tensorSize);
         dict.GetNumber("shard_size", config.shardSize);
@@ -131,6 +128,10 @@ private:
         if (capacityGb > 0) { config.memoryBufferCapacity = capacityGb << 30; }
         dict.GetNumber("waiting_queue_depth", config.waitingQueueDepth);
         dict.GetNumber("timeout_ms", config.timeoutMs);
+        dict.GetNumber("cache_stream_number", config.streamNumber);
+        dict.GetNumber("memory_stream_number", config.streamNumber);
+        dict.Get("use_gdr", config.useGdr);
+        dict.Get("cpu_affinity_cores", config.cpuAffinityCores);
 
         std::vector<size_t> required;
         dict.GetNumbers("memory_required_tensor_types", required);
@@ -150,6 +151,9 @@ private:
 
     Status CheckConfig(Config& config)
     {
+        if (config.deviceId < 0) {
+            return Status::InvalidParam("invalid device({})", config.deviceId);
+        }
         if (config.shardSize == 0) { return Status::InvalidParam("invalid shard size"); }
         if (config.blockSize == 0 || config.blockSize % config.shardSize != 0) {
             return Status::InvalidParam("invalid block size({})", config.blockSize);
@@ -161,6 +165,16 @@ private:
         if (config.memoryTokenChunkSize == 0) {
             return Status::InvalidParam("invalid memory token chunk size");
         }
+        if (config.streamNumber == 0) {
+            return Status::InvalidParam("invalid stream number({})", config.streamNumber);
+        }
+#ifdef CPU_SETSIZE
+        for (const auto core : config.cpuAffinityCores) {
+            if (core < 0 || core >= CPU_SETSIZE) {
+                return Status::InvalidParam("invalid cpu core({})", core);
+            }
+        }
+#endif
         if (config.requiredTensorTypes.empty()) {
             return Status::InvalidParam("invalid memory required tensor types");
         }
@@ -173,8 +187,8 @@ private:
             perTokenSize += Sum(iter->second);
         }
         if (perTokenSize == 0 || config.shardSize % perTokenSize != 0) {
-            return Status::InvalidParam("invalid token payload size({}) on shard({})",
-                                        perTokenSize, config.shardSize);
+            return Status::InvalidParam("invalid token payload size({}) on shard({})", perTokenSize,
+                                        config.shardSize);
         }
         config.tokensPerBlock = config.shardSize / perTokenSize;
         return Status::OK();
@@ -186,6 +200,7 @@ private:
         UC_INFO("{}-{}({}).", ns, UCM_COMMIT_ID, UCM_BUILD_TYPE);
         UC_INFO("Set {}::StoreBackend to {}.", ns,
                 config.storeBackend ? config.storeBackend->Readme() : "null");
+        UC_INFO("Set {}::DeviceId to {}.", ns, config.deviceId);
         UC_INFO("Set {}::ShardSize to {}.", ns, config.shardSize);
         UC_INFO("Set {}::BlockSize to {}.", ns, config.blockSize);
         UC_INFO("Set {}::TensorSizes to {}.", ns, config.tensorSizes);
@@ -193,6 +208,8 @@ private:
         UC_INFO("Set {}::TokensPerBlock to {}.", ns, config.tokensPerBlock);
         UC_INFO("Set {}::WaitingQueueDepth to {}.", ns, config.waitingQueueDepth);
         UC_INFO("Set {}::TimeoutMs to {}.", ns, config.timeoutMs);
+        UC_INFO("Set {}::StreamNumber to {}.", ns, config.streamNumber);
+        UC_INFO("Set {}::UseGdr to {}.", ns, config.useGdr);
     }
 };
 

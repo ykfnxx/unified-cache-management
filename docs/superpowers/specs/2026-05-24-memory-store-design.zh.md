@@ -57,7 +57,7 @@ builder 会先 stack `Posix`，再 stack `Cache`。外部公开调用落到栈�
 | API 面 | 只实现标准 `StoreV1` 接口。token-layer 方法仍然走 `StoreV1` 默认 unsupported。 | 在标准接口之外，额外实现 `LookupTokens`、`LoadTokens`、`DumpTokens`。 |
 | 内部数据粒度 | 以内存 buffer slot 保存完整 `(block_id, shard_index)` shard。 | 以 `(block_id, layer_id, chunk_id, tensor_type)` 为 key 保存 token chunk，并额外维护 `(block_id, layer_id)` 的 `fullReady` 集合。 |
 | Lookup 路径 | `BufferManager` 先查本地 buffer；miss 时继续查 backend，`cacheLoadBackendOnly` 还可以显式绕过本地命中。 | `Lookup` / `LookupOnPrefix` / `LookupTokens` 都只查本地内存状态，不访问 backend。backend miss 补齐只发生在 `Load` / `LoadTokens`。 |
-| 传输模型 | 明确区分 host/device 传输，依赖 `device_id`、copy stream、可选 GDR、dispatch 线程和 transfer/backend 线程。 | 复用共享的 `trans/copy_stream.h` helper，并把传输拆成 staged queue。load 走 dispatch + transfer 两阶段，dump 走 dispatch + transfer + backend-host 三阶段。用户地址与 memory buffer 之间的数据搬运仍然通过 `Trans::Stream` 的 `HostToDeviceAsync` / `DeviceToHostAsync` 完成。 |
+| 传输模型 | 明确区分 host/device 传输，依赖 `device_id`、copy stream、可选 GDR、dispatch 线程和 transfer/backend 线程。 | 复用 store 层现有的 `cache/cc/copy_stream.h` helper，并把传输拆成 staged queue。load 走 dispatch + transfer 两阶段，dump 走 dispatch + transfer + backend-host 三阶段。用户地址与 memory buffer 之间的数据搬运仍然通过 `Trans::Stream` 的 `HostToDeviceAsync` / `DeviceToHostAsync` 完成。 |
 | backend 交互 | backend load/dump 以 shard 为单位异步提交，`Wait` 发生在 queue stage。 | token miss 会退化成整 shard 的 backend `Load`，并在 `TransBuffer` 内同步 `Wait`；full shard dump 也是在 `TransBuffer` 内同步 `Wait`。 |
 | 配置面 | 依赖 `device_id`、`share_buffer_enable`、`cache_buffer_capacity_gb`、`running_queue_depth`、`stream_number`、`use_gdr`、`cpu_affinity_cores` 等。 | 当前使用 `device_id`、`cache_stream_number` / `memory_stream_number`、`use_gdr`、`cpu_affinity_cores`、`shard_size`、`block_size`、`tensor_size(_list)`、`memory_token_chunk_size`、`memory_buffer_capacity_gb`、`memory_required_tensor_types`、`memory_tensor_size_by_type_*`、`waiting_queue_depth`、`running_queue_depth`、`timeout_ms`。 |
 
@@ -73,7 +73,7 @@ builder 会先 stack `Posix`，再 stack `Cache`。外部公开调用落到栈�
 
 3. `MemoryStore` 现在在“谁负责传输”和“queue 怎么分阶段”这两件事上更接近 `CacheStore`，
    但 backend 执行流仍然不相同。
-   当前 load/dump queue 负责通过共享的 `Trans::CopyStream` helper 和 `Trans::Stream`
+   当前 load/dump queue 负责通过现有 store 侧 `CopyStream` helper 和 `Trans::Stream`
    处理调用方地址与设备/host buffer 之间的搬运；`TransBuffer` 退回到 host 侧，只负责
    chunk/full-shard 拼装与 backend 交互。
    `CacheStore` 仍然把 backend wait 放在线程队列阶段，围绕异步 shard transfer 工作；

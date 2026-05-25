@@ -26,10 +26,10 @@
 
 #include <future>
 #include <thread>
+#include "copy_stream.h"
 #include "template/hashset.h"
 #include "template/spsc_ring_queue.h"
 #include "thread/latch.h"
-#include "trans/copy_stream.h"
 #include "trans_buffer.h"
 #include "trans_task.h"
 #include "ucmstore_v1.h"
@@ -70,8 +70,8 @@ public:
 
 private:
     void DispatchStage(std::promise<Status>& started);
-    void DispatchOneTask(Trans::CopyStream& stream, TaskPair&& pair);
-    Status DumpOneTask(Trans::CopyStream& stream, TaskPtr task);
+    void DispatchOneTask(CopyStream& stream, TaskPair&& pair);
+    Status DumpOneTask(CopyStream& stream, TaskPtr task);
     Status DeviceToHostGatherAsync(std::shared_ptr<Trans::Stream> stream, void** device,
                                    void* host);
     void BackendDumpStage();

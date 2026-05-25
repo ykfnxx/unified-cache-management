@@ -21,25 +21,25 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
-#ifndef UNIFIEDCACHE_TRANS_COPY_STREAM_H
-#define UNIFIEDCACHE_TRANS_COPY_STREAM_H
+#ifndef UNIFIEDCACHE_CACHE_STORE_CC_COPY_STREAM_H
+#define UNIFIEDCACHE_CACHE_STORE_CC_COPY_STREAM_H
 
 #include "logger/logger.h"
 #include "status/status.h"
 #include "trans/device.h"
 
-namespace UC::Trans {
+namespace UC::CacheStore {
 
 class CopyStream {
     int32_t deviceId_{-1};
     size_t streamNumber_{0};
     size_t streamIndex_{0};
-    std::vector<std::shared_ptr<Stream>> streams_;
+    std::vector<std::shared_ptr<Trans::Stream>> streams_;
 
 public:
     Status Setup(const int32_t deviceId, const size_t streamNumber, const bool useGdr)
     {
-        Device device;
+        Trans::Device device;
         auto s = device.Setup(deviceId);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to setup device({}).", s, deviceId);
@@ -47,7 +47,7 @@ public:
         }
         streams_.reserve(streamNumber);
         for (size_t i = 0; i < streamNumber; ++i) {
-            std::shared_ptr<Stream> stream =
+            std::shared_ptr<Trans::Stream> stream =
                 useGdr ? device.MakeGdrStream() : device.MakeSharedStream();
             if (!stream) [[unlikely]] {
                 UC_ERROR("Failed to make stream on device({}).", deviceId);
@@ -60,7 +60,7 @@ public:
         return Status::OK();
     }
 
-    std::shared_ptr<Stream> NextStream() noexcept
+    std::shared_ptr<Trans::Stream> NextStream() noexcept
     {
         if (streamNumber_ == 0) [[unlikely]] { return nullptr; }
         auto& stream = streams_[streamIndex_];
@@ -93,6 +93,6 @@ public:
     }
 };
 
-}  // namespace UC::Trans
+}  // namespace UC::CacheStore
 
 #endif

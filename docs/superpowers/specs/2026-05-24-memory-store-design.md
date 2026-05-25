@@ -61,7 +61,7 @@ intent. The main implementation anchors are:
 | API surface | Implements only the standard `StoreV1` methods. Token-layer methods still use the default unsupported behavior on `StoreV1`. | Implements `LookupTokens`, `LoadTokens`, and `DumpTokens` in addition to the standard methods. |
 | Internal storage unit | Stores full `(block_id, shard_index)` shards in buffer slots. | Stores token chunks keyed by `(block_id, layer_id, chunk_id, tensor_type)` and separately tracks `(block_id, layer_id)` in a `fullReady` set. |
 | Lookup path | `BufferManager` checks the local buffer first, then falls back to backend lookup on miss. `cacheLoadBackendOnly` can explicitly bypass local hits. | `Lookup`, `LookupOnPrefix`, and `LookupTokens` are local-memory checks only. Backend fetch on miss happens only through `Load` or `LoadTokens`. |
-| Transfer model | Explicit host/device transfer pipeline with `device_id`, copy streams, optional GDR, dispatch threads, and transfer/backend stages. | Reuses the shared `trans/copy_stream.h` helper and splits transfer into staged queues. Load uses dispatch + transfer stages; dump uses dispatch + transfer + backend-host stages. User-address transfer still goes through `Trans::Stream` `HostToDeviceAsync` / `DeviceToHostAsync`. |
+| Transfer model | Explicit host/device transfer pipeline with `device_id`, copy streams, optional GDR, dispatch threads, and transfer/backend stages. | Reuses the existing store-side `cache/cc/copy_stream.h` helper and splits transfer into staged queues. Load uses dispatch + transfer stages; dump uses dispatch + transfer + backend-host stages. User-address transfer still goes through `Trans::Stream` `HostToDeviceAsync` / `DeviceToHostAsync`. |
 | Backend interaction | Backend shard load/dump is submitted asynchronously and waited in queue stages. | Token misses degrade to full-shard backend `Load`, and `TransBuffer` waits synchronously inside `LoadFullFromBackend`. Full-shard dump also waits synchronously inside `DumpFullToBackend`. |
 | Config surface | Depends on `device_id`, `share_buffer_enable`, `cache_buffer_capacity_gb`, `running_queue_depth`, `stream_number`, `use_gdr`, `cpu_affinity_cores`, and related cache-transfer settings. | Currently uses `device_id`, `cache_stream_number` / `memory_stream_number`, `use_gdr`, `cpu_affinity_cores`, `shard_size`, `block_size`, `tensor_size(_list)`, `memory_token_chunk_size`, `memory_buffer_capacity_gb`, `memory_required_tensor_types`, `memory_tensor_size_by_type_*`, `waiting_queue_depth`, `running_queue_depth`, and `timeout_ms`. |
 
@@ -82,7 +82,7 @@ intent. The main implementation anchors are:
    ownership and queue staging, but it still does not match `CacheStore` on
    backend execution flow.
    The load and dump queues own caller-buffer/device transfers through the
-   shared `Trans::CopyStream` helper and `Trans::Stream`, while `TransBuffer`
+   existing store-side `CopyStream` helper and `Trans::Stream`, while `TransBuffer`
    stays on the host side for chunk assembly, full-shard assembly, and backend
    interaction.
    `CacheStore` still keeps backend wait inside its queue-driven transfer

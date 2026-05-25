@@ -132,7 +132,7 @@ void DumpQueue::DispatchOneTask(TaskPair&& pair)
 
 void DumpQueue::TransferStage(std::promise<Status>& started)
 {
-    Trans::CopyStream stream;
+    UC::CacheStore::CopyStream stream;
     auto s = stream.Setup(deviceId_, streamNumber_, useGdr_);
     started.set_value(s);
     if (s.Failure()) { return; }
@@ -143,7 +143,7 @@ void DumpQueue::TransferStage(std::promise<Status>& started)
     running_.ConsumerLoop(stop_, &DumpQueue::TransferOneTask, this, stream);
 }
 
-void DumpQueue::TransferOneTask(Trans::CopyStream& stream, CopyTask&& task)
+void DumpQueue::TransferOneTask(UC::CacheStore::CopyStream& stream, CopyTask&& task)
 {
     if (failureSet_->Contains(task.taskHandle)) {
         if (task.dumpTask.waiter) { task.dumpTask.waiter->Done(); }

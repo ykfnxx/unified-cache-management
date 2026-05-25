@@ -26,7 +26,7 @@
 #include <gtest/gtest.h>
 #include <memory>
 #include <type_traits>
-#include "trans/copy_stream.h"
+#include "cache/cc/copy_stream.h"
 #include "trans_buffer.h"
 #include "ucmstore_v1.h"
 
@@ -112,7 +112,7 @@ TEST(UCMMemoryStoreTest, TokenDumpLoadRoundTripUsesTensorType)
 
 TEST(UCMMemoryStoreStructureTest, CopyStreamMovesThroughTransferStream)
 {
-    UC::Trans::CopyStream copyStream;
+    UC::CacheStore::CopyStream copyStream;
     ASSERT_EQ(copyStream.Setup(0, 1, false), UC::Status::OK());
 
     std::array<std::byte, 4> src{std::byte{9}, std::byte{8}, std::byte{7}, std::byte{6}};

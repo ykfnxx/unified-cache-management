@@ -134,7 +134,7 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
 
 void LoadQueue::TransferStage(std::promise<Status>& started)
 {
-    Trans::CopyStream stream;
+    UC::CacheStore::CopyStream stream;
     auto s = stream.Setup(deviceId_, streamNumber_, useGdr_);
     started.set_value(s);
     if (s.Failure()) { return; }
@@ -145,7 +145,7 @@ void LoadQueue::TransferStage(std::promise<Status>& started)
     running_.ConsumerLoop(stop_, &LoadQueue::TransferOneTask, this, stream);
 }
 
-void LoadQueue::TransferOneTask(Trans::CopyStream& stream, CopyTask&& task)
+void LoadQueue::TransferOneTask(UC::CacheStore::CopyStream& stream, CopyTask&& task)
 {
     if (failureSet_->Contains(task.taskHandle)) {
         if (task.waiter) { task.waiter->Done(); }

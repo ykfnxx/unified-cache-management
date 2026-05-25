@@ -8,10 +8,10 @@
 
 #include <future>
 #include <thread>
+#include "cache/cc/copy_stream.h"
 #include "template/hashset.h"
 #include "template/spsc_ring_queue.h"
 #include "thread/latch.h"
-#include "trans/copy_stream.h"
 #include "trans_buffer.h"
 #include "trans_task.h"
 
@@ -39,7 +39,7 @@ private:
     void DispatchStage();
     void DispatchOneTask(TaskPair&& pair);
     void TransferStage(std::promise<Status>& started);
-    void TransferOneTask(Trans::CopyStream& stream, CopyTask&& task);
+    void TransferOneTask(UC::CacheStore::CopyStream& stream, CopyTask&& task);
     Status HostToDeviceScatterAsync(std::shared_ptr<Trans::Stream> stream, void* host,
                                     const std::vector<size_t>& sizes, void** device);
 

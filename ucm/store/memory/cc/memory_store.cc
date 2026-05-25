@@ -127,6 +127,7 @@ private:
         dict.GetNumber("memory_buffer_capacity_gb", capacityGb);
         if (capacityGb > 0) { config.memoryBufferCapacity = capacityGb << 30; }
         dict.GetNumber("waiting_queue_depth", config.waitingQueueDepth);
+        dict.GetNumber("running_queue_depth", config.runningQueueDepth);
         dict.GetNumber("timeout_ms", config.timeoutMs);
         dict.GetNumber("cache_stream_number", config.streamNumber);
         dict.GetNumber("memory_stream_number", config.streamNumber);
@@ -165,7 +166,11 @@ private:
         if (config.memoryTokenChunkSize == 0) {
             return Status::InvalidParam("invalid memory token chunk size");
         }
-        if (config.streamNumber == 0) {
+        if (config.waitingQueueDepth <= 1 || config.runningQueueDepth <= 1) {
+            return Status::InvalidParam("invalid queue depth({},{})", config.waitingQueueDepth,
+                                        config.runningQueueDepth);
+        }
+        if (config.streamNumber < 1 || config.streamNumber > 32) {
             return Status::InvalidParam("invalid stream number({})", config.streamNumber);
         }
 #ifdef CPU_SETSIZE
@@ -206,7 +211,9 @@ private:
         UC_INFO("Set {}::TensorSizes to {}.", ns, config.tensorSizes);
         UC_INFO("Set {}::MemoryTokenChunkSize to {}.", ns, config.memoryTokenChunkSize);
         UC_INFO("Set {}::TokensPerBlock to {}.", ns, config.tokensPerBlock);
+        UC_INFO("Set {}::CpuAffinityCores to {}.", ns, config.cpuAffinityCores);
         UC_INFO("Set {}::WaitingQueueDepth to {}.", ns, config.waitingQueueDepth);
+        UC_INFO("Set {}::RunningQueueDepth to {}.", ns, config.runningQueueDepth);
         UC_INFO("Set {}::TimeoutMs to {}.", ns, config.timeoutMs);
         UC_INFO("Set {}::StreamNumber to {}.", ns, config.streamNumber);
         UC_INFO("Set {}::UseGdr to {}.", ns, config.useGdr);

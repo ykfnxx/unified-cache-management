@@ -65,7 +65,7 @@ void DumpQueue::Submit(TaskPtr task, WaiterPtr waiter)
 
 void DumpQueue::DispatchStage(std::promise<Status>& started)
 {
-    CopyStream stream;
+    Trans::CopyStream stream;
     auto s = stream.Setup(deviceId_, streamNumber_, useGdr_);
     started.set_value(s);
     if (s.Failure()) [[unlikely]] { return; }
@@ -76,7 +76,7 @@ void DumpQueue::DispatchStage(std::promise<Status>& started)
     waiting_.ConsumerLoop(stop_, &DumpQueue::DispatchOneTask, this, stream);
 }
 
-void DumpQueue::DispatchOneTask(CopyStream& stream, TaskPair&& pair)
+void DumpQueue::DispatchOneTask(Trans::CopyStream& stream, TaskPair&& pair)
 {
     auto& task = pair.first;
     auto& waiter = pair.second;
@@ -89,7 +89,7 @@ void DumpQueue::DispatchOneTask(CopyStream& stream, TaskPair&& pair)
     waiter->Done();
 }
 
-Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
+Status DumpQueue::DumpOneTask(Trans::CopyStream& stream, TaskPtr task)
 {
     auto tp = NowTime::Now();
     Detail::TaskDesc backendTaskDesc;

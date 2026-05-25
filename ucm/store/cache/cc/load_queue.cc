@@ -115,7 +115,7 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
 
 void LoadQueue::TransferStage(std::promise<Status>& started)
 {
-    CopyStream stream;
+    Trans::CopyStream stream;
     auto s = stream.Setup(deviceId_, streamNumber_, useGdr_);
     started.set_value(s);
     if (s.Failure()) [[unlikely]] { return; }
@@ -126,7 +126,7 @@ void LoadQueue::TransferStage(std::promise<Status>& started)
     running_.ConsumerLoop(stop_, &LoadQueue::TransferOneTask, this, stream);
 }
 
-void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
+void LoadQueue::TransferOneTask(Trans::CopyStream& stream, ShardTask&& task)
 {
     if (failureSet_->Contains(task.taskHandle)) {
         if (task.waiter) { task.waiter->Done(); }

@@ -8,10 +8,10 @@
 
 #include <future>
 #include <thread>
-#include "copy_stream.h"
 #include "template/hashset.h"
 #include "template/spsc_ring_queue.h"
 #include "thread/latch.h"
+#include "trans/copy_stream.h"
 #include "trans_buffer.h"
 #include "trans_task.h"
 
@@ -22,6 +22,13 @@ class LoadQueue {
     using WaiterPtr = std::shared_ptr<Latch>;
     using TaskPair = std::pair<TaskPtr, WaiterPtr>;
     using TaskIdSet = HashSet<Detail::TaskHandle>;
+    struct CopyTask {
+        Detail::TaskHandle taskHandle;
+        std::vector<size_t> sizes;
+        std::vector<std::byte> hostBuffer;
+        std::vector<void*> deviceAddrs;
+        WaiterPtr waiter;
+    };
 
 public:
     ~LoadQueue();
@@ -29,8 +36,10 @@ public:
     void Submit(TaskPtr task, WaiterPtr waiter);
 
 private:
-    void DispatchStage(std::promise<Status>& started);
-    void DispatchOneTask(CopyStream& stream, TaskPair&& pair);
+    void DispatchStage();
+    void DispatchOneTask(TaskPair&& pair);
+    void TransferStage(std::promise<Status>& started);
+    void TransferOneTask(Trans::CopyStream& stream, CopyTask&& task);
     Status HostToDeviceScatterAsync(std::shared_ptr<Trans::Stream> stream, void* host,
                                     const std::vector<size_t>& sizes, void** device);
 
@@ -43,8 +52,12 @@ private:
     std::unordered_map<Detail::TensorType, std::vector<size_t>> tensorSizesByType_{};
     size_t streamNumber_{1};
     bool useGdr_{false};
+    std::vector<ssize_t> cpuAffinityCores_{};
     SpscRingQueue<TaskPair> waiting_;
+    SpscRingQueue<CopyTask> running_;
     std::thread dispatcher_;
+    std::thread transfer_;
+    std::vector<CopyTask> holder_;
 };
 
 }  // namespace UC::MemoryStore

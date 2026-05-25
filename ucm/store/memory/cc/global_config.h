@@ -22,6 +22,7 @@ struct Config {
     size_t memoryTokenChunkSize{16};
     size_t memoryBufferCapacity{1ULL << 30};
     size_t waitingQueueDepth{8192};
+    size_t runningQueueDepth{524288};
     size_t timeoutMs{30000};
     size_t streamNumber{1};
     bool useGdr{false};

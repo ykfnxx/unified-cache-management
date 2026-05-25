@@ -63,14 +63,7 @@ Expected<std::vector<uint8_t>> TransBuffer::Lookup(const Detail::BlockId* blocks
     result.reserve(num);
     std::lock_guard<std::mutex> guard(mutex_);
     for (size_t i = 0; i < num; ++i) {
-        bool hit = false;
-        for (size_t layer = 0; layer < LayerNumber(); ++layer) {
-            if (IsFullReadyNoLock(blocks[i], layer)) {
-                hit = true;
-                break;
-            }
-        }
-        result.push_back(hit);
+        result.push_back(IsFullReadyNoLock(blocks[i], 0));
     }
     return result;
 }

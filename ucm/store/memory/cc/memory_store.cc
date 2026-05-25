@@ -17,12 +17,16 @@ Status MemoryStore::Setup(const Config& inConfig)
         UC_ERROR("Failed to check memory store config: {}.", s);
         return s;
     }
-    s = buffer_.Setup(config);
-    if (s.Failure()) {
-        UC_ERROR("Failed({}) to setup memory buffer.", s);
-        return s;
+    storeBackend_ = reinterpret_cast<StoreV1*>(config.storeBackend);
+    bufferEnable_ = config.deviceId >= 0;
+    if (bufferEnable_) {
+        s = buffer_.Setup(config);
+        if (s.Failure()) {
+            UC_ERROR("Failed({}) to setup memory buffer.", s);
+            return s;
+        }
     }
-    transEnable_ = config.deviceId >= 0;
+    transEnable_ = bufferEnable_;
     if (transEnable_) {
         s = transMgr_.Setup(config, &buffer_);
         if (s.Failure()) {
@@ -38,16 +42,91 @@ std::string MemoryStore::Readme() const { return "MemoryStore"; }
 
 Expected<std::vector<uint8_t>> MemoryStore::Lookup(const Detail::BlockId* blocks, size_t num)
 {
+    if (!bufferEnable_) {
+        if (!storeBackend_) { return Status::InvalidParam("invalid store backend"); }
+        auto res = storeBackend_->Lookup(blocks, num);
+        if (!res) { UC_ERROR("Failed({}) to lookup memory backend blocks({}).", res.Error(), num); }
+        return res;
+    }
+
     auto res = buffer_.Lookup(blocks, num);
-    if (!res) { UC_ERROR("Failed({}) to lookup memory blocks({}).", res.Error(), num); }
-    return res;
+    if (!res) {
+        UC_ERROR("Failed({}) to lookup memory blocks({}).", res.Error(), num);
+        return res;
+    }
+    auto results = std::move(res).Value();
+    if (!storeBackend_) { return results; }
+
+    std::vector<Detail::BlockId> misses;
+    std::vector<size_t> missIndexes;
+    misses.reserve(num);
+    missIndexes.reserve(num);
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (results[i]) { continue; }
+        misses.push_back(blocks[i]);
+        missIndexes.push_back(i);
+    }
+    if (misses.empty()) { return results; }
+
+    auto backendRes = storeBackend_->Lookup(misses.data(), misses.size());
+    if (!backendRes) { return backendRes.Error(); }
+    auto backendHits = std::move(backendRes).Value();
+    if (backendHits.size() != missIndexes.size()) {
+        return Status::InvalidParam("invalid backend lookup result size({},{})",
+                                    backendHits.size(), missIndexes.size());
+    }
+    for (size_t i = 0; i < missIndexes.size(); ++i) {
+        results[missIndexes[i]] = backendHits[i];
+    }
+    return results;
 }
 
 Expected<ssize_t> MemoryStore::LookupOnPrefix(const Detail::BlockId* blocks, size_t num)
 {
-    auto res = buffer_.LookupOnPrefix(blocks, num);
-    if (!res) { UC_ERROR("Failed({}) to lookup memory prefix blocks({}).", res.Error(), num); }
-    return res;
+    if (!bufferEnable_) {
+        if (!storeBackend_) { return Status::InvalidParam("invalid store backend"); }
+        auto res = storeBackend_->LookupOnPrefix(blocks, num);
+        if (!res) {
+            UC_ERROR("Failed({}) to lookup memory backend prefix blocks({}).", res.Error(), num);
+        }
+        return res;
+    }
+
+    auto local = buffer_.Lookup(blocks, num);
+    if (!local) {
+        UC_ERROR("Failed({}) to lookup memory prefix blocks({}).", local.Error(), num);
+        return local.Error();
+    }
+    auto hits = std::move(local).Value();
+
+    std::vector<Detail::BlockId> misses;
+    std::vector<size_t> missIndexes;
+    misses.reserve(num);
+    missIndexes.reserve(num);
+    for (size_t i = 0; i < hits.size(); ++i) {
+        if (hits[i]) { continue; }
+        misses.push_back(blocks[i]);
+        missIndexes.push_back(i);
+    }
+    if (misses.empty()) { return static_cast<ssize_t>(num) - 1; }
+    if (!storeBackend_) {
+        return missIndexes.front() == 0 ? -1 : static_cast<ssize_t>(missIndexes.front()) - 1;
+    }
+
+    auto backendRes = storeBackend_->LookupOnPrefix(misses.data(), misses.size());
+    if (!backendRes) { return backendRes.Error(); }
+    const auto backendPrefix = backendRes.Value();
+    if (backendPrefix < -1 ||
+        static_cast<size_t>(backendPrefix + 1) > missIndexes.size()) {
+        return Status::InvalidParam("invalid backend prefix result({},{})", backendPrefix,
+                                    missIndexes.size());
+    }
+    if (static_cast<size_t>(backendPrefix + 1) == missIndexes.size()) {
+        return static_cast<ssize_t>(num) - 1;
+    }
+    return missIndexes[backendPrefix + 1] == 0
+        ? -1
+        : static_cast<ssize_t>(missIndexes[backendPrefix + 1]) - 1;
 }
 
 void MemoryStore::Prefetch(const Detail::BlockId*, size_t) {}
@@ -119,6 +198,10 @@ Status MemoryStore::CheckConfig(Config& config)
 {
     if (config.deviceId < -1) {
         return Status::InvalidParam("invalid device({})", config.deviceId);
+    }
+    if (config.deviceId == -1) {
+        if (!config.storeBackend) { return Status::InvalidParam("invalid store backend"); }
+        return Status::OK();
     }
     if (config.shardSize == 0) { return Status::InvalidParam("invalid shard size"); }
     if (config.blockSize == 0 || config.blockSize % config.shardSize != 0) {

@@ -37,6 +37,8 @@ private:
 
 private:
     TransBuffer buffer_;
+    StoreV1* storeBackend_{nullptr};
+    bool bufferEnable_{false};
     bool transEnable_{false};
     TransManager transMgr_;
 };

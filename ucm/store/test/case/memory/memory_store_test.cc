@@ -17,6 +17,7 @@
 #include "dump_queue.h"
 #include "load_queue.h"
 #include "memory_store.h"
+#include "detail/mock_store.h"
 #include "trans/device.h"
 #include "trans_buffer.h"
 #include "ucmstore_v1.h"
@@ -350,6 +351,270 @@ TEST(UCMMemoryStoreValidationTest, DumpRejectsFullShardAddrCountMismatch)
     auto dumpTask = store.Dump(dump);
     ASSERT_TRUE(dumpTask.HasValue());
     EXPECT_NE(store.Wait(dumpTask.Value()), UC::Status::OK());
+}
+
+TEST(UCMMemoryStoreCacheStoreContractTest, SchedulerLookupDelegatesToBackend)
+{
+    using namespace UC::MemoryStore;
+    using testing::_;
+    using testing::Return;
+
+    UC::Test::Detail::MockStore backend;
+    EXPECT_CALL(backend, Readme()).WillRepeatedly(Return("MockStore"));
+    std::array<UC::Detail::BlockId, 3> blocks{MakeBlockId(61), MakeBlockId(62),
+                                              MakeBlockId(63)};
+    EXPECT_CALL(backend, Lookup(_, blocks.size())).WillOnce(Return(std::vector<uint8_t>{1, 0, 1}));
+
+    MemoryStore store;
+    Config config;
+    config.storeBackend = reinterpret_cast<uintptr_t>(&backend);
+    config.deviceId = -1;
+    ASSERT_EQ(store.Setup(config), UC::Status::OK());
+
+    auto lookup = store.Lookup(blocks.data(), blocks.size());
+    ASSERT_TRUE(lookup.HasValue());
+    EXPECT_EQ(lookup.Value(), (std::vector<uint8_t>{1, 0, 1}));
+}
+
+TEST(UCMMemoryStoreCacheStoreContractTest, WorkerLookupMissesBackendAndMergesResults)
+{
+    using namespace UC::MemoryStore;
+    using testing::_;
+    using testing::Return;
+
+    UC::Test::Detail::MockStore backend;
+    EXPECT_CALL(backend, Readme()).WillRepeatedly(Return("MockStore"));
+    std::array<UC::Detail::BlockId, 3> blocks{MakeBlockId(64), MakeBlockId(65),
+                                              MakeBlockId(66)};
+    EXPECT_CALL(backend, Lookup(_, blocks.size())).WillOnce(Return(std::vector<uint8_t>{0, 1, 1}));
+
+    MemoryStore store;
+    Config config;
+    config.storeBackend = reinterpret_cast<uintptr_t>(&backend);
+    config.deviceId = 0;
+    config.shardSize = 4;
+    config.blockSize = 4;
+    config.tensorSizeList = {4};
+    config.memoryTokenChunkSize = 1;
+    config.memoryBufferCapacity = 1ULL << 20;
+    config.requiredTensorTypes = {0};
+    config.tensorSizesByType = {{0, {4}}};
+    ASSERT_EQ(store.Setup(config), UC::Status::OK());
+
+    auto lookup = store.Lookup(blocks.data(), blocks.size());
+    ASSERT_TRUE(lookup.HasValue());
+    EXPECT_EQ(lookup.Value(), (std::vector<uint8_t>{0, 1, 1}));
+}
+
+TEST(UCMMemoryStoreCacheStoreContractTest, WorkerLookupKeepsLocalHitsAndQueriesBackendMisses)
+{
+    using namespace UC::MemoryStore;
+    using testing::_;
+    using testing::Return;
+
+    UC::Test::Detail::MockStore backend;
+    EXPECT_CALL(backend, Readme()).WillRepeatedly(Return("MockStore"));
+
+    MemoryStore store;
+    Config config;
+    config.storeBackend = reinterpret_cast<uintptr_t>(&backend);
+    config.deviceId = 0;
+    config.shardSize = 4;
+    config.blockSize = 4;
+    config.tensorSizeList = {4};
+    config.memoryTokenChunkSize = 1;
+    config.memoryBufferCapacity = 1ULL << 20;
+    config.requiredTensorTypes = {0};
+    config.tensorSizesByType = {{0, {4}}};
+    ASSERT_EQ(store.Setup(config), UC::Status::OK());
+
+    auto localHit = MakeBlockId(70);
+    std::array<std::byte, 4> payload{std::byte{1}, std::byte{2}, std::byte{3},
+                                     std::byte{4}};
+    EXPECT_CALL(backend, Dump(_)).WillOnce(Return(UC::Detail::TaskHandle{101}));
+    EXPECT_CALL(backend, Wait(UC::Detail::TaskHandle{101})).WillOnce(Return(UC::Status::OK()));
+    UC::Detail::TaskDesc dump;
+    dump.push_back(UC::Detail::Shard{localHit, 0, {payload.data()}});
+    auto dumpTask = store.Dump(dump);
+    ASSERT_TRUE(dumpTask.HasValue());
+    ASSERT_EQ(store.Wait(dumpTask.Value()), UC::Status::OK());
+
+    std::array<UC::Detail::BlockId, 3> blocks{localHit, MakeBlockId(71), MakeBlockId(72)};
+    EXPECT_CALL(backend, Lookup(_, 2)).WillOnce(Return(std::vector<uint8_t>{1, 0}));
+
+    auto lookup = store.Lookup(blocks.data(), blocks.size());
+    ASSERT_TRUE(lookup.HasValue());
+    EXPECT_EQ(lookup.Value(), (std::vector<uint8_t>{1, 1, 0}));
+}
+
+TEST(UCMMemoryStoreCacheStoreContractTest, WorkerLookupUsesShardZeroAsLocalBlockHit)
+{
+    using namespace UC::MemoryStore;
+    using testing::_;
+    using testing::Return;
+
+    UC::Test::Detail::MockStore backend;
+    EXPECT_CALL(backend, Readme()).WillRepeatedly(Return("MockStore"));
+
+    MemoryStore store;
+    Config config;
+    config.storeBackend = reinterpret_cast<uintptr_t>(&backend);
+    config.deviceId = 0;
+    config.shardSize = 4;
+    config.blockSize = 8;
+    config.tensorSizeList = {4};
+    config.memoryTokenChunkSize = 1;
+    config.memoryBufferCapacity = 1ULL << 20;
+    config.requiredTensorTypes = {0};
+    config.tensorSizesByType = {{0, {4}}};
+    ASSERT_EQ(store.Setup(config), UC::Status::OK());
+
+    auto block = MakeBlockId(73);
+    std::array<std::byte, 4> payload{std::byte{1}, std::byte{2}, std::byte{3},
+                                     std::byte{4}};
+    EXPECT_CALL(backend, Dump(_)).WillOnce(Return(UC::Detail::TaskHandle{102}));
+    EXPECT_CALL(backend, Wait(UC::Detail::TaskHandle{102})).WillOnce(Return(UC::Status::OK()));
+    UC::Detail::TaskDesc dump;
+    dump.push_back(UC::Detail::Shard{block, 1, {payload.data()}});
+    auto dumpTask = store.Dump(dump);
+    ASSERT_TRUE(dumpTask.HasValue());
+    ASSERT_EQ(store.Wait(dumpTask.Value()), UC::Status::OK());
+
+    EXPECT_CALL(backend, Lookup(_, 1)).WillOnce(Return(std::vector<uint8_t>{0}));
+    auto lookup = store.Lookup(&block, 1);
+    ASSERT_TRUE(lookup.HasValue());
+    EXPECT_EQ(lookup.Value(), std::vector<uint8_t>{0});
+}
+
+TEST(UCMMemoryStoreCacheStoreContractTest, WorkerLookupOnPrefixMissesBackend)
+{
+    using namespace UC::MemoryStore;
+    using testing::_;
+    using testing::Return;
+
+    UC::Test::Detail::MockStore backend;
+    EXPECT_CALL(backend, Readme()).WillRepeatedly(Return("MockStore"));
+    std::array<UC::Detail::BlockId, 3> blocks{MakeBlockId(67), MakeBlockId(68),
+                                              MakeBlockId(69)};
+    EXPECT_CALL(backend, LookupOnPrefix(_, blocks.size())).WillOnce(Return(ssize_t{1}));
+
+    MemoryStore store;
+    Config config;
+    config.storeBackend = reinterpret_cast<uintptr_t>(&backend);
+    config.deviceId = 0;
+    config.shardSize = 4;
+    config.blockSize = 4;
+    config.tensorSizeList = {4};
+    config.memoryTokenChunkSize = 1;
+    config.memoryBufferCapacity = 1ULL << 20;
+    config.requiredTensorTypes = {0};
+    config.tensorSizesByType = {{0, {4}}};
+    ASSERT_EQ(store.Setup(config), UC::Status::OK());
+
+    auto lookup = store.LookupOnPrefix(blocks.data(), blocks.size());
+    ASSERT_TRUE(lookup.HasValue());
+    EXPECT_EQ(lookup.Value(), 1);
+}
+
+TEST(UCMMemoryStoreCacheStoreContractTest, StandardDumpLoadPreservesOrdinaryMultiTensorLayout)
+{
+    using namespace UC::MemoryStore;
+    using testing::_;
+    using testing::Return;
+
+    UC::Test::Detail::MockStore backend;
+    EXPECT_CALL(backend, Readme()).WillRepeatedly(Return("MockStore"));
+    EXPECT_CALL(backend, Dump(_)).WillOnce(Return(UC::Detail::TaskHandle{103}));
+    EXPECT_CALL(backend, Wait(UC::Detail::TaskHandle{103})).WillOnce(Return(UC::Status::OK()));
+    EXPECT_CALL(backend, Load(_)).Times(0);
+
+    MemoryStore store;
+    Config config;
+    config.storeBackend = reinterpret_cast<uintptr_t>(&backend);
+    config.deviceId = 0;
+    config.shardSize = 16;
+    config.blockSize = 16;
+    config.tensorSizeList = {4, 4, 4, 4};
+    config.memoryTokenChunkSize = 2;
+    config.memoryBufferCapacity = 1ULL << 20;
+    config.requiredTensorTypes = {0, 1};
+    config.tensorSizesByType = {{0, {2}}, {1, {2}}};
+    ASSERT_EQ(store.Setup(config), UC::Status::OK());
+
+    auto block = MakeBlockId(74);
+    std::array<std::byte, 4> src0{std::byte{1}, std::byte{2}, std::byte{3},
+                                  std::byte{4}};
+    std::array<std::byte, 4> src1{std::byte{5}, std::byte{6}, std::byte{7},
+                                  std::byte{8}};
+    std::array<std::byte, 4> src2{std::byte{9}, std::byte{10}, std::byte{11},
+                                  std::byte{12}};
+    std::array<std::byte, 4> src3{std::byte{13}, std::byte{14}, std::byte{15},
+                                  std::byte{16}};
+    UC::Detail::TaskDesc dump;
+    dump.push_back(UC::Detail::Shard{block, 0, {src0.data(), src1.data(), src2.data(),
+                                                src3.data()}});
+    auto dumpTask = store.Dump(dump);
+    ASSERT_TRUE(dumpTask.HasValue());
+    ASSERT_EQ(store.Wait(dumpTask.Value()), UC::Status::OK());
+
+    std::array<std::byte, 4> dst0{};
+    std::array<std::byte, 4> dst1{};
+    std::array<std::byte, 4> dst2{};
+    std::array<std::byte, 4> dst3{};
+    UC::Detail::TaskDesc load;
+    load.push_back(UC::Detail::Shard{block, 0, {dst0.data(), dst1.data(), dst2.data(),
+                                                dst3.data()}});
+    auto loadTask = store.Load(load);
+    ASSERT_TRUE(loadTask.HasValue());
+    ASSERT_EQ(store.Wait(loadTask.Value()), UC::Status::OK());
+
+    EXPECT_EQ(dst0, src0);
+    EXPECT_EQ(dst1, src1);
+    EXPECT_EQ(dst2, src2);
+    EXPECT_EQ(dst3, src3);
+}
+
+TEST(UCMMemoryStoreCacheStoreContractTest, StandardDumpLoadPreservesLayerwiseShardLayout)
+{
+    using namespace UC::MemoryStore;
+    using testing::_;
+    using testing::Return;
+
+    UC::Test::Detail::MockStore backend;
+    EXPECT_CALL(backend, Readme()).WillRepeatedly(Return("MockStore"));
+    EXPECT_CALL(backend, Dump(_)).WillOnce(Return(UC::Detail::TaskHandle{104}));
+    EXPECT_CALL(backend, Wait(UC::Detail::TaskHandle{104})).WillOnce(Return(UC::Status::OK()));
+    EXPECT_CALL(backend, Load(_)).Times(0);
+
+    MemoryStore store;
+    Config config;
+    config.storeBackend = reinterpret_cast<uintptr_t>(&backend);
+    config.deviceId = 0;
+    config.shardSize = 4;
+    config.blockSize = 16;
+    config.tensorSizeList = {4};
+    config.memoryTokenChunkSize = 1;
+    config.memoryBufferCapacity = 1ULL << 20;
+    config.requiredTensorTypes = {0};
+    config.tensorSizesByType = {{0, {4}}};
+    ASSERT_EQ(store.Setup(config), UC::Status::OK());
+
+    auto block = MakeBlockId(75);
+    std::array<std::byte, 4> src{std::byte{17}, std::byte{18}, std::byte{19},
+                                 std::byte{20}};
+    UC::Detail::TaskDesc dump;
+    dump.push_back(UC::Detail::Shard{block, 2, {src.data()}});
+    auto dumpTask = store.Dump(dump);
+    ASSERT_TRUE(dumpTask.HasValue());
+    ASSERT_EQ(store.Wait(dumpTask.Value()), UC::Status::OK());
+
+    std::array<std::byte, 4> dst{};
+    UC::Detail::TaskDesc load;
+    load.push_back(UC::Detail::Shard{block, 2, {dst.data()}});
+    auto loadTask = store.Load(load);
+    ASSERT_TRUE(loadTask.HasValue());
+    ASSERT_EQ(store.Wait(loadTask.Value()), UC::Status::OK());
+    EXPECT_EQ(dst, src);
 }
 
 TEST(UCMMemoryStoreStructureTest, DumpTransferUsesPublicDeviceToHostApi)

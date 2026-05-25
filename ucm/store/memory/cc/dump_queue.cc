@@ -105,7 +105,7 @@ Status DumpQueue::DumpTaskDesc(Trans::Stream* stream, TaskPtr task, WaiterPtr wa
         backendShard.block = shard.owner;
         backendShard.layer = shard.index;
         backendShard.full.resize(shardSize_);
-        auto s = DeviceToHostGatherAsync(stream, shard.addrs.data(), tensorSizeList_,
+        auto s = DeviceToHostGatherAsync(stream, shard.addrs, tensorSizeList_,
                                          backendShard.full.data());
         if (s.Failure()) { return s; }
         dumpTask.backendShards.push_back(std::move(backendShard));
@@ -158,7 +158,7 @@ Status DumpQueue::DumpTokenTaskDesc(Trans::Stream* stream, TaskPtr task, WaiterP
         TokenCopy tokenCopy;
         tokenCopy.item = item;
         tokenCopy.data.resize(Sum(iter->second));
-        auto s = DeviceToHostGatherAsync(stream, item.addrs.data(), iter->second,
+        auto s = DeviceToHostGatherAsync(stream, item.addrs, iter->second,
                                          tokenCopy.data.data());
         if (s.Failure()) { return s; }
         tokenCopies.push_back(std::move(tokenCopy));
@@ -204,11 +204,17 @@ Status DumpQueue::DumpTokenTaskDesc(Trans::Stream* stream, TaskPtr task, WaiterP
     return Status::OK();
 }
 
-Status DumpQueue::DeviceToHostGatherAsync(Trans::Stream* stream, void* const* device,
+Status DumpQueue::DeviceToHostGatherAsync(Trans::Stream* stream, const std::vector<void*>& device,
                                           const std::vector<size_t>& sizes, void* host)
 {
+    if (device.size() != sizes.size()) {
+        return Status::InvalidParam("invalid source addr number({},{})", device.size(),
+                                    sizes.size());
+    }
+    if (!host) { return Status::InvalidParam("invalid destination host addr"); }
     size_t offset = 0;
     for (size_t i = 0; i < sizes.size(); ++i) {
+        if (!device[i]) { return Status::InvalidParam("invalid source addr"); }
         auto pHost = static_cast<void*>(static_cast<int8_t*>(host) + offset);
         auto s = stream->DeviceToHostAsync(device[i], pHost, sizes[i]);
         if (s.Failure()) { return s; }

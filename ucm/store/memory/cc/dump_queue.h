@@ -46,7 +46,7 @@ private:
     void DispatchOneTask(Trans::Stream* stream, TaskPair&& pair);
     Status DumpTaskDesc(Trans::Stream* stream, TaskPtr task, WaiterPtr waiter);
     Status DumpTokenTaskDesc(Trans::Stream* stream, TaskPtr task, WaiterPtr waiter);
-    Status DeviceToHostGatherAsync(Trans::Stream* stream, void* const* device,
+    Status DeviceToHostGatherAsync(Trans::Stream* stream, const std::vector<void*>& device,
                                    const std::vector<size_t>& sizes, void* host);
     void BackendDumpStage();
 

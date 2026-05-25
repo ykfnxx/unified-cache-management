@@ -242,6 +242,116 @@ TEST(UCMMemoryStoreTest, TokenDumpLoadRoundTripUsesTensorType)
     EXPECT_EQ(std::memcmp(src.data(), dst.data(), src.size()), 0);
 }
 
+TEST(UCMMemoryStoreLayoutCrossTest, StandardDumpThenTokenLoadUsesLayerMajorKvLayout)
+{
+    using namespace UC::MemoryStore;
+
+    MemoryStore store;
+    Config config;
+    config.storeBackend = 0;
+    config.deviceId = 0;
+    config.shardSize = 8;
+    config.blockSize = 8;
+    config.tensorSizeList = {4, 4};
+    config.memoryTokenChunkSize = 2;
+    config.memoryBufferCapacity = 1ULL << 20;
+    config.requiredTensorTypes = {0, 1};
+    config.tensorSizesByType = {{0, {2}}, {1, {2}}};
+    ASSERT_EQ(store.Setup(config), UC::Status::OK());
+
+    auto block = MakeBlockId(51);
+    std::array<std::byte, 4> kIn{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    std::array<std::byte, 4> vIn{std::byte{5}, std::byte{6}, std::byte{7}, std::byte{8}};
+    UC::Detail::TaskDesc dump;
+    dump.push_back(UC::Detail::Shard{block, 0, {kIn.data(), vIn.data()}});
+    auto dumpTask = store.Dump(dump);
+    ASSERT_TRUE(dumpTask.HasValue());
+    ASSERT_EQ(store.Wait(dumpTask.Value()), UC::Status::OK());
+
+    std::array<std::byte, 2> kToken1{};
+    UC::Detail::TokenLayerTaskDesc loadToken;
+    loadToken.push_back(UC::Detail::TokenLayerShard{block, 0, 1, 0, {kToken1.data()}});
+    auto loadTask = store.LoadTokens(loadToken);
+    ASSERT_TRUE(loadTask.HasValue());
+    ASSERT_EQ(store.Wait(loadTask.Value()), UC::Status::OK());
+
+    std::array<std::byte, 2> expected{std::byte{3}, std::byte{4}};
+    EXPECT_EQ(kToken1, expected);
+}
+
+TEST(UCMMemoryStoreLayoutCrossTest, TokenDumpThenStandardLoadAssemblesLayerMajorKvLayout)
+{
+    using namespace UC::MemoryStore;
+
+    MemoryStore store;
+    Config config;
+    config.storeBackend = 0;
+    config.deviceId = 0;
+    config.shardSize = 8;
+    config.blockSize = 8;
+    config.tensorSizeList = {4, 4};
+    config.memoryTokenChunkSize = 2;
+    config.memoryBufferCapacity = 1ULL << 20;
+    config.requiredTensorTypes = {0, 1};
+    config.tensorSizesByType = {{0, {2}}, {1, {2}}};
+    ASSERT_EQ(store.Setup(config), UC::Status::OK());
+
+    auto block = MakeBlockId(52);
+    std::array<std::byte, 2> kToken0{std::byte{1}, std::byte{2}};
+    std::array<std::byte, 2> kToken1{std::byte{3}, std::byte{4}};
+    std::array<std::byte, 2> vToken0{std::byte{5}, std::byte{6}};
+    std::array<std::byte, 2> vToken1{std::byte{7}, std::byte{8}};
+    UC::Detail::TokenLayerTaskDesc dumpTokens;
+    dumpTokens.push_back(UC::Detail::TokenLayerShard{block, 0, 0, 0, {kToken0.data()}});
+    dumpTokens.push_back(UC::Detail::TokenLayerShard{block, 0, 1, 0, {kToken1.data()}});
+    dumpTokens.push_back(UC::Detail::TokenLayerShard{block, 0, 0, 1, {vToken0.data()}});
+    dumpTokens.push_back(UC::Detail::TokenLayerShard{block, 0, 1, 1, {vToken1.data()}});
+    auto dumpTask = store.DumpTokens(dumpTokens);
+    ASSERT_TRUE(dumpTask.HasValue());
+    ASSERT_EQ(store.Wait(dumpTask.Value()), UC::Status::OK());
+
+    std::array<std::byte, 4> kOut{};
+    std::array<std::byte, 4> vOut{};
+    UC::Detail::TaskDesc load;
+    load.push_back(UC::Detail::Shard{block, 0, {kOut.data(), vOut.data()}});
+    auto loadTask = store.Load(load);
+    ASSERT_TRUE(loadTask.HasValue());
+    ASSERT_EQ(store.Wait(loadTask.Value()), UC::Status::OK());
+
+    std::array<std::byte, 4> expectedK{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    std::array<std::byte, 4> expectedV{std::byte{5}, std::byte{6}, std::byte{7}, std::byte{8}};
+    EXPECT_EQ(kOut, expectedK);
+    EXPECT_EQ(vOut, expectedV);
+}
+
+TEST(UCMMemoryStoreValidationTest, DumpRejectsFullShardAddrCountMismatch)
+{
+    using namespace UC::MemoryStore;
+
+    MemoryStore store;
+    Config config;
+    config.storeBackend = 0;
+    config.deviceId = 0;
+    config.shardSize = 4;
+    config.blockSize = 4;
+    config.tensorSizeList = {4};
+    config.memoryTokenChunkSize = 1;
+    config.memoryBufferCapacity = 1ULL << 20;
+    config.requiredTensorTypes = {0};
+    config.tensorSizesByType = {{0, {4}}};
+    ASSERT_EQ(store.Setup(config), UC::Status::OK());
+
+    auto block = MakeBlockId(53);
+    std::array<std::byte, 4> first{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    std::array<std::byte, 4> extra{std::byte{5}, std::byte{6}, std::byte{7}, std::byte{8}};
+    UC::Detail::TaskDesc dump;
+    dump.push_back(UC::Detail::Shard{block, 0, {first.data(), extra.data()}});
+
+    auto dumpTask = store.Dump(dump);
+    ASSERT_TRUE(dumpTask.HasValue());
+    EXPECT_NE(store.Wait(dumpTask.Value()), UC::Status::OK());
+}
+
 TEST(UCMMemoryStoreStructureTest, DumpTransferUsesPublicDeviceToHostApi)
 {
     UC::Trans::Device device;

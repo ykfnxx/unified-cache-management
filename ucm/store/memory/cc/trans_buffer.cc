@@ -384,8 +384,8 @@ Status TransBuffer::SplitFullShard(const BlockId& block, size_t layer,
 {
     if (full.size() != shardSize_) { return Status::InvalidParam("invalid shard"); }
     size_t offset = 0;
-    for (size_t token = 0; token < tokensPerBlock_; ++token) {
-        for (const auto type : requiredTensorTypes_) {
+    for (const auto type : requiredTensorTypes_) {
+        for (size_t token = 0; token < tokensPerBlock_; ++token) {
             Detail::TokenLayerShard item{block, layer, token, type, {}};
             auto* p = TokenData(item, true);
             const auto size = TypePayloadSize(type);
@@ -402,8 +402,8 @@ Status TransBuffer::AssembleFullShard(const BlockId& block, size_t layer,
 {
     full.resize(shardSize_);
     size_t offset = 0;
-    for (size_t token = 0; token < tokensPerBlock_; ++token) {
-        for (const auto type : requiredTensorTypes_) {
+    for (const auto type : requiredTensorTypes_) {
+        for (size_t token = 0; token < tokensPerBlock_; ++token) {
             Detail::TokenLayerShard item{block, layer, token, type, {}};
             if (!TokenReadyNoLock(item)) { return Status::NotFound(); }
             auto* p = TokenData(item, false);

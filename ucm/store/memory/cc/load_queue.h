@@ -54,7 +54,8 @@ private:
     void TransferOneTask(Trans::Stream* stream, CopyTask&& task);
     Status WaitBackendTaskReady(CopyTask& task);
     Status HostToDeviceScatterAsync(Trans::Stream* stream, void* host,
-                                    const std::vector<size_t>& sizes, void** device);
+                                    const std::vector<size_t>& sizes,
+                                    const std::vector<void*>& device);
 
 private:
     alignas(64) std::atomic_bool stop_{false};

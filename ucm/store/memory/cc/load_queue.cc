@@ -185,7 +185,7 @@ void LoadQueue::TransferOneTask(Trans::Stream* stream, CopyTask&& task)
     auto s = WaitBackendTaskReady(task);
     if (s.Success()) {
         s = HostToDeviceScatterAsync(stream, task.hostBuffer.data(), task.sizes,
-                                     task.deviceAddrs.data());
+                                     task.deviceAddrs);
     }
     if (s.Success()) {
         holder_.push_back(std::move(task));
@@ -232,10 +232,17 @@ Status LoadQueue::WaitBackendTaskReady(CopyTask& task)
 }
 
 Status LoadQueue::HostToDeviceScatterAsync(Trans::Stream* stream, void* host,
-                                           const std::vector<size_t>& sizes, void** device)
+                                           const std::vector<size_t>& sizes,
+                                           const std::vector<void*>& device)
 {
+    if (device.size() != sizes.size()) {
+        return Status::InvalidParam("invalid destination addr number({},{})", device.size(),
+                                    sizes.size());
+    }
+    if (!host) { return Status::InvalidParam("invalid source host addr"); }
     size_t offset = 0;
     for (size_t i = 0; i < sizes.size(); ++i) {
+        if (!device[i]) { return Status::InvalidParam("invalid destination addr"); }
         auto pHost = static_cast<void*>(static_cast<int8_t*>(host) + offset);
         auto s = stream->HostToDeviceAsync(pHost, device[i], sizes[i]);
         if (s.Failure()) { return s; }

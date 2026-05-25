@@ -21,6 +21,8 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
+#include <array>
+#include <atomic>
 #include "cache/cc/trans_manager.h"
 #include "detail/data_generator.h"
 #include "detail/mock_store.h"
@@ -234,4 +236,61 @@ TEST_F(UCCacheTransManagerTest, DumpThenLoadWithLayerAndChunk)
         ASSERT_EQ(s.Underlying(), UC::Status::OK().Underlying());
     }
     ASSERT_EQ(data1.Compare(data2), 0);
+}
+
+TEST_F(UCCacheTransManagerTest, DumpThenLoadPreservesLayerMajorKvLayout)
+{
+    using namespace UC::CacheStore;
+
+    UC::Test::Detail::MockStore backend;
+    EXPECT_CALL(backend, Dump).WillOnce(testing::Invoke(NextId));
+    EXPECT_CALL(backend, Load).Times(0);
+    UC::Latch backendWait{};
+    backendWait.Up();
+    EXPECT_CALL(backend, Wait).WillOnce(testing::Invoke([&backendWait]() {
+        backendWait.Done();
+        return UC::Status::OK();
+    }));
+
+    Config config;
+    config.storeBackend = (uintptr_t)(void*)&backend;
+    config.tensorSize = 4;
+    config.shardSize = 8;
+    config.blockSize = 8;
+    config.deviceId = 0;
+    config.bufferNumber = 2048;
+    config.uniqueId = rd.RandomString(10);
+    config.shareBufferEnable = false;
+
+    TransBuffer buffer;
+    auto s = buffer.Setup(config);
+    ASSERT_EQ(s, UC::Status::OK());
+    TransManager transMgr;
+    s = transMgr.Setup(config, &buffer);
+    ASSERT_EQ(s, UC::Status::OK());
+
+    auto block = UC::Test::Detail::TypesHelper::MakeBlockId("a1b2c3d4e5f6789012345678901234ab");
+    std::array<std::byte, 4> kIn{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    std::array<std::byte, 4> vIn{std::byte{5}, std::byte{6}, std::byte{7}, std::byte{8}};
+    UC::Detail::TaskDesc dump;
+    dump.brief = "DumpLayerMajorKv";
+    dump.push_back(UC::Detail::Shard{block, 0, {kIn.data(), vIn.data()}});
+
+    auto dumpHandle = transMgr.Submit({TransTask::Type::DUMP, dump});
+    ASSERT_TRUE(dumpHandle.HasValue());
+    ASSERT_EQ(transMgr.Wait(dumpHandle.Value()), UC::Status::OK());
+
+    std::array<std::byte, 4> kOut{};
+    std::array<std::byte, 4> vOut{};
+    UC::Detail::TaskDesc load;
+    load.brief = "LoadLayerMajorKv";
+    load.push_back(UC::Detail::Shard{block, 0, {kOut.data(), vOut.data()}});
+
+    auto loadHandle = transMgr.Submit({TransTask::Type::LOAD, load});
+    ASSERT_TRUE(loadHandle.HasValue());
+    ASSERT_EQ(transMgr.Wait(loadHandle.Value()), UC::Status::OK());
+
+    EXPECT_EQ(kOut, kIn);
+    EXPECT_EQ(vOut, vIn);
+    backendWait.Wait();
 }

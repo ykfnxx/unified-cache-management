@@ -8,10 +8,10 @@
 
 #include <future>
 #include <thread>
-#include "cache/cc/copy_stream.h"
 #include "template/hashset.h"
 #include "template/spsc_ring_queue.h"
 #include "thread/latch.h"
+#include "trans/device.h"
 #include "trans_buffer.h"
 #include "trans_task.h"
 
@@ -47,7 +47,11 @@ private:
     void DispatchStage();
     void DispatchOneTask(TaskPair&& pair);
     void TransferStage(std::promise<Status>& started);
-    void TransferOneTask(UC::CacheStore::CopyStream& stream, CopyTask&& task);
+    void TransferOneTask(CopyTask&& task);
+    Status SetupTransferStreams();
+    std::shared_ptr<Trans::Stream> NextStream() noexcept;
+    Status WaitEventOnStreams(void* event) noexcept;
+    Status SynchronizeStreams() noexcept;
     void BackendDumpStage();
     Status DeviceToHostGatherAsync(std::shared_ptr<Trans::Stream> stream, void** device,
                                    const std::vector<size_t>& sizes, void* host);
@@ -69,6 +73,8 @@ private:
     std::thread transfer_;
     std::thread dumper_;
     std::vector<DumpTask> holder_;
+    size_t streamIndex_{0};
+    std::vector<std::shared_ptr<Trans::Stream>> streams_;
 };
 
 }  // namespace UC::MemoryStore

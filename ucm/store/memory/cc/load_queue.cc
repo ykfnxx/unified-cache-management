@@ -4,30 +4,10 @@
  * Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
  * */
 #include "load_queue.h"
-#include <numeric>
 #include "logger/logger.h"
 #include "thread/cpu_affinity.h"
 
 namespace UC::MemoryStore {
-
-namespace {
-size_t Sum(const std::vector<size_t>& sizes)
-{
-    return std::accumulate(sizes.begin(), sizes.end(), size_t{0});
-}
-
-std::vector<void*> BuildHostAddrs(std::vector<std::byte>& buffer, const std::vector<size_t>& sizes)
-{
-    std::vector<void*> addrs;
-    addrs.reserve(sizes.size());
-    size_t offset = 0;
-    for (const auto size : sizes) {
-        addrs.push_back(buffer.data() + offset);
-        offset += size;
-    }
-    return addrs;
-}
-}  // namespace
 
 LoadQueue::~LoadQueue()
 {
@@ -40,7 +20,9 @@ Status LoadQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
 {
     failureSet_ = failureSet;
     buffer_ = buffer;
+    backend_ = config.storeBackend;
     deviceId_ = config.deviceId;
+    shardSize_ = config.shardSize;
     tensorSizes_ = config.tensorSizes;
     tensorSizesByType_ = config.tensorSizesByType;
     streamNumber_ = config.streamNumber;
@@ -90,18 +72,33 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
             waiter->Done();
             return;
         }
-        Detail::TaskDesc hostTask;
-        hostTask.brief = task->desc.brief;
         for (size_t i = 0; i < nShard; ++i) {
             const auto& shard = task->desc[i];
-            std::vector<std::byte> hostBuffer(Sum(tensorSizes_));
-            auto hostAddrs = BuildHostAddrs(hostBuffer, tensorSizes_);
-            hostTask.clear();
-            hostTask.push_back({shard.owner, shard.index, hostAddrs});
-            s = buffer_->Load(hostTask);
+            CopyTask copyTask;
+            copyTask.taskHandle = task->id;
+            copyTask.type = CopyType::FULL;
+            copyTask.block = shard.owner;
+            copyTask.layer = shard.index;
+            copyTask.sizes = tensorSizes_;
+            copyTask.deviceAddrs = shard.addrs;
+            copyTask.waiter = (i + 1 < nShard) ? nullptr : waiter;
+            s = buffer_->ReadFull(shard.owner, shard.index, copyTask.hostBuffer);
+            if (s == Status::NotFound() && backend_) {
+                copyTask.hostBuffer.resize(shardSize_);
+                Detail::TaskDesc backendTask;
+                backendTask.brief = "Backend2Memory";
+                backendTask.push_back({shard.owner, shard.index, {copyTask.hostBuffer.data()}});
+                auto res = backend_->Load(std::move(backendTask));
+                if (!res) {
+                    s = res.Error();
+                } else {
+                    copyTask.backendTaskHandle = res.Value();
+                    copyTask.backendResultNeedsCommit = true;
+                    s = Status::OK();
+                }
+            }
             if (s.Failure()) { break; }
-            running_.Push({task->id, tensorSizes_, std::move(hostBuffer), shard.addrs,
-                           (i + 1 < nShard) ? nullptr : waiter});
+            running_.Push(std::move(copyTask));
         }
     } else {
         const auto nItem = task->tokenDesc.size();
@@ -109,20 +106,35 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
             waiter->Done();
             return;
         }
-        Detail::TokenLayerTaskDesc hostTask;
-        hostTask.brief = task->tokenDesc.brief;
         for (size_t i = 0; i < nItem; ++i) {
             const auto& item = task->tokenDesc[i];
-            const auto& sizes = tensorSizesByType_.at(item.tensorType);
-            std::vector<std::byte> hostBuffer(Sum(sizes));
-            auto hostAddrs = BuildHostAddrs(hostBuffer, sizes);
-            hostTask.clear();
-            hostTask.push_back(
-                {item.owner, item.layer, item.tokenOffset, item.tensorType, hostAddrs});
-            s = buffer_->LoadTokens(hostTask);
+            CopyTask copyTask;
+            copyTask.taskHandle = task->id;
+            copyTask.type = CopyType::TOKEN;
+            copyTask.block = item.owner;
+            copyTask.layer = item.layer;
+            copyTask.tokenOffset = item.tokenOffset;
+            copyTask.tensorType = item.tensorType;
+            copyTask.sizes = tensorSizesByType_.at(item.tensorType);
+            copyTask.deviceAddrs = item.addrs;
+            copyTask.waiter = (i + 1 < nItem) ? nullptr : waiter;
+            s = buffer_->ReadToken(item, copyTask.hostBuffer);
+            if (s == Status::NotFound() && backend_) {
+                copyTask.backendBuffer.resize(shardSize_);
+                Detail::TaskDesc backendTask;
+                backendTask.brief = "Backend2Memory";
+                backendTask.push_back({item.owner, item.layer, {copyTask.backendBuffer.data()}});
+                auto res = backend_->Load(std::move(backendTask));
+                if (!res) {
+                    s = res.Error();
+                } else {
+                    copyTask.backendTaskHandle = res.Value();
+                    copyTask.backendResultNeedsCommit = true;
+                    s = Status::OK();
+                }
+            }
             if (s.Failure()) { break; }
-            running_.Push({task->id, sizes, std::move(hostBuffer), item.addrs,
-                           (i + 1 < nItem) ? nullptr : waiter});
+            running_.Push(std::move(copyTask));
         }
     }
     if (s.Failure()) {
@@ -134,28 +146,27 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
 
 void LoadQueue::TransferStage(std::promise<Status>& started)
 {
-    UC::CacheStore::CopyStream stream;
-    auto s = stream.Setup(deviceId_, streamNumber_, useGdr_);
+    auto s = SetupTransferStreams();
     started.set_value(s);
     if (s.Failure()) { return; }
     if (!cpuAffinityCores_.empty()) {
         s = CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
         if (s.Failure()) { UC_WARN("Failed({}) to set affinity.", s); }
     }
-    running_.ConsumerLoop(stop_, &LoadQueue::TransferOneTask, this, stream);
+    running_.ConsumerLoop(stop_, &LoadQueue::TransferOneTask, this);
 }
 
-void LoadQueue::TransferOneTask(UC::CacheStore::CopyStream& stream, CopyTask&& task)
+void LoadQueue::TransferOneTask(CopyTask&& task)
 {
     if (failureSet_->Contains(task.taskHandle)) {
         if (task.waiter) { task.waiter->Done(); }
         return;
     }
-    auto s = Status::OK();
-    auto copyStream = stream.NextStream();
-    if (!copyStream) {
+    auto s = WaitBackendTaskReady(task);
+    auto copyStream = NextStream();
+    if (s.Success() && !copyStream) {
         s = Status::Error("invalid memory load stream");
-    } else {
+    } else if (s.Success()) {
         s = HostToDeviceScatterAsync(copyStream, task.hostBuffer.data(), task.sizes,
                                      task.deviceAddrs.data());
     }
@@ -165,7 +176,7 @@ void LoadQueue::TransferOneTask(UC::CacheStore::CopyStream& stream, CopyTask&& t
     }
     if (s.Success()) {
         holder_.push_back(std::move(task));
-        s = stream.Synchronize();
+        s = SynchronizeStreams();
     }
     if (s.Failure()) {
         UC_ERROR("Failed({}) to run memory load transfer task({}).", s, task.taskHandle);
@@ -175,6 +186,80 @@ void LoadQueue::TransferOneTask(UC::CacheStore::CopyStream& stream, CopyTask&& t
     if (!waiter && !holder_.empty()) { waiter = holder_.back().waiter; }
     holder_.clear();
     if (waiter) { waiter->Done(); }
+}
+
+Status LoadQueue::WaitBackendTaskReady(CopyTask& task)
+{
+    if (task.backendTaskHandle == 0) { return Status::OK(); }
+    auto s = backend_->Wait(task.backendTaskHandle);
+    if (s.Failure()) {
+        UC_ERROR("Failed({}) to wait backend({}) for memory load task({}).", s,
+                 task.backendTaskHandle, task.taskHandle);
+        return s;
+    }
+    if (!task.backendResultNeedsCommit) { return Status::OK(); }
+    if (task.type == CopyType::FULL) {
+        s = buffer_->CommitFull(task.block, task.layer, task.hostBuffer);
+    } else {
+        s = buffer_->CommitFull(task.block, task.layer, task.backendBuffer);
+        if (s.Success()) {
+            Detail::TokenLayerShard item{task.block, task.layer, task.tokenOffset, task.tensorType,
+                                         task.deviceAddrs};
+            s = buffer_->ReadToken(item, task.hostBuffer);
+        }
+    }
+    if (s.Failure()) {
+        UC_ERROR("Failed({}) to commit backend result for memory load task({}).", s,
+                 task.taskHandle);
+        return s;
+    }
+    task.backendTaskHandle = 0;
+    task.backendResultNeedsCommit = false;
+    task.backendBuffer.clear();
+    return Status::OK();
+}
+
+Status LoadQueue::SetupTransferStreams()
+{
+    Trans::Device device;
+    auto s = device.Setup(deviceId_);
+    if (s.Failure()) {
+        UC_ERROR("Failed({}) to setup device({}).", s, deviceId_);
+        return s;
+    }
+    streamIndex_ = 0;
+    streams_.clear();
+    streams_.reserve(streamNumber_);
+    for (size_t i = 0; i < streamNumber_; ++i) {
+        std::shared_ptr<Trans::Stream> stream =
+            useGdr_ ? device.MakeGdrStream() : device.MakeSharedStream();
+        if (!stream) {
+            UC_ERROR("Failed to make memory transfer stream on device({}).", deviceId_);
+            return Status::Error();
+        }
+        streams_.push_back(std::move(stream));
+    }
+    return Status::OK();
+}
+
+std::shared_ptr<Trans::Stream> LoadQueue::NextStream() noexcept
+{
+    if (streams_.empty()) { return nullptr; }
+    auto& stream = streams_[streamIndex_];
+    streamIndex_ = (streamIndex_ + 1) % streams_.size();
+    return stream;
+}
+
+Status LoadQueue::SynchronizeStreams() noexcept
+{
+    auto status = Status::OK();
+    for (auto& stream : streams_) {
+        auto s = stream->Synchronized();
+        if (s.Success()) { continue; }
+        UC_ERROR("Failed({}) to synchronize memory load stream on device({}).", s, deviceId_);
+        if (status.Success()) { status = s; }
+    }
+    return status;
 }
 
 Status LoadQueue::HostToDeviceScatterAsync(std::shared_ptr<Trans::Stream> stream, void* host,

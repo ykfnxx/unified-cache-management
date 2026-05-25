@@ -57,6 +57,11 @@ public:
     Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num);
     Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num);
     Expected<std::vector<uint8_t>> LookupTokens(const Detail::TokenLayerTaskDesc& task);
+    bool FullReady(const BlockId& block, size_t layer);
+    bool TokenReady(const Detail::TokenLayerShard& item);
+    Status ReadFull(const BlockId& block, size_t layer, std::vector<std::byte>& full);
+    Status ReadToken(const Detail::TokenLayerShard& item, std::vector<std::byte>& data);
+    Status CommitFull(const BlockId& block, size_t layer, const std::vector<std::byte>& full);
     Status Load(Detail::TaskDesc& task);
     Status Dump(const Detail::TaskDesc& task);
     Status LoadTokens(Detail::TokenLayerTaskDesc& task);

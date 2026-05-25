@@ -132,18 +132,17 @@ void DumpQueue::DispatchOneTask(TaskPair&& pair)
 
 void DumpQueue::TransferStage(std::promise<Status>& started)
 {
-    UC::CacheStore::CopyStream stream;
-    auto s = stream.Setup(deviceId_, streamNumber_, useGdr_);
+    auto s = SetupTransferStreams();
     started.set_value(s);
     if (s.Failure()) { return; }
     if (!cpuAffinityCores_.empty()) {
         s = CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
         if (s.Failure()) { UC_WARN("Failed({}) to set affinity.", s); }
     }
-    running_.ConsumerLoop(stop_, &DumpQueue::TransferOneTask, this, stream);
+    running_.ConsumerLoop(stop_, &DumpQueue::TransferOneTask, this);
 }
 
-void DumpQueue::TransferOneTask(UC::CacheStore::CopyStream& stream, CopyTask&& task)
+void DumpQueue::TransferOneTask(CopyTask&& task)
 {
     if (failureSet_->Contains(task.taskHandle)) {
         if (task.dumpTask.waiter) { task.dumpTask.waiter->Done(); }
@@ -151,9 +150,9 @@ void DumpQueue::TransferOneTask(UC::CacheStore::CopyStream& stream, CopyTask&& t
     }
     auto s = Status::OK();
     if (task.waitPrerequisite) {
-        s = stream.WaitEvent(reinterpret_cast<void*>(task.prerequisiteHandle));
+        s = WaitEventOnStreams(reinterpret_cast<void*>(task.prerequisiteHandle));
     }
-    auto copyStream = stream.NextStream();
+    auto copyStream = NextStream();
     if (s.Success() && !copyStream) { s = Status::Error("invalid memory dump stream"); }
     if (s.Success()) {
         s = DeviceToHostGatherAsync(copyStream, task.deviceAddrs.data(), task.sizes,
@@ -165,7 +164,7 @@ void DumpQueue::TransferOneTask(UC::CacheStore::CopyStream& stream, CopyTask&& t
     }
     if (s.Success()) {
         holder_.push_back(std::move(task.dumpTask));
-        s = stream.Synchronize();
+        s = SynchronizeStreams();
     }
     if (s.Failure()) {
         UC_ERROR("Failed({}) to run memory dump transfer task({}).", s, task.taskHandle);
@@ -178,6 +177,61 @@ void DumpQueue::TransferOneTask(UC::CacheStore::CopyStream& stream, CopyTask&& t
     }
     for (auto& dumpTask : holder_) { dumping_.Push(std::move(dumpTask)); }
     holder_.clear();
+}
+
+Status DumpQueue::SetupTransferStreams()
+{
+    Trans::Device device;
+    auto s = device.Setup(deviceId_);
+    if (s.Failure()) {
+        UC_ERROR("Failed({}) to setup device({}).", s, deviceId_);
+        return s;
+    }
+    streamIndex_ = 0;
+    streams_.clear();
+    streams_.reserve(streamNumber_);
+    for (size_t i = 0; i < streamNumber_; ++i) {
+        std::shared_ptr<Trans::Stream> stream =
+            useGdr_ ? device.MakeGdrStream() : device.MakeSharedStream();
+        if (!stream) {
+            UC_ERROR("Failed to make memory transfer stream on device({}).", deviceId_);
+            return Status::Error();
+        }
+        streams_.push_back(std::move(stream));
+    }
+    return Status::OK();
+}
+
+std::shared_ptr<Trans::Stream> DumpQueue::NextStream() noexcept
+{
+    if (streams_.empty()) { return nullptr; }
+    auto& stream = streams_[streamIndex_];
+    streamIndex_ = (streamIndex_ + 1) % streams_.size();
+    return stream;
+}
+
+Status DumpQueue::WaitEventOnStreams(void* event) noexcept
+{
+    auto status = Status::OK();
+    for (auto& stream : streams_) {
+        auto s = stream->WaitEvent(event);
+        if (s.Success()) { continue; }
+        UC_ERROR("Failed({}) to wait event on memory dump stream on device({}).", s, deviceId_);
+        if (status.Success()) { status = s; }
+    }
+    return status;
+}
+
+Status DumpQueue::SynchronizeStreams() noexcept
+{
+    auto status = Status::OK();
+    for (auto& stream : streams_) {
+        auto s = stream->Synchronized();
+        if (s.Success()) { continue; }
+        UC_ERROR("Failed({}) to synchronize memory dump stream on device({}).", s, deviceId_);
+        if (status.Success()) { status = s; }
+    }
+    return status;
 }
 
 void DumpQueue::BackendDumpStage()

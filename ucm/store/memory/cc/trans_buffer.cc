@@ -97,6 +97,48 @@ Expected<std::vector<uint8_t>> TransBuffer::LookupTokens(const Detail::TokenLaye
     return result;
 }
 
+bool TransBuffer::FullReady(const BlockId& block, size_t layer)
+{
+    std::lock_guard<std::mutex> guard(mutex_);
+    return IsFullReadyNoLock(block, layer);
+}
+
+bool TransBuffer::TokenReady(const Detail::TokenLayerShard& item)
+{
+    std::lock_guard<std::mutex> guard(mutex_);
+    return TokenReadyNoLock(item);
+}
+
+Status TransBuffer::ReadFull(const BlockId& block, size_t layer, std::vector<std::byte>& full)
+{
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!IsFullReadyNoLock(block, layer)) { return Status::NotFound(); }
+    return AssembleFullShard(block, layer, full);
+}
+
+Status TransBuffer::ReadToken(const Detail::TokenLayerShard& item, std::vector<std::byte>& data)
+{
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto s = ValidateItem(item);
+    if (s.Failure()) { return s; }
+    if (!TokenReadyNoLock(item)) { return Status::NotFound(); }
+    auto* p = TokenData(item, false);
+    if (!p) { return Status::NotFound(); }
+    data.resize(TypePayloadSize(item.tensorType));
+    std::memcpy(data.data(), p, data.size());
+    return Status::OK();
+}
+
+Status TransBuffer::CommitFull(const BlockId& block, size_t layer,
+                               const std::vector<std::byte>& full)
+{
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto s = SplitFullShard(block, layer, full);
+    if (s.Failure()) { return s; }
+    fullReady_.insert({block, layer});
+    return Status::OK();
+}
+
 Status TransBuffer::Load(Detail::TaskDesc& task)
 {
     std::lock_guard<std::mutex> guard(mutex_);

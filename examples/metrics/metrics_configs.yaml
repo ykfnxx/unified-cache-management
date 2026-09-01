@@ -59,6 +59,12 @@ counter:
   - name: "cache_d2h_errors_total"
     documentation: "Number of Cache device-to-host transfer, event wait, or sync failures"
 
+  # -- On-evict fake backend write statistics ------------------------------
+  - name: "on_evict_backend_write_requests_total"
+    documentation: "Number of backend write requests triggered by OnEvictCache eviction"
+  - name: "on_evict_backend_write_bytes_total"
+    documentation: "Total bytes represented by backend write requests triggered by OnEvictCache eviction"
+
   # -- Pipeline Cache stage: per-worker real throughput counters ------------
   # Accumulated per completed Cache task with size = shardSize * num_shards.
   # Use rate() / 1e9 to get actual GB/s the worker is moving through the

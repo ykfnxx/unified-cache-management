@@ -99,7 +99,18 @@ No Cache Store-specific Gauges are exported by default.
 | `ucm:cache_dump_backend_submit_duration_ms` | Time to synchronously submit the buffer to the lower Store                               |
 | `ucm:cache_dump_backend_wait_duration_ms`   | Time waiting for the lower Store to complete the write                                   |
 
-### 1.3 Posix Store
+### 1.3 OnEvictCache | Fake
+
+| Metric                                      | Description                                                        |
+| ------------------------------------------- | ------------------------------------------------------------------ |
+| `ucm:on_evict_backend_write_requests_total` | Backend write requests triggered by cache eviction                 |
+| `ucm:on_evict_backend_write_bytes_total`    | Bytes represented by backend write requests triggered by eviction |
+
+View the cumulative values at the vLLM `/metrics` endpoint. Use `rate(ucm:on_evict_backend_write_requests_total[5m])` for requests per second and `rate(ucm:on_evict_backend_write_bytes_total[5m])` for bytes per second.
+
+Fake keeps the BlockIds received by `Dump`, so an OnEvictCache local miss can still return a hit for a block previously written to Fake. The existing connector hit-rate metrics therefore reflect the combined OnEvictCache and Fake lookup result.
+
+### 1.4 Posix Store
 
 #### Counters
 
@@ -131,7 +142,7 @@ No Cache Store-specific Gauges are exported by default.
 | `ucm:posix_load_queue_wait_duration_ms` | Time a Posix Load task waits before the first worker picks it up                    |
 | `ucm:posix_dump_queue_wait_duration_ms` | Time a Posix Dump task waits before the first worker picks it up                    |
 
-### 1.4 YuanRong Store
+### 1.5 YuanRong Store
 
 #### Counters
 
@@ -162,7 +173,7 @@ No Cache Store-specific Gauges are exported by default.
 
 No YuanRong-specific Histograms are exported by default.
 
-### 1.5 Mooncake Store
+### 1.6 Mooncake Store
 
 #### Counters
 

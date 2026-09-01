@@ -23,8 +23,11 @@
  * */
 #include <algorithm>
 #include <atomic>
+#include <mutex>
+#include <unordered_set>
 #include "logger/logger.h"
 #include "meta_manager.h"
+#include "metrics_api.h"
 #include "time/stopwatch.h"
 #include "ucmstore_v1.h"
 
@@ -32,6 +35,10 @@ namespace UC::FakeStore {
 
 class FakeStore : public StoreV1 {
     MetaManager metaMgr_;
+    size_t blockSize_{0};
+    bool onEvictMode_{false};
+    std::mutex dumpedBlocksMutex_;
+    std::unordered_set<Detail::BlockId, Detail::BlockIdHasher> dumpedBlocks_;
 
 public:
     Status Setup(const Detail::Dictionary& inConfig) override
@@ -40,13 +47,19 @@ public:
         inConfig.Get("unique_id", config.uniqueId);
         inConfig.GetNumber("buffer_number", config.bufferNumber);
         inConfig.Get("share_buffer_enable", config.shareBufferEnable);
+        inConfig.GetNumber("block_size", config.blockSize);
+        inConfig.Get("fake_on_evict_mode", config.onEvictMode);
         auto s = CheckConfig(config);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed to check config params: {}.", s);
             return s;
         }
-        s = metaMgr_.Setup(config);
-        if (s.Failure()) [[unlikely]] { return s; }
+        blockSize_ = config.blockSize;
+        onEvictMode_ = config.onEvictMode;
+        if (!onEvictMode_) {
+            s = metaMgr_.Setup(config);
+            if (s.Failure()) [[unlikely]] { return s; }
+        }
         ShowConfig(config);
         return Status::OK();
     }
@@ -54,6 +67,12 @@ public:
     Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num) override
     {
         std::vector<uint8_t> founds(num);
+        if (onEvictMode_) {
+            std::lock_guard<std::mutex> lock(dumpedBlocksMutex_);
+            std::transform(blocks, blocks + num, founds.begin(),
+                           [this](const auto& block) { return dumpedBlocks_.count(block); });
+            return founds;
+        }
         StopWatch sw;
         std::transform(blocks, blocks + num, founds.begin(),
                        [this](const Detail::BlockId& block) { return metaMgr_.Exist(block); });
@@ -62,6 +81,14 @@ public:
     }
     Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num) override
     {
+        if (onEvictMode_) {
+            std::lock_guard<std::mutex> lock(dumpedBlocksMutex_);
+            ssize_t index = -1;
+            for (size_t i = 0; i < num && dumpedBlocks_.count(blocks[i]); ++i) {
+                index = static_cast<ssize_t>(i);
+            }
+            return index;
+        }
         ssize_t index = -1;
         StopWatch sw;
         for (size_t i = 0; i < num && metaMgr_.Exist(blocks[i]); i++) {
@@ -72,6 +99,13 @@ public:
     }
     Expected<ssize_t> LookupOnReverse(const Detail::BlockId* blocks, size_t num) override
     {
+        if (onEvictMode_) {
+            std::lock_guard<std::mutex> lock(dumpedBlocksMutex_);
+            for (ssize_t i = static_cast<ssize_t>(num) - 1; i >= 0; --i) {
+                if (dumpedBlocks_.count(blocks[i])) { return i; }
+            }
+            return static_cast<ssize_t>(-1);
+        }
         StopWatch sw;
         for (ssize_t i = static_cast<ssize_t>(num) - 1; i >= 0; --i) {
             if (metaMgr_.Exist(blocks[i])) {
@@ -87,6 +121,16 @@ public:
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override { return NextId(); }
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override
     {
+        if (onEvictMode_) {
+            {
+                std::lock_guard<std::mutex> lock(dumpedBlocksMutex_);
+                for (const auto& shard : task) { dumpedBlocks_.insert(shard.owner); }
+            }
+            Metrics::UpdateStats(NAME_TO_METRIC_ID("on_evict_backend_write_requests_total"), 1.0);
+            Metrics::UpdateStats(NAME_TO_METRIC_ID("on_evict_backend_write_bytes_total"),
+                                 static_cast<double>(blockSize_));
+            return NextId();
+        }
         StopWatch sw;
         std::for_each(task.begin(), task.end(),
                       [this](const Detail::Shard& shard) { metaMgr_.Insert(shard.owner); });
@@ -104,6 +148,10 @@ private:
     };
     Status CheckConfig(const Config& config)
     {
+        if (config.onEvictMode) {
+            if (config.blockSize == 0) { return Status::InvalidParam("invalid block size"); }
+            return Status::OK();
+        }
         if (config.uniqueId.empty()) { return Status::InvalidParam("invalid unique id"); }
         if (config.bufferNumber < 1024) {
             return Status::InvalidParam("too small buffer number({})", config.bufferNumber);
@@ -120,6 +168,7 @@ private:
         UC_INFO("Set {}::UniqueId to {}.", ns, config.uniqueId);
         UC_INFO("Set {}::BufferNumber to {}.", ns, config.bufferNumber);
         UC_INFO("Set {}::ShareBufferEnable to {}.", ns, config.shareBufferEnable);
+        UC_INFO("Set {}::OnEvictMode to {}.", ns, config.onEvictMode);
     }
 };
 

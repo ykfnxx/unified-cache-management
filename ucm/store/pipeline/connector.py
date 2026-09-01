@@ -284,6 +284,21 @@ def _cache_fake_pipeline_builder(
     pipeline.Stack("Cache", str(store_dir / "cache/libcachestore.so"), config)
 
 
+def _on_evict_cache_fake_pipeline_builder(
+    config: Dict[str, object], pipeline: ucmpipelinestore.PipelineStore
+):
+    store_dir = Path(__file__).resolve().parent.parent
+    fake_config = copy.deepcopy(config)
+    fake_config["fake_on_evict_mode"] = True
+    _preload_metrics(store_dir)
+    pipeline.Stack("Fake", str(store_dir / "fake/libfakestore.so"), fake_config)
+    pipeline.Stack(
+        "OnEvictCache",
+        str(store_dir / "on_evict_cache/libonevictcachestore.so"),
+        config,
+    )
+
+
 def _mooncake_pipeline_builder(
     config: Dict[str, object], pipeline: ucmpipelinestore.PipelineStore
 ):
@@ -390,6 +405,9 @@ UcmPipelineStoreBuilder.register(
     "Cache|Compress|Posix", _build_cache_compress_posix_pipeline
 )
 UcmPipelineStoreBuilder.register("Cache|Fake", _cache_fake_pipeline_builder)
+UcmPipelineStoreBuilder.register(
+    "OnEvictCache|Fake", _on_evict_cache_fake_pipeline_builder
+)
 UcmPipelineStoreBuilder.register("Mooncake", _mooncake_pipeline_builder)
 UcmPipelineStoreBuilder.register("Mooncake|Posix", _mooncake_posix_pipeline_builder)
 UcmPipelineStoreBuilder.register("Delegator", _delegator_pipeline_builder)

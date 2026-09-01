@@ -25,6 +25,7 @@
 #include "detail/random.h"
 #include "detail/types_helper.h"
 #include "fake/cc/fake_store.cc"
+#include "metrics_api.h"
 
 class UCFakeStoreImplTest : public testing::Test {
 protected:
@@ -80,4 +81,36 @@ TEST_F(UCFakeStoreImplTest, Lookup)
         std::vector<uint8_t> expected{true, true, false, true};
         ASSERT_TRUE(founds == expected);
     }
+}
+
+TEST_F(UCFakeStoreImplTest, OnEvictModeTracksDumpedBlocksAndCountsRequests)
+{
+    UC::Metrics::SetUp();
+    UC::Metrics::CreateStats("on_evict_backend_write_requests_total", "counter");
+    UC::Metrics::CreateStats("on_evict_backend_write_bytes_total", "counter");
+    UC::Metrics::GetAllStatsAndClear();
+
+    UC::FakeStore::FakeStore store;
+    UC::Detail::Dictionary config;
+    config.SetNumber("block_size", size_t(4096));
+    config.Set("fake_on_evict_mode", true);
+    ASSERT_TRUE(store.Setup(config).Success());
+
+    auto block = UC::Test::Detail::TypesHelper::MakeBlockId("block-a");
+    ASSERT_FALSE(store.Lookup(&block, 1).Value()[0]);
+    UC::Detail::TaskDesc task{
+        UC::Detail::Shard{block, 0, {}}
+    };
+    ASSERT_TRUE(store.Dump(std::move(task)));
+    ASSERT_TRUE(store.Lookup(&block, 1).Value()[0]);
+
+    auto missing = UC::Test::Detail::TypesHelper::MakeBlockId("block-b");
+    const UC::Detail::BlockId blocks[]{block, missing};
+    EXPECT_EQ(store.LookupOnPrefix(blocks, 2).Value(), 0);
+    EXPECT_EQ(store.LookupOnReverse(blocks, 2).Value(), 0);
+
+    const auto stats = UC::Metrics::GetAllStatsAndClear();
+    const auto& counters = std::get<0>(stats);
+    EXPECT_EQ(counters.at("on_evict_backend_write_requests_total"), 1.0);
+    EXPECT_EQ(counters.at("on_evict_backend_write_bytes_total"), 4096.0);
 }

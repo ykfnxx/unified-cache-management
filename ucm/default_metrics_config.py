@@ -91,6 +91,17 @@ _COUNTER_METRICS = [
         "Number of Cache device-to-host transfer, event wait, or sync failures",
     ),
     (
+        "on_evict_backend_write_requests_total",
+        "Number of backend write requests triggered by OnEvictCache eviction",
+    ),
+    (
+        "on_evict_backend_write_bytes_total",
+        (
+            "Total bytes represented by backend write requests triggered by "
+            "OnEvictCache eviction"
+        ),
+    ),
+    (
         "cache_load_bytes_total",
         "Total bytes loaded through the Cache stage (per-task size summed)",
     ),

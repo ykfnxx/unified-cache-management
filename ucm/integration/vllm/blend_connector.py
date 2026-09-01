@@ -324,6 +324,7 @@ class UCMBlendConnector(UCMDirectConnector):
             (load_ucm_block_ids, load_vllm_block_ids),
             (dump_ucm_block_ids, dump_vllm_block_ids),
             req_meta.chunks_meta,
+            request_block_ids=list(ucm_block_hashs),
         )
 
     def _post_process_chunk_cache(self, k_cache, vllm_ids, positions) -> None:

@@ -117,6 +117,10 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
         flat = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
         self.store_.Prefetch(flat)
 
+    def observe_request(self, block_ids: List[bytes]) -> None:
+        flat = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
+        self.store_.ObserveRequest(flat)
+
     def _tensor_normalize(self, tensors: List[List[torch.Tensor]]) -> np.ndarray:
         n_rows = len(tensors)
         n_cols = len(tensors[0])
@@ -179,6 +183,31 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
         else:
             addrs = np.array(src_addr, dtype=np.uint64)
         task_id = self.store_.Dump(ids, indexes, addrs, prerequisite_handle)
+        return UcmPipelineStoreTransTask(task_id)
+
+    def dump_data_with_context(
+        self,
+        block_ids: List[bytes],
+        shard_index: List[int],
+        src_addr: List[List[int]] | np.ndarray,
+        request_block_ids: List[List[bytes]],
+        dump_block_ids: List[List[bytes]],
+        prerequisite_handle: int = 0,
+    ) -> Task:
+        ids = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
+        indexes = array.array("Q", shard_index)
+        if isinstance(src_addr, np.ndarray):
+            addrs = src_addr
+        else:
+            addrs = np.array(src_addr, dtype=np.uint64)
+        task_id = self.store_.Dump(
+            ids,
+            indexes,
+            addrs,
+            request_block_ids,
+            dump_block_ids,
+            prerequisite_handle,
+        )
         return UcmPipelineStoreTransTask(task_id)
 
     def wait(self, task: Task) -> None:

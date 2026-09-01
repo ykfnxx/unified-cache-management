@@ -160,6 +160,19 @@ Expected<Detail::TaskHandle> HealthBreakerStore::Dump(Detail::TaskDesc task)
     return store_->Dump(std::move(task));
 }
 
+Expected<Detail::TaskHandle> HealthBreakerStore::Dump(
+    Detail::TaskDesc task, const Detail::RequestAwareDumpContext& context)
+{
+    if (!Enabled()) { return Status::StoreUnhealthy(storeId_); }
+    return store_->Dump(std::move(task), context);
+}
+
+Status HealthBreakerStore::ObserveRequest(const Detail::BlockId* blocks, size_t num)
+{
+    if (!Enabled()) { return Status::StoreUnhealthy(storeId_); }
+    return store_->ObserveRequest(blocks, num);
+}
+
 Expected<bool> HealthBreakerStore::Check(Detail::TaskHandle taskId)
 {
     return store_->Check(taskId);

@@ -360,6 +360,7 @@ def _install_stubs():
     _install_module(
         "ucm.integration.vllm.device",
         create_device=lambda *args, **kwargs: None,
+        get_current_device_id=lambda: 0,
     )
     _install_module("ucm.logger", init_logger=lambda name: _Logger())
     _install_module("ucm.shared.metrics", ucmmetrics=fake_ucmmetrics)
@@ -383,6 +384,7 @@ from ucm.default_metrics_config import DEFAULT_METRICS_CONFIG
 from ucm.integration.vllm.metrics import UCMConnectorStats, UCMPromMetrics
 from ucm.integration.vllm.ucm_connector import (
     PendingDumpTask,
+    RequestMeta,
     UCMConnector,
     UCMDirectConnector,
     UCMLayerWiseConnector,
@@ -564,6 +566,40 @@ def _reset_fakes():
     import ucm.metrics_dispatcher as dispatcher_module
 
     dispatcher_module._DISPATCHER = None
+
+
+def test_decode_blocks_are_not_admitted_to_request_aware_dump():
+    connector = object.__new__(UCMDirectConnector)
+    connector.block_size = 4
+    connector.cp_world_size = 1
+    request = RequestMeta(
+        ucm_block_ids=[b"a" * 16, b"b" * 16],
+        num_token_ids=8,
+        vllm_block_ids=[0, 1],
+        token_processed=8,
+    )
+
+    dispatch = connector._generate_dispatch_meta(request, 1, [2], need_load=False)
+
+    assert dispatch.dump_block_ids == ([], [])
+    assert dispatch.request_block_ids == []
+
+
+def test_prefill_dump_carries_full_ordered_request_path():
+    connector = object.__new__(UCMDirectConnector)
+    connector.block_size = 4
+    connector.cp_world_size = 1
+    request = RequestMeta(
+        ucm_block_ids=[b"a" * 16, b"b" * 16],
+        num_token_ids=8,
+        vllm_block_ids=[0],
+        token_processed=4,
+    )
+
+    dispatch = connector._generate_dispatch_meta(request, 4, [1], need_load=False)
+
+    assert dispatch.dump_block_ids == ([b"b" * 16], [1])
+    assert dispatch.request_block_ids == [b"a" * 16, b"b" * 16]
 
 
 def test_config_definitions_register_enable_list_and_metric_names():

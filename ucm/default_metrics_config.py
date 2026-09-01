@@ -102,6 +102,22 @@ _COUNTER_METRICS = [
         ),
     ),
     (
+        "on_evict_eviction_paths_total",
+        "Number of eviction paths committed by OnEvictCache",
+    ),
+    (
+        "on_evict_evicted_blocks_total",
+        "Number of resident blocks evicted by OnEvictCache",
+    ),
+    (
+        "on_evict_discarded_blocks_total",
+        "Number of expired OnEvictCache blocks discarded without backend dump",
+    ),
+    (
+        "on_evict_discarded_bytes_total",
+        "Bytes represented by expired OnEvictCache blocks discarded without backend dump",
+    ),
+    (
         "cache_load_bytes_total",
         "Total bytes loaded through the Cache stage (per-task size summed)",
     ),

@@ -22,17 +22,40 @@
  * SOFTWARE.
  */
 #include <atomic>
+#include <chrono>
 #include <list>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include "metrics_api.h"
 #include "ucmstore_v1.h"
 
 namespace UC::OnEvictCacheStore {
 
 class OnEvictCacheStore final : public StoreV1 {
     using BlockId = Detail::BlockId;
+    using Clock = std::chrono::steady_clock;
     using LruList = std::list<BlockId>;
+
+    struct LruEntry {
+        LruList::iterator position;
+        Clock::time_point lastAccessTime;
+    };
+
+    struct RadixNode {
+        BlockId block;
+        BlockId parent{};
+        bool hasParent{false};
+        bool resident{false};
+        size_t residentChildCount{0};
+        uint64_t lastAccessSeq{0};
+        Clock::time_point lastAccessTime;
+    };
+
+    using ProtectedBlocks = std::unordered_set<BlockId, Detail::BlockIdHasher>;
+    using LeafKey = std::pair<uint64_t, BlockId>;
 
 public:
     Status Setup(const Detail::Dictionary& config) override
@@ -41,11 +64,14 @@ public:
         config.GetNumber("block_size", blockSize_);
         config.GetNumber("on_evict_cache_capacity_gb", capacityGb_);
         config.Get("on_evict_cache_policy", policy_);
+        config.GetNumber("on_evict_cache_dump_max_idle_s", dumpMaxIdleSeconds_);
 
         if (backend_ == nullptr) { return Status::InvalidParam("invalid store backend"); }
         if (blockSize_ == 0) { return Status::InvalidParam("invalid block size"); }
         if (capacityGb_ == 0) { return Status::InvalidParam("invalid cache capacity"); }
-        if (policy_ != "lru") { return Status::InvalidParam("unsupported eviction policy"); }
+        if (policy_ != "lru" && policy_ != "radix_lru") {
+            return Status::InvalidParam("unsupported eviction policy");
+        }
 
         capacityBlocks_ = (capacityGb_ << 30) / blockSize_;
         if (capacityBlocks_ == 0) { return Status::InvalidParam("cache capacity is too small"); }
@@ -60,15 +86,26 @@ public:
         std::vector<uint8_t> founds(num, false);
         std::vector<BlockId> backendBlocks;
         std::vector<size_t> backendIndexes;
+        const auto accessSeq = ++accessSeq_;
+        const auto now = Clock::now();
         for (size_t i = 0; i < num; ++i) {
-            auto it = entries_.find(blocks[i]);
-            if (it != entries_.end()) {
-                founds[i] = true;
-                Touch(it);
+            if (policy_ == "lru") {
+                auto it = entries_.find(blocks[i]);
+                if (it != entries_.end()) {
+                    founds[i] = true;
+                    TouchLru(it, now);
+                    continue;
+                }
             } else {
-                backendBlocks.push_back(blocks[i]);
-                backendIndexes.push_back(i);
+                auto it = radixNodes_.find(blocks[i]);
+                if (it != radixNodes_.end() && it->second.resident) {
+                    founds[i] = true;
+                    TouchRadix(it->second, accessSeq, now);
+                    continue;
+                }
             }
+            backendBlocks.push_back(blocks[i]);
+            backendIndexes.push_back(i);
         }
         if (!backendBlocks.empty()) {
             auto backendFounds = backend_->Lookup(backendBlocks.data(), backendBlocks.size());
@@ -104,23 +141,47 @@ public:
 
     void Prefetch(const BlockId*, size_t) override {}
 
+    Status ObserveRequest(const BlockId* blocks, size_t num) override
+    {
+        if (policy_ == "lru") { return Status::OK(); }
+        std::lock_guard<std::mutex> lock(mutex_);
+        ObserveRequestLocked(blocks, num);
+        return Status::OK();
+    }
+
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc) override { return NextId(); }
 
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& shard : task) {
-            auto it = entries_.find(shard.owner);
-            if (it != entries_.end()) {
-                Touch(it);
-                continue;
-            }
-            if (entries_.size() == capacityBlocks_) {
-                auto status = EvictOne();
+        if (policy_ == "radix_lru") {
+            return Status::InvalidParam("radix_lru requires request context");
+        }
+        auto status = DumpLru(task);
+        if (status.Failure()) { return status; }
+        return NextId();
+    }
+
+    Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task,
+                                      const Detail::RequestAwareDumpContext& context) override
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (policy_ == "lru") {
+            auto status = DumpLru(task);
+            if (status.Failure()) { return status; }
+            return NextId();
+        }
+
+        ProtectedBlocks protectedBlocks;
+        for (const auto& request : context) {
+            protectedBlocks.insert(request.requestBlocks.begin(), request.requestBlocks.end());
+            ObserveRequestLocked(request.requestBlocks.data(), request.requestBlocks.size());
+        }
+        for (const auto& request : context) {
+            for (const auto& block : request.dumpBlocks) {
+                auto status = AdmitRadix(block, protectedBlocks);
                 if (status.Failure()) { return status; }
             }
-            lru_.push_front(shard.owner);
-            entries_[shard.owner] = lru_.begin();
         }
         return NextId();
     }
@@ -130,24 +191,185 @@ public:
     Status Wait(Detail::TaskHandle) override { return Status::OK(); }
 
 private:
-    using EntryIterator =
-        std::unordered_map<BlockId, LruList::iterator, Detail::BlockIdHasher>::iterator;
+    using EntryIterator = std::unordered_map<BlockId, LruEntry, Detail::BlockIdHasher>::iterator;
 
-    void Touch(EntryIterator it) { lru_.splice(lru_.begin(), lru_, it->second); }
-
-    Status EvictOne()
+    void TouchLru(EntryIterator it, Clock::time_point now)
     {
-        const auto victim = lru_.back();
+        lru_.splice(lru_.begin(), lru_, it->second.position);
+        it->second.lastAccessTime = now;
+    }
+
+    Status DumpLru(const Detail::TaskDesc& task)
+    {
+        for (const auto& shard : task) {
+            auto it = entries_.find(shard.owner);
+            if (it != entries_.end()) {
+                TouchLru(it, Clock::now());
+                continue;
+            }
+            if (entries_.size() == capacityBlocks_) {
+                auto status = EvictLru();
+                if (status.Failure()) { return status; }
+            }
+            lru_.push_front(shard.owner);
+            entries_[shard.owner] = LruEntry{lru_.begin(), Clock::now()};
+        }
+        return Status::OK();
+    }
+
+    void ObserveRequestLocked(const BlockId* blocks, size_t num)
+    {
+        const auto accessSeq = ++accessSeq_;
+        const auto now = Clock::now();
+        for (size_t i = 0; i < num; ++i) {
+            auto inserted = radixNodes_.emplace(blocks[i], RadixNode{});
+            auto& node = inserted.first->second;
+            if (inserted.second) {
+                node.block = blocks[i];
+                if (i != 0) {
+                    node.parent = blocks[i - 1];
+                    node.hasParent = true;
+                }
+            }
+            if (node.resident) { TouchRadix(node, accessSeq, now); }
+        }
+    }
+
+    void TouchRadix(RadixNode& node, uint64_t accessSeq, Clock::time_point now)
+    {
+        if (node.residentChildCount == 0) {
+            leafLru_.erase(LeafKey{node.lastAccessSeq, node.block});
+        }
+        node.lastAccessSeq = accessSeq;
+        node.lastAccessTime = now;
+        if (node.residentChildCount == 0) {
+            leafLru_.insert(LeafKey{node.lastAccessSeq, node.block});
+        }
+    }
+
+    Status AdmitRadix(const BlockId& block, const ProtectedBlocks& protectedBlocks)
+    {
+        auto it = radixNodes_.find(block);
+        if (it == radixNodes_.end()) { return Status::InvalidParam("block is not in radix tree"); }
+        if (it->second.resident) {
+            TouchRadix(it->second, ++accessSeq_, Clock::now());
+            return Status::OK();
+        }
+        if (residentBlocks_ == capacityBlocks_) {
+            auto status = EvictRadixPath(protectedBlocks);
+            if (status.Failure()) { return status; }
+        }
+
+        auto& node = it->second;
+        node.resident = true;
+        node.lastAccessSeq = ++accessSeq_;
+        node.lastAccessTime = Clock::now();
+        ++residentBlocks_;
+        if (node.hasParent) {
+            auto& parent = radixNodes_.find(node.parent)->second;
+            if (parent.resident && parent.residentChildCount == 0) {
+                leafLru_.erase(LeafKey{parent.lastAccessSeq, parent.block});
+            }
+            ++parent.residentChildCount;
+        }
+        if (node.residentChildCount == 0) {
+            leafLru_.insert(LeafKey{node.lastAccessSeq, node.block});
+        }
+        return Status::OK();
+    }
+
+    bool Expired(Clock::time_point lastAccessTime, Clock::time_point now) const
+    {
+        return dumpMaxIdleSeconds_ != 0 &&
+               now - lastAccessTime >= std::chrono::seconds(dumpMaxIdleSeconds_);
+    }
+
+    Status DumpToBackend(const BlockId& block)
+    {
         Detail::TaskDesc backendTask{
-            Detail::Shard{victim, 0, {}}
+            Detail::Shard{block, 0, {}}
         };
         backendTask.brief = "OnEvictCache2Backend";
         auto submitted = backend_->Dump(std::move(backendTask));
         if (!submitted) { return submitted.Error(); }
-        auto status = backend_->Wait(submitted.Value());
-        if (status.Failure()) { return status; }
-        entries_.erase(victim);
+        return backend_->Wait(submitted.Value());
+    }
+
+    void RecordEviction(size_t blocks, size_t discarded)
+    {
+        Metrics::UpdateStats(NAME_TO_METRIC_ID("on_evict_eviction_paths_total"), 1.0);
+        Metrics::UpdateStats(NAME_TO_METRIC_ID("on_evict_evicted_blocks_total"),
+                             static_cast<double>(blocks));
+        Metrics::UpdateStats(NAME_TO_METRIC_ID("on_evict_discarded_blocks_total"),
+                             static_cast<double>(discarded));
+        Metrics::UpdateStats(NAME_TO_METRIC_ID("on_evict_discarded_bytes_total"),
+                             static_cast<double>(discarded * blockSize_));
+    }
+
+    Status EvictLru()
+    {
+        const auto victim = lru_.back();
+        const auto it = entries_.find(victim);
+        const auto discarded = Expired(it->second.lastAccessTime, Clock::now());
+        if (!discarded) {
+            auto status = DumpToBackend(victim);
+            if (status.Failure()) { return status; }
+        }
+        entries_.erase(it);
         lru_.pop_back();
+        RecordEviction(1, discarded ? 1 : 0);
+        return Status::OK();
+    }
+
+    Status EvictRadixPath(const ProtectedBlocks& protectedBlocks)
+    {
+        auto leaf = leafLru_.begin();
+        while (leaf != leafLru_.end() && protectedBlocks.count(leaf->second) != 0) { ++leaf; }
+        if (leaf == leafLru_.end()) { return Status::NoSpace(); }
+
+        const auto startSeq = leaf->first;
+        std::vector<BlockId> victims;
+        auto current = leaf->second;
+        while (true) {
+            victims.push_back(current);
+            const auto& node = radixNodes_.find(current)->second;
+            if (!node.hasParent) { break; }
+            const auto& parent = radixNodes_.find(node.parent)->second;
+            if (!parent.resident || parent.residentChildCount >= 2 ||
+                protectedBlocks.count(parent.block) != 0 || parent.lastAccessSeq > startSeq) {
+                break;
+            }
+            current = parent.block;
+        }
+
+        const auto now = Clock::now();
+        size_t discarded = 0;
+        for (const auto& victim : victims) {
+            const auto& node = radixNodes_.find(victim)->second;
+            if (Expired(node.lastAccessTime, now)) {
+                ++discarded;
+                continue;
+            }
+            auto status = DumpToBackend(victim);
+            if (status.Failure()) { return status; }
+        }
+
+        for (const auto& victim : victims) {
+            auto& node = radixNodes_.find(victim)->second;
+            leafLru_.erase(LeafKey{node.lastAccessSeq, node.block});
+            node.resident = false;
+            --residentBlocks_;
+            if (node.hasParent) { --radixNodes_.find(node.parent)->second.residentChildCount; }
+        }
+        for (const auto& victim : victims) {
+            const auto& node = radixNodes_.find(victim)->second;
+            if (!node.hasParent) { continue; }
+            auto& parent = radixNodes_.find(node.parent)->second;
+            if (parent.resident && parent.residentChildCount == 0) {
+                leafLru_.insert(LeafKey{parent.lastAccessSeq, parent.block});
+            }
+        }
+        RecordEviction(victims.size(), discarded);
         return Status::OK();
     }
 
@@ -161,10 +383,15 @@ private:
     size_t blockSize_{0};
     size_t capacityGb_{0};
     size_t capacityBlocks_{0};
+    size_t dumpMaxIdleSeconds_{0};
     std::string policy_{"lru"};
     std::mutex mutex_;
     LruList lru_;
-    std::unordered_map<BlockId, LruList::iterator, Detail::BlockIdHasher> entries_;
+    std::unordered_map<BlockId, LruEntry, Detail::BlockIdHasher> entries_;
+    uint64_t accessSeq_{0};
+    size_t residentBlocks_{0};
+    std::unordered_map<BlockId, RadixNode, Detail::BlockIdHasher> radixNodes_;
+    std::set<LeafKey> leafLru_;
 };
 
 }  // namespace UC::OnEvictCacheStore

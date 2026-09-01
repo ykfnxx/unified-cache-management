@@ -66,6 +66,13 @@ struct TaskDesc : std::vector<Shard> {
     uintptr_t prerequisiteHandle{0};
 };
 
+struct RequestBlockContext {
+    std::vector<BlockId> requestBlocks;
+    std::vector<BlockId> dumpBlocks;
+};
+
+using RequestAwareDumpContext = std::vector<RequestBlockContext>;
+
 }  // namespace UC::Detail
 
 #endif

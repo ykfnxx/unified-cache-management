@@ -64,6 +64,14 @@ counter:
     documentation: "Number of backend write requests triggered by OnEvictCache eviction"
   - name: "on_evict_backend_write_bytes_total"
     documentation: "Total bytes represented by backend write requests triggered by OnEvictCache eviction"
+  - name: "on_evict_eviction_paths_total"
+    documentation: "Number of eviction paths committed by OnEvictCache"
+  - name: "on_evict_evicted_blocks_total"
+    documentation: "Number of resident blocks evicted by OnEvictCache"
+  - name: "on_evict_discarded_blocks_total"
+    documentation: "Number of expired OnEvictCache blocks discarded without backend dump"
+  - name: "on_evict_discarded_bytes_total"
+    documentation: "Bytes represented by expired OnEvictCache blocks discarded without backend dump"
 
   # -- Pipeline Cache stage: per-worker real throughput counters ------------
   # Accumulated per completed Cache task with size = shardSize * num_shards.

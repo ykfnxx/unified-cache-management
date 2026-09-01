@@ -24,6 +24,7 @@
 #ifndef UNIFIEDCACHE_STORE_V1_H
 #define UNIFIEDCACHE_STORE_V1_H
 
+#include <utility>
 #include "status/status.h"
 #include "type/dictionary.h"
 #include "type/types.h"
@@ -155,6 +156,12 @@ public:
      *   - On failure: relevant Status code.
      */
     virtual Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) = 0;
+
+    virtual Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task,
+                                              const Detail::RequestAwareDumpContext&)
+    { return Dump(std::move(task)); }
+
+    virtual Status ObserveRequest(const Detail::BlockId*, size_t) { return Status::OK(); }
 
     /**
      * @brief Poll for task completion without blocking.

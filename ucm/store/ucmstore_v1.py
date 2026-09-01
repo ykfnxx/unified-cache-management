@@ -127,6 +127,21 @@ class UcmKVStoreBaseV1(ABC):
         """
         pass
 
+    def observe_request(self, block_ids: List[bytes]) -> None:
+        """Report an ordered request path to stores that use request-aware eviction."""
+
+    def dump_data_with_context(
+        self,
+        block_ids: List[bytes],
+        shard_index: List[int],
+        src_addr: List[List[int]] | np.ndarray,
+        request_block_ids: List[List[bytes]],
+        dump_block_ids: List[List[bytes]],
+        prerequisite_handle: int = 0,
+    ) -> Task:
+        """Dump with ordered request metadata; stores may ignore the metadata."""
+        return self.dump_data(block_ids, shard_index, src_addr, prerequisite_handle)
+
     @abstractmethod
     def load(
         self,

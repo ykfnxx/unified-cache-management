@@ -340,6 +340,7 @@ class RequestDispatchMeta:
         list[bytes], list[int]
     ]  # [0] mean ucm_block_ids, [1] means vllm_block_ids
     dump_block_ids: tuple[list[bytes], list[int]]
+    request_block_ids: list[bytes] = field(default_factory=list, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1649,6 +1650,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         |                                         scheduled_block_num                                      |
         """
 
+        is_prefill = req_meta.token_processed < req_meta.num_token_ids
         hbm_hit_block_num = req_meta.hbm_hit_block_num
         total_hit_block_num = req_meta.total_hit_block_num
         ucm_block_ids = req_meta.ucm_block_ids
@@ -1684,6 +1686,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         return RequestDispatchMeta(
             (load_ucm_block_ids, load_vllm_block_ids),
             (dump_ucm_block_ids, dump_vllm_block_ids),
+            request_block_ids=list(ucm_block_ids) if is_prefill else [],
         )
 
     def build_connector_meta(
@@ -1704,7 +1707,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         # for cached request, there are 3 situation:
         # 1. chunked prefill: we only need dump
         # 2. resumed: we need to handle like new request
-        # 3. TODO decode stage: nothing happened
+        # 3. decode: do not generate UCM dump metadata
         scheduled_cached_reqs = scheduler_output.scheduled_cached_reqs
         if not isinstance(scheduled_cached_reqs, list):
             # >= 0.9.2
@@ -1939,6 +1942,18 @@ class UCMDirectConnector(KVConnectorBase_V1):
         if preempted_req_ids:
             self._flush_pending_dump_tasks(preempted_req_ids)
 
+    def _store_block_ids(self, block_ids: list[bytes]) -> list[bytes]:
+        if self.tp_rank % self.tp_size == 0:
+            return list(block_ids)
+        return [self.request_hasher(block_id) for block_id in block_ids]
+
+    def _observe_requests_without_dump(self, metadata: UCMConnectorMetadata) -> None:
+        for request in metadata.request_meta.values():
+            if request.request_block_ids and not request.dump_block_ids[0]:
+                self.store.observe_request(
+                    self._store_block_ids(request.request_block_ids)
+                )
+
     def wait_for_save(self) -> None:
         # TODO support PP
         wait_for_save_start_ms = time.perf_counter() * 1000
@@ -1956,11 +1971,14 @@ class UCMDirectConnector(KVConnectorBase_V1):
         if self.is_mla and self.tp_rank != 0:
             return
 
+        self._observe_requests_without_dump(metadata)
+
         is_save = False
         num_saved_block = 0
         total_ucm_block_ids, total_vllm_block_ids = [], []
         dump_request_ids: set[str] = set()
-        block_ids_by_request: dict[str, set[bytes]] = {}
+        block_ids_by_request: dict[str, list[bytes]] = {}
+        request_block_ids_by_request: dict[str, list[bytes]] = {}
         for request_id, request in metadata.request_meta.items():
             if len(request.dump_block_ids[0]) == 0:
                 continue
@@ -1976,13 +1994,12 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     continue
             is_save = True
             dump_request_ids.add(request_id)
-            block_ids_by_request[request_id] = set(ucm_block_ids)
             num_saved_block += len(ucm_block_ids)
-            store_block_ids = ucm_block_ids
-            if self.tp_rank != 0:
-                store_block_ids = [
-                    self.request_hasher(block_id) for block_id in ucm_block_ids
-                ]
+            store_block_ids = self._store_block_ids(ucm_block_ids)
+            block_ids_by_request[request_id] = store_block_ids
+            request_block_ids_by_request[request_id] = self._store_block_ids(
+                request.request_block_ids
+            )
             total_ucm_block_ids.extend(store_block_ids)
             total_vllm_block_ids.extend(vllm_block_ids)
 
@@ -2002,6 +2019,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
                     shard_indexs,
                     total_ptrs,
                     event_handle,
+                    request_block_ids_by_request,
                 )
             except Exception as e:
                 logger.error(f"dump kv cache failed. {type(e).__name__}: {e}")
@@ -2177,7 +2195,15 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
         metadata = self._get_connector_metadata()
         block_ids_by_request = {
-            request_id: set(metadata.request_meta[request_id].dump_block_ids[0])
+            request_id: self._store_block_ids(
+                metadata.request_meta[request_id].dump_block_ids[0]
+            )
+            for request_id in dump_request_ids
+        }
+        request_block_ids_by_request = {
+            request_id: self._store_block_ids(
+                metadata.request_meta[request_id].request_block_ids
+            )
             for request_id in dump_request_ids
         }
         local_layer_id = layer_id - self.first_layer_id
@@ -2198,6 +2224,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
                 shard_indexs,
                 layer_ptrs,
                 event_handle,
+                request_block_ids_by_request,
             )
             self._pending_dump_tasks.append(
                 PendingDumpTask(
@@ -2389,11 +2416,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
 
             dump_request_ids.add(request_id)
             ucm_block_ids, vllm_block_ids = request.dump_block_ids
-            store_block_ids = ucm_block_ids
-            if self.tp_rank % self.tp_size != 0:
-                store_block_ids = [
-                    self.request_hasher(block_id) for block_id in ucm_block_ids
-                ]
+            store_block_ids = self._store_block_ids(ucm_block_ids)
             total_ucm_block_ids.extend(store_block_ids)
             total_vllm_block_ids.extend(vllm_block_ids)
 
@@ -2418,6 +2441,7 @@ class UCMLayerWiseConnector(UCMDirectConnector):
             self._layerwise_save_bytes = 0
         if self._connector_metadata:
             metadata = self._get_connector_metadata()
+            self._observe_requests_without_dump(metadata)
             self._async_dump_req_ids.update(
                 request_id
                 for request_id, request in metadata.request_meta.items()
@@ -2499,6 +2523,10 @@ class UCMCPConnector(UCMLayerWiseConnector):
         # the blocks that each device can process are [current_rank :: cp_world_size],
         # where current_rank = self.dcp_world_size * self.pcp_rank + self.dcp_rank.
         for _, request in connector_metadata.request_meta.items():
+            if request.request_block_ids:
+                request.request_block_ids = request.request_block_ids[
+                    self.current_rank :: self.cp_world_size
+                ]
             if len(request.load_block_ids[0]) > 0:
                 ucm_block_ids, vllm_block_ids = request.load_block_ids
                 ucm_block_ids = ucm_block_ids[self.current_rank :: self.cp_world_size]

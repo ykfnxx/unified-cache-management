@@ -21,6 +21,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
+#include <cstring>
 #include <list>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -140,6 +141,38 @@ class PipelineStore {
         return desc;
     }
 
+    static std::vector<Detail::BlockId> MakeBlockIds(const pybind11::handle& values)
+    {
+        std::vector<Detail::BlockId> blocks;
+        for (const auto& value : pybind11::reinterpret_borrow<pybind11::iterable>(values)) {
+            const auto bytes = pybind11::cast<std::string>(value);
+            if (bytes.size() != Detail::BlockId{}.size()) {
+                ThrowIfFailed(Status::InvalidParam("invalid block id size"));
+            }
+            Detail::BlockId block;
+            std::memcpy(block.data(), bytes.data(), block.size());
+            blocks.push_back(block);
+        }
+        return blocks;
+    }
+
+    static Detail::RequestAwareDumpContext MakeRequestContext(const pybind11::list& requestBlocks,
+                                                              const pybind11::list& dumpBlocks)
+    {
+        if (requestBlocks.size() != dumpBlocks.size()) {
+            ThrowIfFailed(Status::InvalidParam("request and dump context size mismatch"));
+        }
+        Detail::RequestAwareDumpContext context;
+        context.reserve(requestBlocks.size());
+        for (size_t i = 0; i < requestBlocks.size(); ++i) {
+            context.push_back(Detail::RequestBlockContext{
+                MakeBlockIds(requestBlocks[i]),
+                MakeBlockIds(dumpBlocks[i]),
+            });
+        }
+        return context;
+    }
+
 public:
     PipelineStore() = default;
     ~PipelineStore()
@@ -207,6 +240,11 @@ public:
         BufferArrayView<Detail::BlockId> idArr{ids};
         StoreBack()->Prefetch(idArr.data, idArr.num);
     }
+    void ObserveRequest(const pybind11::buffer& ids)
+    {
+        BufferArrayView<Detail::BlockId> idArr{ids};
+        ThrowIfFailed(StoreBack()->ObserveRequest(idArr.data, idArr.num));
+    }
     Detail::TaskHandle Load(const pybind11::buffer& ids, const pybind11::buffer& indexes,
                             const pybind11::buffer& addrs)
     {
@@ -223,6 +261,19 @@ public:
         desc.brief = "Dump";
         desc.prerequisiteHandle = prerequisite_handle;
         auto res = StoreBack()->Dump(desc);
+        if (res) { return res.Value(); }
+        if (res.Error() == Status::StoreUnhealthy()) { return UNHEALTHY_DUMP_TASK; }
+        ThrowError(res.Error());
+    }
+    Detail::TaskHandle Dump(const pybind11::buffer& ids, const pybind11::buffer& indexes,
+                            const pybind11::buffer& addrs, const pybind11::list& requestBlocks,
+                            const pybind11::list& dumpBlocks, uintptr_t prerequisite_handle = 0)
+    {
+        auto desc = MakeTaskDesc(ids, indexes, addrs);
+        desc.brief = "Dump";
+        desc.prerequisiteHandle = prerequisite_handle;
+        auto context = MakeRequestContext(requestBlocks, dumpBlocks);
+        auto res = StoreBack()->Dump(std::move(desc), context);
         if (res) { return res.Value(); }
         if (res.Error() == Status::StoreUnhealthy()) { return UNHEALTHY_DUMP_TASK; }
         ThrowError(res.Error());
@@ -268,10 +319,21 @@ PYBIND11_MODULE(ucmpipelinestore, m)
     s.def("LookupOnPrefix", &PipelineStore::LookupOnPrefix, py::arg("ids").noconvert());
     s.def("LookupOnReverse", &PipelineStore::LookupOnReverse, py::arg("ids").noconvert());
     s.def("Prefetch", &PipelineStore::Prefetch, py::arg("ids").noconvert());
+    s.def("ObserveRequest", &PipelineStore::ObserveRequest, py::arg("ids").noconvert());
     s.def("Load", &PipelineStore::Load, py::arg("ids").noconvert(), py::arg("indexes").noconvert(),
           py::arg("addrs").noconvert());
-    s.def("Dump", &PipelineStore::Dump, py::arg("ids").noconvert(), py::arg("indexes").noconvert(),
-          py::arg("addrs").noconvert(), py::arg("prerequisite_handle") = 0);
+    s.def("Dump",
+          py::overload_cast<const pybind11::buffer&, const pybind11::buffer&,
+                            const pybind11::buffer&, uintptr_t>(&PipelineStore::Dump),
+          py::arg("ids").noconvert(), py::arg("indexes").noconvert(), py::arg("addrs").noconvert(),
+          py::arg("prerequisite_handle") = 0);
+    s.def(
+        "Dump",
+        py::overload_cast<const pybind11::buffer&, const pybind11::buffer&, const pybind11::buffer&,
+                          const pybind11::list&, const pybind11::list&, uintptr_t>(
+            &PipelineStore::Dump),
+        py::arg("ids").noconvert(), py::arg("indexes").noconvert(), py::arg("addrs").noconvert(),
+        py::arg("request_blocks"), py::arg("dump_blocks"), py::arg("prerequisite_handle") = 0);
     s.def("Check", &PipelineStore::Check);
     s.def("Wait", &PipelineStore::Wait);
 }

@@ -192,11 +192,12 @@ class RankConsistencyManager:
     def submit_dump(
         self,
         store: UcmKVStoreBaseV1,
-        block_ids_by_request: dict[str, set[bytes]],
+        block_ids_by_request: dict[str, list[bytes]],
         block_ids: list[bytes],
         shard_indices: list[int],
         ptrs: Any,
         event_handle: int,
+        request_block_ids_by_request: dict[str, list[bytes]] | None = None,
     ) -> Any:
         """Track submitted blocks and the Store used by each dump task."""
         request_context = (
@@ -212,7 +213,21 @@ class RankConsistencyManager:
                 request_block_ids
             )
         try:
-            task = store.dump_data(block_ids, shard_indices, ptrs, event_handle)
+            if request_block_ids_by_request is None:
+                task = store.dump_data(block_ids, shard_indices, ptrs, event_handle)
+            else:
+                request_ids = list(block_ids_by_request)
+                task = store.dump_data_with_context(
+                    block_ids,
+                    shard_indices,
+                    ptrs,
+                    [
+                        request_block_ids_by_request[request_id]
+                        for request_id in request_ids
+                    ],
+                    [block_ids_by_request[request_id] for request_id in request_ids],
+                    event_handle,
+                )
         except Exception:
             self._record_dump_failure(request_context)
             raise

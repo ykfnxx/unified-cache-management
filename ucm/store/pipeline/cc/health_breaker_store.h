@@ -59,6 +59,9 @@ public:
     Status CheckHealth() override;
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override;
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override;
+    Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task,
+                                      const Detail::RequestAwareDumpContext& context) override;
+    Status ObserveRequest(const Detail::BlockId* blocks, size_t num) override;
     Expected<bool> Check(Detail::TaskHandle taskId) override;
     Status Wait(Detail::TaskHandle taskId) override;
 

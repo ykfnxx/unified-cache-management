@@ -253,6 +253,7 @@ def run_once(
     metadata.request_meta["uc_test_write"] = RequestDispatchMeta(
         load_block_ids=([], []),
         dump_block_ids=(dump_hashes, dump_vllm_block_ids),
+        request_block_ids=dump_hashes,
     )
     connector.connector.kv_caches = kv_caches
     connector.bind_connector_metadata(metadata)
@@ -276,6 +277,7 @@ def run_once(
     load_metadata.request_meta["uc_test_read"] = RequestDispatchMeta(
         load_block_ids=(dump_hashes, load_vllm_block_ids),
         dump_block_ids=([], []),
+        request_block_ids=dump_hashes,
     )
     connector.connector.kv_caches = kv_caches
     connector.bind_connector_metadata(load_metadata)

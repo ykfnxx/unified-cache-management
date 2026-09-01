@@ -105,6 +105,10 @@ No Cache Store-specific Gauges are exported by default.
 | ------------------------------------------- | ------------------------------------------------------------------ |
 | `ucm:on_evict_backend_write_requests_total` | Backend write requests triggered by cache eviction                 |
 | `ucm:on_evict_backend_write_bytes_total`    | Bytes represented by backend write requests triggered by eviction |
+| `ucm:on_evict_eviction_paths_total`         | Radix or single-block eviction paths committed                     |
+| `ucm:on_evict_evicted_blocks_total`         | Resident blocks removed by eviction                               |
+| `ucm:on_evict_discarded_blocks_total`       | Expired blocks discarded without a backend write                   |
+| `ucm:on_evict_discarded_bytes_total`        | Bytes represented by expired blocks discarded without a write     |
 
 View the cumulative values at the vLLM `/metrics` endpoint. Use `rate(ucm:on_evict_backend_write_requests_total[5m])` for requests per second and `rate(ucm:on_evict_backend_write_bytes_total[5m])` for bytes per second.
 

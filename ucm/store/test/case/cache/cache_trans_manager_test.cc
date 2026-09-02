@@ -21,6 +21,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
+#include <algorithm>
 #include "cache/cc/trans_manager.h"
 #include "detail/data_generator.h"
 #include "detail/mock_store.h"

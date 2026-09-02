@@ -22,10 +22,8 @@
  * SOFTWARE.
  */
 #include "on_evict_cache/cc/on_evict_cache_store.cc"
-#include <chrono>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
-#include <thread>
 #include "detail/mock_store.h"
 #include "detail/types_helper.h"
 
@@ -192,11 +190,30 @@ TEST(UCOnEvictCacheStoreTest, DiscardsExpiredVictimWithoutBackendDump)
 
     const auto a = UC::Test::Detail::TypesHelper::MakeBlockId("a");
     const auto b = UC::Test::Detail::TypesHelper::MakeBlockId("b");
-    ASSERT_TRUE(store.Dump(Task(a), Context({a}, {a})));
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-    ASSERT_TRUE(store.Dump(Task(b), Context({b}, {b})));
+    ASSERT_TRUE(store.Dump(Task(a), Context({a}, {a}), 0));
+    ASSERT_TRUE(store.Dump(Task(b), Context({b}, {b}), 1'000'000'000));
 
     EXPECT_EQ(store.Lookup(&b, 1).Value(), (std::vector<uint8_t>{true}));
+}
+
+TEST(UCOnEvictCacheStoreTest, LogicalLookupRefreshesVictimAccessTime)
+{
+    testing::StrictMock<UC::Test::Detail::MockStore> backend;
+    UC::OnEvictCacheStore::OnEvictCacheStore store;
+    SetupStore(store, backend, "radix_lru", 1, 1);
+
+    const auto a = UC::Test::Detail::TypesHelper::MakeBlockId("a");
+    const auto b = UC::Test::Detail::TypesHelper::MakeBlockId("b");
+    ASSERT_TRUE(store.Dump(Task(a), Context({a}, {a}), 0));
+    EXPECT_EQ(store.LookupOnPrefix(&a, 1, 2'000'000'000).Value(), 0);
+
+    EXPECT_CALL(backend, Dump(testing::_))
+        .WillOnce(testing::Invoke([&a](UC::Detail::TaskDesc task) {
+            EXPECT_EQ(task[0].owner, a);
+            return UC::Expected<UC::Detail::TaskHandle>(UC::Detail::TaskHandle{31});
+        }));
+    EXPECT_CALL(backend, Wait(31)).WillOnce(testing::Return(UC::Status::OK()));
+    ASSERT_TRUE(store.Dump(Task(b), Context({b}, {b}), 2'000'000'000));
 }
 
 }  // namespace

@@ -122,6 +122,13 @@ Expected<ssize_t> HealthBreakerStore::LookupOnPrefix(const Detail::BlockId* bloc
     return store_->LookupOnPrefix(blocks, num);
 }
 
+Expected<ssize_t> HealthBreakerStore::LookupOnPrefix(const Detail::BlockId* blocks, size_t num,
+                                                     uint64_t logicalTimeNs)
+{
+    if (!Enabled()) { return static_cast<ssize_t>(-1); }
+    return store_->LookupOnPrefix(blocks, num, logicalTimeNs);
+}
+
 Expected<ssize_t> HealthBreakerStore::LookupOnReverse(const Detail::BlockId* blocks, size_t num)
 {
     if (!Enabled()) { return static_cast<ssize_t>(-1); }
@@ -165,6 +172,13 @@ Expected<Detail::TaskHandle> HealthBreakerStore::Dump(
 {
     if (!Enabled()) { return Status::StoreUnhealthy(storeId_); }
     return store_->Dump(std::move(task), context);
+}
+
+Expected<Detail::TaskHandle> HealthBreakerStore::Dump(
+    Detail::TaskDesc task, const Detail::RequestAwareDumpContext& context, uint64_t logicalTimeNs)
+{
+    if (!Enabled()) { return Status::StoreUnhealthy(storeId_); }
+    return store_->Dump(std::move(task), context, logicalTimeNs);
 }
 
 Status HealthBreakerStore::ObserveRequest(const Detail::BlockId* blocks, size_t num)

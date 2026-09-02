@@ -54,6 +54,8 @@ public:
     std::string Readme() const override;
     Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num) override;
     Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num) override;
+    Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num,
+                                     uint64_t logicalTimeNs) override;
     Expected<ssize_t> LookupOnReverse(const Detail::BlockId* blocks, size_t num) override;
     void Prefetch(const Detail::BlockId* blocks, size_t num) override;
     Status CheckHealth() override;
@@ -61,6 +63,9 @@ public:
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override;
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task,
                                       const Detail::RequestAwareDumpContext& context) override;
+    Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task,
+                                      const Detail::RequestAwareDumpContext& context,
+                                      uint64_t logicalTimeNs) override;
     Status ObserveRequest(const Detail::BlockId* blocks, size_t num) override;
     Expected<bool> Check(Detail::TaskHandle taskId) override;
     Status Wait(Detail::TaskHandle taskId) override;

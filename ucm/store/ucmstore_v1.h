@@ -24,6 +24,7 @@
 #ifndef UNIFIEDCACHE_STORE_V1_H
 #define UNIFIEDCACHE_STORE_V1_H
 
+#include <cstdint>
 #include <utility>
 #include "status/status.h"
 #include "type/dictionary.h"
@@ -91,6 +92,12 @@ public:
      *   - On failure: appropriate Status code.
      * */
     virtual Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num) = 0;
+
+    virtual Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num,
+                                             uint64_t)
+    {
+        return LookupOnPrefix(blocks, num);
+    }
 
     /**
      * @brief Check whether the given blocks exist in storage (reverse scan).
@@ -160,6 +167,13 @@ public:
     virtual Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task,
                                               const Detail::RequestAwareDumpContext&)
     { return Dump(std::move(task)); }
+
+    virtual Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task,
+                                              const Detail::RequestAwareDumpContext& context,
+                                              uint64_t)
+    {
+        return Dump(std::move(task), context);
+    }
 
     virtual Status ObserveRequest(const Detail::BlockId*, size_t) { return Status::OK(); }
 

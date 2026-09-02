@@ -73,7 +73,8 @@ public:
     Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num)
     {
         if (!buffer_ || loadBackendOnly_) {
-            return LookupThrough<&StoreV1::LookupOnPrefix>(blocks, num);
+            using Lookup = Expected<ssize_t> (StoreV1::*)(const Detail::BlockId*, size_t);
+            return LookupThrough<static_cast<Lookup>(&StoreV1::LookupOnPrefix)>(blocks, num);
         }
         return LookupOnPrefixFast(blocks, num);
     }

@@ -245,6 +245,26 @@ public:
         BufferArrayView<Detail::BlockId> idArr{ids};
         ThrowIfFailed(StoreBack()->ObserveRequest(idArr.data, idArr.num));
     }
+    pybind11::tuple ReplayRequest(const pybind11::list& ids, uint64_t logicalTimeNs)
+    {
+        auto blocks = MakeBlockIds(ids);
+        auto found = StoreBack()->LookupOnPrefix(blocks.data(), blocks.size(), logicalTimeNs);
+        if (!found) { ThrowError(found.Error()); }
+        const auto prefixHits = static_cast<size_t>(found.Value() + 1);
+        std::vector<Detail::BlockId> admitted(blocks.begin() + prefixHits, blocks.end());
+
+        Detail::TaskDesc task;
+        task.brief = "ReplayRequest";
+        task.reserve(admitted.size());
+        for (const auto& block : admitted) { task.push_back(Detail::Shard{block, 0, {}}); }
+        Detail::RequestAwareDumpContext context{
+            Detail::RequestBlockContext{std::move(blocks), admitted}
+        };
+        auto dumped = StoreBack()->Dump(std::move(task), context, logicalTimeNs);
+        if (!dumped) { ThrowError(dumped.Error()); }
+        ThrowIfFailed(StoreBack()->Wait(dumped.Value()));
+        return pybind11::make_tuple(prefixHits, admitted.size());
+    }
     Detail::TaskHandle Load(const pybind11::buffer& ids, const pybind11::buffer& indexes,
                             const pybind11::buffer& addrs)
     {
@@ -320,6 +340,8 @@ PYBIND11_MODULE(ucmpipelinestore, m)
     s.def("LookupOnReverse", &PipelineStore::LookupOnReverse, py::arg("ids").noconvert());
     s.def("Prefetch", &PipelineStore::Prefetch, py::arg("ids").noconvert());
     s.def("ObserveRequest", &PipelineStore::ObserveRequest, py::arg("ids").noconvert());
+    s.def("ReplayRequest", &PipelineStore::ReplayRequest, py::arg("block_ids"),
+          py::arg("logical_time_ns"));
     s.def("Load", &PipelineStore::Load, py::arg("ids").noconvert(), py::arg("indexes").noconvert(),
           py::arg("addrs").noconvert());
     s.def("Dump",

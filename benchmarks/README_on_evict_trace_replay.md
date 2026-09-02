@@ -3,11 +3,14 @@
 `on_evict_trace_replay.py` 直接回放 `{timestamp, hash_ids}` JSONL，驱动真实的 C++
 `OnEvictCacheStore | FakeStore`。它不启动 vLLM，不执行模型推理，也不需要 GPU/NPU。
 
-## 1. 本机构建
+## 1. 安装
 
-在 UCM 仓库根目录执行：
+本工具不使用 `pip install`。这里的安装是先用 CMake 编译 C++，再把生成的 `.so`
+复制到当前仓库的 `ucm/` Python 包目录。首次安装时执行下面整段命令：
 
 ```bash
+cd /home/solidyang/workspace/G35/unified-cache-management
+
 sudo apt-get install -y cmake g++ python3-dev python3-wrapt
 
 cmake -S . -B /tmp/ucm-replay-build \
@@ -20,7 +23,23 @@ cmake --install /tmp/ucm-replay-build \
 ```
 
 安装步骤会把 `ucmpipelinestore`、`libonevictcachestore.so`、`libfakestore.so` 和
-metrics 库放到源码目录下对应的 `ucm/` 包中。已经完成过本机构建时可以跳过本节。
+metrics 库放到源码目录下对应的 `ucm/` 包中。已经完成过上述构建时，不需要重复执行
+CMake 命令。
+
+每次打开新终端后，需要设置动态库搜索路径：
+
+```bash
+cd /home/solidyang/workspace/G35/unified-cache-management
+export LD_LIBRARY_PATH="$PWD/ucm/shared/metrics${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
+
+缺少这一步会出现 `libmetrics.so: cannot open shared object file`。设置后可以检查安装结果：
+
+```bash
+python3 -c "from ucm.store.pipeline import ucmpipelinestore; from ucm.shared.metrics import ucmmetrics; print('UCM import OK')"
+```
+
+输出 `UCM import OK` 表示可以开始回放。
 
 `simu` 只选择 CPU 模拟设备运行时；本工具的 OnEvict、Radix Tree、Fake backend 和
 metrics 都运行真实 C++ 实现。
@@ -49,9 +68,12 @@ tokenize 或改变原 trace 的 block 粒度。
 
 ## 3. 运行
 
-从仓库根目录执行：
+从仓库根目录执行。如果当前终端尚未设置动态库路径，先执行这里的 `export`：
 
 ```bash
+cd /home/solidyang/workspace/G35/unified-cache-management
+export LD_LIBRARY_PATH="$PWD/ucm/shared/metrics${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
 python3 benchmarks/on_evict_trace_replay.py \
   --trace-path /path/to/trace.jsonl \
   --timestamp-unit ms \

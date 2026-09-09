@@ -23,6 +23,7 @@
  */
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include "template/task_wrapper.h"
 #include "thread/thread_pool.h"
@@ -35,6 +36,10 @@ struct TransferTask {
     Detail::TaskHandle id;
     std::function<Status(Trans::Stream&)> run;
     Status status;
+    const char* operation{"internal"};
+    size_t shards{0};
+    size_t bytes{0};
+    std::chrono::steady_clock::time_point submitted{std::chrono::steady_clock::now()};
 };
 
 // One worker preserves submission order; TaskWrapper owns completion and errors.
@@ -45,6 +50,10 @@ public:
         timeoutMs_ = timeoutMs;
         worker_.SetNWorker(1).SetWorkerFn([this, deviceId](TaskPair& pair, void* const&) {
             auto& [task, waiter] = pair;
+            const auto started = std::chrono::steady_clock::now();
+            UC_DEBUG("OnEvict task={} op={} start shards={} bytes={} queue_ms={:.3f}", task->id,
+                     task->operation, task->shards, task->bytes,
+                     std::chrono::duration<double, std::milli>(started - task->submitted).count());
             if (!stream_) {
                 Trans::Device device;
                 task->status = device.Setup(deviceId);
@@ -54,7 +63,17 @@ public:
                 }
             }
             if (task->status.Success()) { task->status = task->run(*stream_); }
-            if (task->status.Failure()) { failureSet_.Insert(task->id); }
+            if (task->status.Failure()) {
+                UC_ERROR("OnEvict task={} op={} failed device={} shards={} bytes={} status={}",
+                         task->id, task->operation, deviceId, task->shards, task->bytes,
+                         task->status);
+                failureSet_.Insert(task->id);
+            }
+            UC_DEBUG("OnEvict task={} op={} complete status={} run_ms={:.3f}", task->id,
+                     task->operation, task->status,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                               started)
+                         .count());
             waiter->Done();
         });
         worker_.SetWorkerExitFn([this](void*&) { stream_.reset(); });

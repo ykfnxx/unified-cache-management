@@ -32,6 +32,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "kv_block.h"
+#include "logger/logger.h"
 #include "metrics_api.h"
 #include "transfer_queue.h"
 #include "ucmstore_v1.h"
@@ -100,7 +101,13 @@ public:
             config.GetNumber("device_id", deviceId_);
             if (uniqueId_.empty()) { return Status::InvalidParam("unique_id is required"); }
             // Scheduler instances only query published shared-memory blocks.
-            if (deviceId_ < 0) { return Status::OK(); }
+            if (deviceId_ < 0) {
+                UC_INFO(
+                    "OnEvict setup role=scheduler unique_id={} policy={} fake_res_cap_gib={} "
+                    "idle_s={}",
+                    uniqueId_, policy_, capacityGb_, dumpMaxIdleSeconds_);
+                return Status::OK();
+            }
             config.GetNumber("shard_size", shardSize_);
             size_t tensorSize = 0;
             config.GetNumber("tensor_size", tensorSize);
@@ -126,6 +133,11 @@ public:
             if (status.Failure()) { return status; }
             transfers_ = std::move(transfers);
         }
+        UC_INFO(
+            "OnEvict setup real_kv={} device={} unique_id={} policy={} capacity_gib={} "
+            "capacity_blocks={} block_bytes={} shard_bytes={} idle_s={}",
+            realKV_, deviceId_, uniqueId_, policy_, capacityGb_, capacityBlocks_, blockSize_,
+            shardSize_, dumpMaxIdleSeconds_);
         return Status::OK();
     }
 
@@ -181,11 +193,12 @@ public:
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
     {
         if (!realKV_) { return NextId(); }
+        const auto shards = task.size();
         return transfers_->Submit({NextId(),
                                    [this, task = std::move(task)](Trans::Stream& stream) mutable {
                                        return LoadKV(task, stream);
                                    },
-                                   Status::OK()});
+                                   Status::OK(), "load", shards, shards * shardSize_});
     }
 
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override
@@ -242,11 +255,12 @@ private:
                                             Detail::RequestAwareDumpContext context,
                                             Clock::time_point now)
     {
+        const auto shards = task.size();
         return transfers_->Submit(
             {NextId(),
              [this, task = std::move(task), context = std::move(context),
               now](Trans::Stream& stream) mutable { return DumpKV(task, context, now, stream); },
-             Status::OK()});
+             Status::OK(), "dump", shards, shards * shardSize_});
     }
 
     Status LoadKV(Detail::TaskDesc& task, Trans::Stream& stream)
@@ -256,15 +270,24 @@ private:
         for (auto& shard : task) {
             auto block = std::make_unique<KVBlock>();
             status = block->Open(BlockName(shard.owner), blockSize_);
-            if (status.Failure()) { break; }
+            if (status.Failure()) {
+                UC_ERROR("OnEvict load open/register failed block={} shard={} status={}",
+                         BlockName(shard.owner), shard.index, status);
+                break;
+            }
             auto* host = block->Shard(shard.index, shardSize_);
             buffers.push_back(std::move(block));
             status = stream.HostToDeviceAsync(host, shard.addrs.data(), tensorSizes_);
-            if (status.Failure()) { break; }
+            if (status.Failure()) {
+                UC_ERROR("OnEvict H2D submit failed block={} shard={} status={}",
+                         BlockName(shard.owner), shard.index, status);
+                break;
+            }
         }
         // Mappings pin the payload until every submitted H2D has finished,
         // including when a later shard misses or a transfer submission fails.
         auto synced = stream.Synchronized();
+        if (synced.Failure()) { UC_ERROR("OnEvict H2D sync failed status={}", synced); }
         return status.Failure() ? status : synced;
     }
 
@@ -274,15 +297,24 @@ private:
         std::lock_guard<std::mutex> lock(mutex_);
         if (task.prerequisiteHandle != 0) {
             auto status = stream.WaitEvent(Trans::Event{task.prerequisiteHandle});
-            if (status.Failure()) { return status; }
+            if (status.Failure()) {
+                UC_ERROR("OnEvict dump prerequisite wait failed event={} status={}",
+                         task.prerequisiteHandle, status);
+                return status;
+            }
         }
         auto status = Status::OK();
+        size_t copiedShards = 0;
+        size_t publishedBlocks = 0;
         for (auto& shard : task) {
             auto& block = payloads_[shard.owner];
             if (!block) {
                 block = std::make_unique<KVBlock>();
                 status = block->Create(BlockName(shard.owner), blockSize_, blockSize_ / shardSize_);
                 if (status.Failure()) {
+                    UC_ERROR(
+                        "OnEvict dump allocate/register failed block={} block_bytes={} status={}",
+                        BlockName(shard.owner), blockSize_, status);
                     payloads_.erase(shard.owner);
                     break;
                 }
@@ -290,11 +322,19 @@ private:
             if (block->published || block->shardsReady[shard.index]) { continue; }
             status = stream.DeviceToHostAsync(shard.addrs.data(),
                                               block->Shard(shard.index, shardSize_), tensorSizes_);
-            if (status.Failure()) { break; }
+            if (status.Failure()) {
+                UC_ERROR("OnEvict D2H submit failed block={} shard={} status={}",
+                         BlockName(shard.owner), shard.index, status);
+                break;
+            }
+            ++copiedShards;
         }
         auto synced = stream.Synchronized();
         if (status.Failure()) { return status; }
-        if (synced.Failure()) { return synced; }
+        if (synced.Failure()) {
+            UC_ERROR("OnEvict D2H sync failed status={}", synced);
+            return synced;
+        }
         for (const auto& shard : task) {
             payloads_.at(shard.owner)->shardsReady[shard.index] = true;
             // Refresh the whole batch before admission can evict an older entry.
@@ -328,8 +368,20 @@ private:
             }
             if (status.Failure()) { return status; }
             status = block.Publish(BlockName(shard.owner));
-            if (status.Failure()) { return status; }
+            if (status.Failure()) {
+                UC_ERROR("OnEvict publish failed block={} status={}", BlockName(shard.owner),
+                         status);
+                return status;
+            }
+            ++publishedBlocks;
         }
+        UC_DEBUG(
+            "OnEvict dump shards={} copied_shards={} copied_payload_bytes={} published_blocks={} "
+            "resident_blocks={} capacity_blocks={} retained_payload_blocks={}",
+            task.size(), copiedShards,
+            copiedShards * std::accumulate(tensorSizes_.begin(), tensorSizes_.end(), size_t{0}),
+            publishedBlocks, policy_ == "lru" ? entries_.size() : residentBlocks_, capacityBlocks_,
+            payloads_.size());
         return Status::OK();
     }
 
@@ -350,7 +402,11 @@ private:
             const auto seq = ++accessSeq_;
             for (size_t i = 0; i < num; ++i) {
                 auto found = KVBlock::Exists(BlockName(blocks[i]));
-                if (!found) { return found.Error(); }
+                if (!found) {
+                    UC_ERROR("OnEvict lookup failed block={} status={}", BlockName(blocks[i]),
+                             found.Error());
+                    return found.Error();
+                }
                 founds.push_back(found.Value());
                 auto node = radixNodes_.find(blocks[i]);
                 if (node != radixNodes_.end() && node->second.resident) {
@@ -358,6 +414,10 @@ private:
                 }
                 auto entry = entries_.find(blocks[i]);
                 if (entry != entries_.end()) { TouchLru(entry, now); }
+            }
+            if (Logger::isEnabledFor(Logger::Level::DEBUG)) {
+                const auto hits = std::count(founds.begin(), founds.end(), uint8_t{1});
+                UC_DEBUG("OnEvict lookup blocks={} hits={} misses={}", num, hits, num - hits);
             }
             return founds;
         }
@@ -528,6 +588,11 @@ private:
 
     void RecordEviction(size_t blocks, size_t discarded)
     {
+        UC_DEBUG(
+            "OnEvict eviction policy={} evicted_blocks={} dumped_blocks={} dropped_blocks={} "
+            "resident_blocks={} capacity_blocks={}",
+            policy_, blocks, blocks - discarded, discarded,
+            policy_ == "lru" ? entries_.size() : residentBlocks_, capacityBlocks_);
         Metrics::UpdateStats(NAME_TO_METRIC_ID("on_evict_eviction_paths_total"), 1.0);
         Metrics::UpdateStats(NAME_TO_METRIC_ID("on_evict_evicted_blocks_total"),
                              static_cast<double>(blocks));
@@ -557,7 +622,13 @@ private:
     {
         auto leaf = leafLru_.begin();
         while (leaf != leafLru_.end() && protectedBlocks.count(leaf->second) != 0) { ++leaf; }
-        if (leaf == leafLru_.end()) { return Status::NoSpace(); }
+        if (leaf == leafLru_.end()) {
+            UC_ERROR(
+                "OnEvict NoSpace resident_blocks={} capacity_blocks={} leaves={} "
+                "protected_blocks={}",
+                residentBlocks_, capacityBlocks_, leafLru_.size(), protectedBlocks.size());
+            return Status::NoSpace();
+        }
 
         const auto startSeq = leaf->first;
         std::vector<BlockId> victims;

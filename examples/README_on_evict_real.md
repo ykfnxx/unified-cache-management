@@ -242,7 +242,48 @@ curl -s http://127.0.0.1:8000/metrics | rg 'on_evict_|ucm.*(load|save|lookup)'
 等 CacheStore 专属指标判断本后端的传输。自定义 `metrics_config_path` 会替换指标启用列表，
 需要包含上表中的指标；不配置该路径时使用内置集合。
 
-## 6. 停止服务与常见问题
+## 6. 查看 DEBUG 日志
+
+重新编译安装本分支的 C++ 动态库后，在**启动服务之前**设置：
+
+```bash
+export UCM_LOG_LEVEL=debug
+export UCM_LOG_PATH="$PWD/log-on-evict"
+export UCM_LOG_TO_FILE=true
+
+# 排查时需要看到每个任务，可临时关闭按日志位置的限流。
+export UCM_LOG_RATE_LIMIT_ENABLE=false
+```
+
+然后用第 4 节命令启动服务；不要再次执行其中的 `export UCM_LOG_LEVEL=info`。
+这些变量需要传入实际启动 Worker 的容器/进程。日志级别在 logger 初始化时读取，
+修改另一个终端的变量不会改变已经运行的服务。Release 构建也可以输出 DEBUG 日志。
+
+日志同时输出到控制台和 `$UCM_LOG_PATH/ucm-<pid>.log`。只显示 OnEvict 日志可使用：
+
+```bash
+tail -F "$UCM_LOG_PATH"/ucm-*.log | rg --line-buffered 'OnEvict'
+```
+
+| 级别 | 内容 |
+| --- | --- |
+| INFO | 初始化角色/设备、模式、命名空间、策略、GiB 容量、block 上限和 idle 阈值 |
+| DEBUG | Lookup 命中/未命中数；任务 ID、load/dump、shard 数、逻辑字节数、排队/执行耗时 |
+| DEBUG | Dump 实际复制 shard/有效 payload 字节数、新发布 block 数、驻留量和保留 payload 数 |
+| DEBUG | 每次 eviction 的淘汰、dump、drop 数量，以及淘汰后的驻留量 |
+| ERROR | 任务失败、共享内存分配/注册、设备拷贝、事件等待、发布失败及 NoSpace 状态 |
+
+`task=... op=dump/load start` 与 `complete` 用于关联同一个任务。任务日志的 `bytes`
+按 `shards × shard_size` 计算，可能包含对齐空间或已保存的 shard；
+`copied_payload_bytes` 才是本次 Dump 提交复制的有效 tensor 字节数。
+`retained_payload_blocks` 包括 Resident、Dumped 和未完成的 block。
+
+UCM 默认会对同一日志位置限流（10 秒内最多 3 条），因此只设置 DEBUG 不一定能看到
+每次操作。`UCM_LOG_RATE_LIMIT_ENABLE=false` 可关闭该限流，但高流量下异步日志队列
+仍可能丢弃旧消息，日志不能作为精确计数来源。恢复常规部署时可设置
+`UCM_LOG_LEVEL=info`、`UCM_LOG_RATE_LIMIT_ENABLE=true`，精确累计量看 metrics。
+
+## 7. 停止服务与常见问题
 
 正常停止 Worker 会等待已提交传输并释放它持有的共享内存。异常退出可能留下
 `/dev/shm/uc_on_evict_<unique_id>_*` 对象。清理前先停止对应实例，并根据该实例日志中的

@@ -1,3 +1,9 @@
+# 使用方法、安装和部署命令见 README_on_evict_real.md。
+# 在仓库根目录通过 UCM_CONFIG_FILE 指定此文件。
+use_lite: false
+use_layerwise: true
+enable_metrics: true
+
 ucm_connectors:
   - ucm_connector_name: "UcmPipelineStore"
     ucm_connector_config:

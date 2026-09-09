@@ -21,15 +21,19 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <list>
 #include <mutex>
+#include <numeric>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include "kv_block.h"
 #include "metrics_api.h"
+#include "transfer_queue.h"
 #include "ucmstore_v1.h"
 
 namespace UC::OnEvictCacheStore {
@@ -58,32 +62,77 @@ class OnEvictCacheStore final : public StoreV1 {
     using LeafKey = std::pair<uint64_t, BlockId>;
 
 public:
+    ~OnEvictCacheStore() override
+    {
+        if (transfers_) {
+            // Unregister host memory on the transfer thread's device context,
+            // after all previously submitted transfers have completed.
+            auto cleanup = transfers_->Submit({NextId(),
+                                               [this](Trans::Stream&) {
+                                                   payloads_.clear();
+                                                   return Status::OK();
+                                               },
+                                               Status::OK()});
+            if (cleanup) { transfers_->Wait(cleanup.Value()); }
+            transfers_.reset();
+        }
+    }
+
     Status Setup(const Detail::Dictionary& config) override
     {
         config.Get("store_backend", backend_);
         config.GetNumber("block_size", blockSize_);
-        config.GetNumber("on_evict_cache_capacity_gb", capacityGb_);
+        realKV_ = config.Contains("fake_res_cap");
+        config.GetNumber(realKV_ ? "fake_res_cap" : "on_evict_cache_capacity_gb", capacityGb_);
+        if (realKV_) { policy_ = "radix_lru"; }
         config.Get("on_evict_cache_policy", policy_);
         config.GetNumber("on_evict_cache_dump_max_idle_s", dumpMaxIdleSeconds_);
 
-        if (backend_ == nullptr) { return Status::InvalidParam("invalid store backend"); }
-        if (blockSize_ == 0) { return Status::InvalidParam("invalid block size"); }
+        if (!realKV_ && backend_ == nullptr) {
+            return Status::InvalidParam("invalid store backend");
+        }
         if (capacityGb_ == 0) { return Status::InvalidParam("invalid cache capacity"); }
         if (policy_ != "lru" && policy_ != "radix_lru") {
             return Status::InvalidParam("unsupported eviction policy");
         }
+        if (realKV_) {
+            config.Get("unique_id", uniqueId_);
+            config.GetNumber("device_id", deviceId_);
+            if (uniqueId_.empty()) { return Status::InvalidParam("unique_id is required"); }
+            // Scheduler instances only query published shared-memory blocks.
+            if (deviceId_ < 0) { return Status::OK(); }
+            config.GetNumber("shard_size", shardSize_);
+            size_t tensorSize = 0;
+            config.GetNumber("tensor_size", tensorSize);
+            if (tensorSize != 0 && shardSize_ != 0) {
+                tensorSizes_.assign(shardSize_ / tensorSize, tensorSize);
+            } else {
+                config.GetNumbers("tensor_size_list", tensorSizes_);
+            }
+            if (shardSize_ == 0 || blockSize_ % shardSize_ != 0 || tensorSizes_.empty() ||
+                std::accumulate(tensorSizes_.begin(), tensorSizes_.end(), size_t{0}) > shardSize_) {
+                return Status::InvalidParam("invalid KV block/shard/tensor sizes");
+            }
+        }
+        if (blockSize_ == 0) { return Status::InvalidParam("invalid block size"); }
 
         capacityBlocks_ = (capacityGb_ << 30) / blockSize_;
         if (capacityBlocks_ == 0) { return Status::InvalidParam("cache capacity is too small"); }
+        if (realKV_) {
+            size_t timeoutMs = 30000;
+            config.GetNumber("timeout_ms", timeoutMs);
+            auto transfers = std::make_unique<TransferQueue>();
+            auto status = transfers->Setup(deviceId_, timeoutMs);
+            if (status.Failure()) { return status; }
+            transfers_ = std::move(transfers);
+        }
         return Status::OK();
     }
 
     std::string Readme() const override { return "OnEvictCacheStore"; }
 
     Expected<std::vector<uint8_t>> Lookup(const BlockId* blocks, size_t num) override
-    {
-        return LookupAt(blocks, num, Clock::now());
-    }
+    { return LookupAt(blocks, num, Clock::now()); }
 
     Expected<ssize_t> LookupOnPrefix(const BlockId* blocks, size_t num) override
     {
@@ -129,14 +178,23 @@ public:
         return Status::OK();
     }
 
-    Expected<Detail::TaskHandle> Load(Detail::TaskDesc) override { return NextId(); }
+    Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
+    {
+        if (!realKV_) { return NextId(); }
+        return transfers_->Submit({NextId(),
+                                   [this, task = std::move(task)](Trans::Stream& stream) mutable {
+                                       return LoadKV(task, stream);
+                                   },
+                                   Status::OK()});
+    }
 
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override
     {
-        std::lock_guard<std::mutex> lock(mutex_);
         if (policy_ == "radix_lru") {
             return Status::InvalidParam("radix_lru requires request context");
         }
+        if (realKV_) { return SubmitDump(std::move(task), {}, Clock::now()); }
+        std::lock_guard<std::mutex> lock(mutex_);
         auto status = DumpLru(task, Clock::now());
         if (status.Failure()) { return status; }
         return NextId();
@@ -145,6 +203,7 @@ public:
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task,
                                       const Detail::RequestAwareDumpContext& context) override
     {
+        if (realKV_) { return SubmitDump(std::move(task), context, Clock::now()); }
         std::lock_guard<std::mutex> lock(mutex_);
         return DumpWithContext(task, context, Clock::now());
     }
@@ -153,15 +212,127 @@ public:
                                       const Detail::RequestAwareDumpContext& context,
                                       uint64_t logicalTimeNs) override
     {
+        if (realKV_) { return SubmitDump(std::move(task), context, LogicalTime(logicalTimeNs)); }
         std::lock_guard<std::mutex> lock(mutex_);
         return DumpWithContext(task, context, LogicalTime(logicalTimeNs));
     }
 
-    Expected<bool> Check(Detail::TaskHandle) override { return true; }
+    Expected<bool> Check(Detail::TaskHandle task) override
+    { return realKV_ ? transfers_->Check(task) : Expected<bool>{true}; }
 
-    Status Wait(Detail::TaskHandle) override { return Status::OK(); }
+    Status Wait(Detail::TaskHandle task) override
+    { return realKV_ ? transfers_->Wait(task) : Status::OK(); }
 
 private:
+    friend class OnEvictCacheStoreTestPeer;
+
+    std::string BlockName(const BlockId& block) const
+    {
+        static constexpr char hex[] = "0123456789abcdef";
+        std::string name = "/uc_on_evict_" + uniqueId_ + "_";
+        for (auto byte : block) {
+            auto value = std::to_integer<unsigned>(byte);
+            name += hex[value >> 4];
+            name += hex[value & 15];
+        }
+        return name;
+    }
+
+    Expected<Detail::TaskHandle> SubmitDump(Detail::TaskDesc task,
+                                            Detail::RequestAwareDumpContext context,
+                                            Clock::time_point now)
+    {
+        return transfers_->Submit(
+            {NextId(),
+             [this, task = std::move(task), context = std::move(context),
+              now](Trans::Stream& stream) mutable { return DumpKV(task, context, now, stream); },
+             Status::OK()});
+    }
+
+    Status LoadKV(Detail::TaskDesc& task, Trans::Stream& stream)
+    {
+        std::vector<std::unique_ptr<KVBlock>> buffers;
+        auto status = Status::OK();
+        for (auto& shard : task) {
+            auto block = std::make_unique<KVBlock>();
+            status = block->Open(BlockName(shard.owner), blockSize_);
+            if (status.Failure()) { break; }
+            auto* host = block->Shard(shard.index, shardSize_);
+            buffers.push_back(std::move(block));
+            status = stream.HostToDeviceAsync(host, shard.addrs.data(), tensorSizes_);
+            if (status.Failure()) { break; }
+        }
+        // Mappings pin the payload until every submitted H2D has finished,
+        // including when a later shard misses or a transfer submission fails.
+        auto synced = stream.Synchronized();
+        return status.Failure() ? status : synced;
+    }
+
+    Status DumpKV(Detail::TaskDesc& task, const Detail::RequestAwareDumpContext& context,
+                  Clock::time_point now, Trans::Stream& stream)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (task.prerequisiteHandle != 0) {
+            auto status = stream.WaitEvent(Trans::Event{task.prerequisiteHandle});
+            if (status.Failure()) { return status; }
+        }
+        auto status = Status::OK();
+        for (auto& shard : task) {
+            auto& block = payloads_[shard.owner];
+            if (!block) {
+                block = std::make_unique<KVBlock>();
+                status = block->Create(BlockName(shard.owner), blockSize_, blockSize_ / shardSize_);
+                if (status.Failure()) {
+                    payloads_.erase(shard.owner);
+                    break;
+                }
+            }
+            if (block->published || block->shardsReady[shard.index]) { continue; }
+            status = stream.DeviceToHostAsync(shard.addrs.data(),
+                                              block->Shard(shard.index, shardSize_), tensorSizes_);
+            if (status.Failure()) { break; }
+        }
+        auto synced = stream.Synchronized();
+        if (status.Failure()) { return status; }
+        if (synced.Failure()) { return synced; }
+        for (const auto& shard : task) {
+            payloads_.at(shard.owner)->shardsReady[shard.index] = true;
+            // Refresh the whole batch before admission can evict an older entry.
+            auto resident = entries_.find(shard.owner);
+            if (resident != entries_.end()) { TouchLru(resident, now); }
+        }
+
+        ProtectedBlocks protectedBlocks;
+        for (const auto& request : context) {
+            protectedBlocks.insert(request.requestBlocks.begin(), request.requestBlocks.end());
+            ObserveRequestLocked(request.requestBlocks.data(), request.requestBlocks.size(), now);
+        }
+        for (const auto& shard : task) {
+            auto& block = *payloads_.at(shard.owner);
+            if (block.published) {
+                auto resident = entries_.find(shard.owner);
+                if (resident != entries_.end()) { TouchLru(resident, now); }
+                continue;  // Includes Dumped: do not promote it.
+            }
+            if (!std::all_of(block.shardsReady.begin(), block.shardsReady.end(),
+                             [](bool ready) { return ready; })) {
+                continue;
+            }
+            if (policy_ == "radix_lru") {
+                status = AdmitRadix(shard.owner, protectedBlocks, now);
+            } else {
+                Detail::TaskDesc admission{
+                    Detail::Shard{shard.owner, 0, {}}
+                };
+                status = DumpLru(admission, now);
+            }
+            if (status.Failure()) { return status; }
+            status = block.Publish(BlockName(shard.owner));
+            if (status.Failure()) { return status; }
+        }
+        return Status::OK();
+    }
+
     using EntryIterator = std::unordered_map<BlockId, LruEntry, Detail::BlockIdHasher>::iterator;
 
     static Clock::time_point LogicalTime(uint64_t logicalTimeNs)
@@ -174,6 +345,22 @@ private:
                                             Clock::time_point now)
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (realKV_) {
+            std::vector<uint8_t> founds;
+            const auto seq = ++accessSeq_;
+            for (size_t i = 0; i < num; ++i) {
+                auto found = KVBlock::Exists(BlockName(blocks[i]));
+                if (!found) { return found.Error(); }
+                founds.push_back(found.Value());
+                auto node = radixNodes_.find(blocks[i]);
+                if (node != radixNodes_.end() && node->second.resident) {
+                    TouchRadix(node->second, seq, now);
+                }
+                auto entry = entries_.find(blocks[i]);
+                if (entry != entries_.end()) { TouchLru(entry, now); }
+            }
+            return founds;
+        }
         std::vector<uint8_t> founds(num, false);
         std::vector<BlockId> backendBlocks;
         std::vector<size_t> backendIndexes;
@@ -207,9 +394,9 @@ private:
         return founds;
     }
 
-    Expected<Detail::TaskHandle> DumpWithContext(
-        const Detail::TaskDesc& task, const Detail::RequestAwareDumpContext& context,
-        Clock::time_point now)
+    Expected<Detail::TaskHandle> DumpWithContext(const Detail::TaskDesc& task,
+                                                 const Detail::RequestAwareDumpContext& context,
+                                                 Clock::time_point now)
     {
         if (policy_ == "lru") {
             auto status = DumpLru(task, now);
@@ -324,6 +511,12 @@ private:
 
     Status DumpToBackend(const BlockId& block)
     {
+        if (realKV_) {
+            Metrics::UpdateStats(NAME_TO_METRIC_ID("on_evict_backend_write_requests_total"), 1.0);
+            Metrics::UpdateStats(NAME_TO_METRIC_ID("on_evict_backend_write_bytes_total"),
+                                 static_cast<double>(blockSize_));
+            return Status::OK();
+        }
         Detail::TaskDesc backendTask{
             Detail::Shard{block, 0, {}}
         };
@@ -353,6 +546,7 @@ private:
             auto status = DumpToBackend(victim);
             if (status.Failure()) { return status; }
         }
+        if (realKV_ && discarded) { payloads_.erase(victim); }
         entries_.erase(it);
         lru_.pop_back();
         RecordEviction(1, discarded ? 1 : 0);
@@ -395,6 +589,7 @@ private:
             auto& node = radixNodes_.find(victim)->second;
             leafLru_.erase(LeafKey{node.lastAccessSeq, node.block});
             node.resident = false;
+            if (realKV_ && Expired(node.lastAccessTime, now)) { payloads_.erase(victim); }
             --residentBlocks_;
             if (node.hasParent) { --radixNodes_.find(node.parent)->second.residentChildCount; }
         }
@@ -416,6 +611,13 @@ private:
         return id.fetch_add(1, std::memory_order_relaxed);
     }
 
+    bool realKV_{false};
+    int32_t deviceId_{-1};
+    size_t shardSize_{0};
+    std::vector<size_t> tensorSizes_;
+    std::string uniqueId_;
+    std::unordered_map<BlockId, std::unique_ptr<KVBlock>, Detail::BlockIdHasher> payloads_;
+    std::unique_ptr<TransferQueue> transfers_;
     StoreV1* backend_{nullptr};
     size_t blockSize_{0};
     size_t capacityGb_{0};

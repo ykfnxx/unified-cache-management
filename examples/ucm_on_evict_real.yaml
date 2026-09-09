@@ -1,0 +1,7 @@
+ucm_connectors:
+  - ucm_connector_name: "UcmPipelineStore"
+    ucm_connector_config:
+      store_pipeline: "OnEvictCache"
+      fake_res_cap: 64  # GiB; only Resident blocks count towards this limit.
+      on_evict_cache_policy: "radix_lru"
+      on_evict_cache_dump_max_idle_s: 3600  # 0 disables idle-time discard.

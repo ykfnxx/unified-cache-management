@@ -8,6 +8,10 @@ if(BUILD_UNIT_TESTS)
         list(FILTER UCMSTORE_TEST_SOURCE_FILES EXCLUDE REGEX ".*/yuanrong/.*\\.cc$")
     endif()
     add_executable(ucmstore.test ${UCMSTORE_TEST_SOURCE_FILES})
+    if(RUNTIME_ENVIRONMENT STREQUAL "simu")
+        set_source_files_properties(case/on_evict_cache/on_evict_cache_store_test.cc
+            PROPERTIES COMPILE_DEFINITIONS UCM_TEST_SIMU)
+    endif()
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "12" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "13")
         set_source_files_properties(case/dram/kv_protocol_test.cc
             PROPERTIES COMPILE_OPTIONS "-Wno-nonnull")

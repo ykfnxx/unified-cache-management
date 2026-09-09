@@ -313,6 +313,18 @@ def _cache_fake_pipeline_builder(
     pipeline.Stack("Cache", str(store_dir / "cache/libcachestore.so"), config)
 
 
+def _on_evict_cache_pipeline_builder(
+    config: Dict[str, object], pipeline: ucmpipelinestore.PipelineStore
+):
+    store_dir = Path(__file__).resolve().parent.parent
+    _preload_metrics(store_dir)
+    pipeline.Stack(
+        "OnEvictCache",
+        str(store_dir / "on_evict_cache/libonevictcachestore.so"),
+        config,
+    )
+
+
 def _on_evict_cache_fake_pipeline_builder(
     config: Dict[str, object], pipeline: ucmpipelinestore.PipelineStore
 ):
@@ -443,3 +455,5 @@ UcmPipelineStoreBuilder.register("Delegator", _delegator_pipeline_builder)
 UcmPipelineStoreBuilder.register("YuanRong", _yuanrong_pipeline_builder)
 UcmPipelineStoreBuilder.register("YuanRong|Posix", _yuanrong_posix_pipeline_builder)
 UcmPipelineStoreBuilder.register("Dram", _dram_pipeline_builder)
+
+UcmPipelineStoreBuilder.register("OnEvictCache", _on_evict_cache_pipeline_builder)

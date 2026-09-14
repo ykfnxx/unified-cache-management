@@ -228,10 +228,10 @@ TEST(UCOnEvictCacheStoreTest, LogicalLookupRefreshesVictimAccessTime)
 namespace UC::OnEvictCacheStore {
 class OnEvictCacheStoreTestPeer {
 public:
-    static Status DumpWithStream(OnEvictCacheStore& store, Detail::TaskDesc task,
-                                 const Detail::RequestAwareDumpContext& context,
-                                 Trans::Stream& stream)
-    { return store.DumpKV(task, context, OnEvictCacheStore::Clock::time_point{}, stream); }
+    static Status DumpWithStreams(OnEvictCacheStore& store, Detail::TaskDesc task,
+                                  const Detail::RequestAwareDumpContext& context,
+                                  TransferStreams& streams)
+    { return store.DumpKV(task, context, OnEvictCacheStore::Clock::time_point{}, streams); }
     // Exercise eviction with small real payloads instead of allocating GiBs.
     static void SetCapacity(OnEvictCacheStore& store, size_t blocks)
     { store.capacityBlocks_ = blocks; }
@@ -485,11 +485,11 @@ TEST_F(OnEvictRealTest, LruAlsoStoresAndDropsRealKV)
 TEST(OnEvictTransferTest, CheckWaitAndFailureFollowActualTaskCompletion)
 {
     UC::OnEvictCacheStore::TransferQueue queue;
-    ASSERT_TRUE(queue.Setup(0, 30000).Success());
+    ASSERT_TRUE(queue.Setup(0, 30000, 1).Success());
     std::promise<void> entered, release;
     auto released = release.get_future();
     auto task = queue.Submit({1,
-                              [&](UC::Trans::Stream&) {
+                              [&](UC::OnEvictCacheStore::TransferStreams&) {
                                   entered.set_value();
                                   released.wait();
                                   return UC::Status::NoSpace();
@@ -524,26 +524,29 @@ public:
 
 TEST_F(OnEvictRealTest, PrerequisiteAndCopyFailureDoNotPublishKV)
 {
-    FailingStream stream;
-    ASSERT_TRUE(stream.Setup().Success());
+    auto stream = std::make_unique<FailingStream>();
+    ASSERT_TRUE(stream->Setup().Success());
+    auto* streamPtr = stream.get();
+    UC::OnEvictCacheStore::TransferStreams streams;
+    streams.push_back(std::move(stream));
     auto a = Id("a");
     UC::Detail::TaskDesc task{
         {a, 0, {first.data()} },
         {a, 1, {second.data()}}
     };
     task.prerequisiteHandle = 123;
-    stream.failWait = true;
-    EXPECT_TRUE(Peer::DumpWithStream(store, task, Context({a}, {a}), stream).Failure());
-    EXPECT_EQ(stream.waitedEvent, uintptr_t{123});
+    streamPtr->failWait = true;
+    EXPECT_TRUE(Peer::DumpWithStreams(store, task, Context({a}, {a}), streams).Failure());
+    EXPECT_EQ(streamPtr->waitedEvent, uintptr_t{123});
     EXPECT_FALSE(store.Lookup(&a, 1).Value()[0]);
-    stream.failWait = false;
-    stream.failSync = true;
-    EXPECT_TRUE(Peer::DumpWithStream(store, task, Context({a}, {a}), stream).Failure());
+    streamPtr->failWait = false;
+    streamPtr->failSync = true;
+    EXPECT_TRUE(Peer::DumpWithStreams(store, task, Context({a}, {a}), streams).Failure());
     EXPECT_FALSE(store.Lookup(&a, 1).Value()[0]);
     // Retry must copy again after a failed synchronization.
     first.fill(42);
-    stream.failSync = false;
-    ASSERT_TRUE(Peer::DumpWithStream(store, task, Context({a}, {a}), stream).Success());
+    streamPtr->failSync = false;
+    ASSERT_TRUE(Peer::DumpWithStreams(store, task, Context({a}, {a}), streams).Success());
     ExpectData(store, a, first, second);
 }
 }  // namespace

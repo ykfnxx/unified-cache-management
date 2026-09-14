@@ -25,6 +25,7 @@
 
 #include <chrono>
 #include <functional>
+#include "metrics_api.h"
 #include "template/task_wrapper.h"
 #include "thread/thread_pool.h"
 #include "trans/device.h"
@@ -32,9 +33,11 @@
 
 namespace UC::OnEvictCacheStore {
 
+using TransferStreams = std::vector<std::unique_ptr<Trans::Stream>>;
+
 struct TransferTask {
     Detail::TaskHandle id;
-    std::function<Status(Trans::Stream&)> run;
+    std::function<Status(TransferStreams&)> run;
     Status status;
     const char* operation{"internal"};
     size_t shards{0};
@@ -43,40 +46,50 @@ struct TransferTask {
 };
 
 // One worker preserves submission order; TaskWrapper owns completion and errors.
-class TransferQueue : public Detail::TaskWrapper<TransferTask, Detail::TaskHandle> {
+class TransferQueue final : public Detail::TaskWrapper<TransferTask, Detail::TaskHandle> {
 public:
-    Status Setup(int32_t deviceId, size_t timeoutMs)
+    Status Setup(int32_t deviceId, size_t timeoutMs, size_t streamCount)
     {
         timeoutMs_ = timeoutMs;
-        worker_.SetNWorker(1).SetWorkerFn([this, deviceId](TaskPair& pair, void* const&) {
-            auto& [task, waiter] = pair;
-            const auto started = std::chrono::steady_clock::now();
-            UC_DEBUG("OnEvict task={} op={} start shards={} bytes={} queue_ms={:.3f}", task->id,
-                     task->operation, task->shards, task->bytes,
-                     std::chrono::duration<double, std::milli>(started - task->submitted).count());
-            if (!stream_) {
-                Trans::Device device;
-                task->status = device.Setup(deviceId);
-                if (task->status.Success()) { stream_ = device.MakeStream(); }
-                if (task->status.Success() && !stream_) {
-                    task->status = Status::Error("create stream failed");
+        worker_.SetNWorker(1).SetWorkerFn(
+            [this, deviceId, streamCount](TaskPair& pair, void* const&) {
+                auto& [task, waiter] = pair;
+                const auto started = std::chrono::steady_clock::now();
+                const auto queueMs =
+                    std::chrono::duration<double, std::milli>(started - task->submitted).count();
+                Metrics::UpdateStats(
+                    NAME_TO_METRIC_ID("on_evict_transfer_queue_wait_duration_ms"), queueMs);
+                UC_DEBUG("OnEvict task={} op={} start shards={} bytes={} queue_ms={:.3f}",
+                         task->id, task->operation, task->shards, task->bytes, queueMs);
+                if (streams_.empty()) {
+                    Trans::Device device;
+                    task->status = device.Setup(deviceId);
+                    for (size_t i = 0; task->status.Success() && i < streamCount; ++i) {
+                        auto stream = device.MakeStream();
+                        if (!stream) {
+                            task->status = Status::Error("create stream failed");
+                            break;
+                        }
+                        streams_.push_back(std::move(stream));
+                    }
                 }
-            }
-            if (task->status.Success()) { task->status = task->run(*stream_); }
-            if (task->status.Failure()) {
-                UC_ERROR("OnEvict task={} op={} failed device={} shards={} bytes={} status={}",
-                         task->id, task->operation, deviceId, task->shards, task->bytes,
-                         task->status);
-                failureSet_.Insert(task->id);
-            }
-            UC_DEBUG("OnEvict task={} op={} complete status={} run_ms={:.3f}", task->id,
-                     task->operation, task->status,
-                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                               started)
-                         .count());
-            waiter->Done();
-        });
-        worker_.SetWorkerExitFn([this](void*&) { stream_.reset(); });
+                if (task->status.Success()) { task->status = task->run(streams_); }
+                if (task->status.Failure()) {
+                    UC_ERROR(
+                        "OnEvict task={} op={} failed device={} shards={} bytes={} status={}",
+                        task->id, task->operation, deviceId, task->shards, task->bytes,
+                        task->status);
+                    failureSet_.Insert(task->id);
+                }
+                UC_DEBUG(
+                    "OnEvict task={} op={} complete status={} run_ms={:.3f}", task->id,
+                    task->operation, task->status,
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - started)
+                        .count());
+                waiter->Done();
+            });
+        worker_.SetWorkerExitFn([this](void*&) { streams_.clear(); });
         return worker_.Run() ? Status::OK() : Status::Error("start KV transfer worker failed");
     }
     ~TransferQueue()
@@ -92,7 +105,7 @@ private:
     }
     Status FailureStatus(const TaskPtr& task) const override { return task->status; }
 
-    std::unique_ptr<Trans::Stream> stream_;
+    TransferStreams streams_;
     ThreadPool<TaskPair> worker_;
 };
 

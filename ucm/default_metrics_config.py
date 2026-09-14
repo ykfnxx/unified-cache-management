@@ -504,6 +504,56 @@ _HISTOGRAM_METRICS = [
         [0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
     ),
     (
+        "on_evict_dump_total_duration_ms",
+        "End-to-end real-KV OnEvictCache DumpKV execution time (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000],
+    ),
+    (
+        "on_evict_dump_allocate_duration_ms",
+        "OnEvictCache shared-memory create, allocate, mmap, and registration time (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "on_evict_dump_d2h_duration_ms",
+        "OnEvictCache device-to-host submission and synchronization time (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000],
+    ),
+    (
+        "on_evict_dump_metadata_duration_ms",
+        "OnEvictCache request observation and admission time (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50],
+    ),
+    (
+        "on_evict_dump_publish_duration_ms",
+        "OnEvictCache shared-memory publication time (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100],
+    ),
+    (
+        "on_evict_dump_mutex_held_duration_ms",
+        "Time DumpKV holds the store-wide metadata mutex (ms)",
+        [0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50],
+    ),
+    (
+        "on_evict_transfer_queue_wait_duration_ms",
+        "Time an OnEvictCache real-KV transfer task waits before worker pickup (ms)",
+        [0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "on_evict_load_total_duration_ms",
+        "End-to-end real-KV OnEvictCache LoadKV execution time (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000],
+    ),
+    (
+        "on_evict_load_open_duration_ms",
+        "OnEvictCache shared-memory open, mmap, and registration time during LoadKV (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "on_evict_load_h2d_duration_ms",
+        "OnEvictCache host-to-device submission and synchronization time (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000],
+    ),
+    (
         "cache_load_duration_ms",
         "End-to-end Cache stage load task duration (ms)",
         [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],

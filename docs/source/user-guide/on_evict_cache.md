@@ -12,6 +12,10 @@ ucm_connectors:
       fake_res_cap: 64
       on_evict_cache_policy: "radix_lru"
       on_evict_cache_dump_max_idle_s: 3600
+      on_evict_cache_file_workers: 4
+      on_evict_cache_transfer_streams: 4
+      on_evict_cache_parallel_d2h_min_bytes: 1048576
+      on_evict_cache_parallel_h2d_min_bytes: 1048576
 ```
 
 `fake_res_cap` is a positive integer in GiB, matching UCM's existing capacity
@@ -50,10 +54,24 @@ shared-memory object. Scheduler instances query published names; local workers
 can open the same payload for Load. This is local-host storage, not a cross-host
 P/D service. The normal connector rank/hash ownership rules still apply.
 
-Transfers run in submission order on one UCM stream. `Check` reports actual task
-completion and `Wait` returns transfer/admission errors. A protected request
-that cannot fit returns `NoSpace`. Its unpublished payload is not a hit; earlier
-successful admissions in a batch are not rolled back.
+Transfer tasks still run in submission order. Within one Dump, shared-memory
+creation and publication use `on_evict_cache_file_workers` workers (default 4).
+D2H uses up to `on_evict_cache_transfer_streams` independent streams (default
+4) when the task payload reaches `on_evict_cache_parallel_d2h_min_bytes`
+(default 1 MiB). H2D Load uses the same stream pool and is enabled at
+`on_evict_cache_parallel_h2d_min_bytes` (default 1 MiB). Smaller tasks stay on
+one stream. All streams finish before the task is published and completed. Set
+either worker/stream count to 1 to recover the serial path for comparison or
+hardware-specific tuning.
+
+Cross-instance Load opens distinct shared-memory blocks through the file worker
+pool. Each block is mapped once per task even when several requested shards
+belong to that block.
+
+`Check` reports actual task completion and `Wait` returns transfer/admission
+errors. A protected request that cannot fit returns `NoSpace`. Its unpublished
+payload is not a hit; earlier successful admissions in a batch are not rolled
+back.
 
 Normal writer destruction drains outstanding transfers and unlinks its own
 shared-memory objects. An abrupt process exit can leave objects behind; their

@@ -109,6 +109,16 @@ No Cache Store-specific Gauges are exported by default.
 | `ucm:on_evict_evicted_blocks_total`         | Resident blocks removed by eviction                               |
 | `ucm:on_evict_discarded_blocks_total`       | Expired blocks discarded without a backend write                   |
 | `ucm:on_evict_discarded_bytes_total`        | Bytes represented by expired blocks discarded without a write     |
+| `ucm:on_evict_dump_total_duration_ms`       | End-to-end real-KV DumpKV execution time                           |
+| `ucm:on_evict_dump_allocate_duration_ms`    | Shared-memory creation, allocation, mapping, and registration time |
+| `ucm:on_evict_dump_d2h_duration_ms`         | D2H submission and synchronization time                            |
+| `ucm:on_evict_dump_metadata_duration_ms`    | Request observation and cache-admission time                       |
+| `ucm:on_evict_dump_publish_duration_ms`     | Shared-memory publication time                                     |
+| `ucm:on_evict_dump_mutex_held_duration_ms`  | Time DumpKV holds the store-wide metadata mutex                    |
+| `ucm:on_evict_transfer_queue_wait_duration_ms` | Time a real-KV transfer task waits for worker pickup             |
+| `ucm:on_evict_load_total_duration_ms`       | End-to-end real-KV LoadKV execution time                           |
+| `ucm:on_evict_load_open_duration_ms`        | Shared-memory open, mapping, and registration time during LoadKV   |
+| `ucm:on_evict_load_h2d_duration_ms`         | H2D submission and synchronization time                            |
 
 View the cumulative values at the vLLM `/metrics` endpoint. Use `rate(ucm:on_evict_backend_write_requests_total[5m])` for requests per second and `rate(ucm:on_evict_backend_write_bytes_total[5m])` for bytes per second.
 

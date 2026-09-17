@@ -177,6 +177,20 @@ public:
             entry_ = healthBreakerStores_.back().get();
         }
     }
+    void ObserveRequest(const std::string& requestId, uint64_t observation, uint64_t timestamp,
+                        const py::buffer& ids)
+    {
+        auto info = ids.request();
+        if (info.ndim != 1 || info.itemsize != 1 || info.strides[0] != 1 ||
+            info.size % sizeof(Detail::BlockId)) {
+            throw std::invalid_argument("context ids must be contiguous bytes of complete BlockIds");
+        }
+        BufferArrayView<Detail::BlockId> keys(ids);
+        std::vector<Detail::BlockId> blocks(keys.data, keys.data + keys.num);
+        py::gil_scoped_release release;
+        ThrowIfFailed(StoreBack()->ObserveRequest(requestId, observation, timestamp, blocks));
+    }
+    std::map<std::string, uint64_t> ContextStats() { return StoreBack()->ContextStats(); }
     uintptr_t Self() const { return (uintptr_t)(void*)StoreBack(); }
     pybind11::bytes Lookup(const pybind11::buffer& ids)
     {
@@ -264,6 +278,8 @@ PYBIND11_MODULE(ucmpipelinestore, m)
     s.def(py::init<>());
     s.def("Stack", &PipelineStore::Stack);
     s.def("Self", &PipelineStore::Self);
+    s.def("ObserveRequest", &PipelineStore::ObserveRequest);
+    s.def("ContextStats", &PipelineStore::ContextStats);
     s.def("Lookup", &PipelineStore::Lookup, py::arg("ids").noconvert());
     s.def("LookupOnPrefix", &PipelineStore::LookupOnPrefix, py::arg("ids").noconvert());
     s.def("LookupOnReverse", &PipelineStore::LookupOnReverse, py::arg("ids").noconvert());

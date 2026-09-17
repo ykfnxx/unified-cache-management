@@ -24,6 +24,7 @@
 #ifndef UNIFIEDCACHE_STORE_V1_H
 #define UNIFIEDCACHE_STORE_V1_H
 
+#include <map>
 #include "status/status.h"
 #include "type/dictionary.h"
 #include "type/types.h"
@@ -175,6 +176,14 @@ public:
      *         describing the failure.
      */
     virtual Status Wait(Detail::TaskHandle taskId) = 0;
+
+    // Optional request-aware store extension. Hashes describe the complete prefix.
+    virtual Status ObserveRequest(const std::string& requestId, uint64_t observation,
+                                  uint64_t timestampNs, const std::vector<Detail::BlockId>& blocks)
+    {
+        return Status::Unsupported();
+    }
+    virtual std::map<std::string, uint64_t> ContextStats() { return {}; }
 
 protected:
     /**

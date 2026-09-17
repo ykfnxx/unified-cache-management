@@ -1,0 +1,24 @@
+# Local ContextStore: each TP worker owns payload/policy; scheduler intersects metadata.
+# Single-host non-MLA TP, PP=CP=1, direct or layerwise attention.
+use_layerwise: true
+use_lite: false
+enable_event_sync: true
+ucm_connectors:
+  - ucm_connector_name: UcmPipelineStore
+    ucm_connector_config:
+      store_pipeline: ContextStore
+      # Per-rank payload budgets in GiB. TP=4 allocates 32 GiB Memory + 128 GiB simulated SSD.
+      # Both pools use host memory; size the simulated SSD to avoid filling it.
+      # context_tp_size/context_tp_rank are supplied by the connector.
+      context_memory_capacity_gb: 8
+      context_simulated_ssd_capacity_gb: 32
+      context_alpha: 0.01
+      # null/-1: always write back on eviction; otherwise idle > retention drops.
+      context_retention_ns: 60000000000
+      context_max_eviction_blocks: 64
+      cache_stream_number: 4
+      waiting_queue_depth: 8192
+      timeout_ms: 30000
+      use_gdr: false
+      cache_sdma_direct: false
+      cache_io_aggregation: false

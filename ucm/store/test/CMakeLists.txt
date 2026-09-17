@@ -10,6 +10,7 @@ if(BUILD_UNIT_TESTS)
     if(NOT TARGET yuanrongstore)
         list(FILTER UCMSTORE_TEST_SOURCE_FILES EXCLUDE REGEX ".*/yuanrong/.*\\.cc$")
     endif()
+    list(FILTER UCMSTORE_TEST_SOURCE_FILES EXCLUDE REGEX ".*/context/.*\\.cc$")
     add_executable(ucmstore.test ${UCMSTORE_TEST_SOURCE_FILES})
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "12" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "13")
         set_source_files_properties(case/dram/kv_protocol_test.cc

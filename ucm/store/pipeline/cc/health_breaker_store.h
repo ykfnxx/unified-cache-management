@@ -57,6 +57,12 @@ public:
     Expected<ssize_t> LookupOnReverse(const Detail::BlockId* blocks, size_t num) override;
     void Prefetch(const Detail::BlockId* blocks, size_t num) override;
     Status CheckHealth() override;
+    Status ObserveRequest(const std::string& id, uint64_t observation, uint64_t timestamp,
+                          const std::vector<Detail::BlockId>& blocks) override
+    {
+        return store_->ObserveRequest(id, observation, timestamp, blocks);
+    }
+    std::map<std::string, uint64_t> ContextStats() override { return store_->ContextStats(); }
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override;
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override;
     Expected<bool> Check(Detail::TaskHandle taskId) override;

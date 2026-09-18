@@ -1409,6 +1409,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
             self._vllm_config.parallel_config
         )
         self.tp_size = self._vllm_config.parallel_config.tensor_parallel_size
+        self.cp_world_size = 1
         self.kv_cache_dtype: torch.dtype = None
         self.num_head = vllm_config.model_config.get_num_kv_heads(
             vllm_config.parallel_config
@@ -1523,7 +1524,6 @@ class UCMDirectConnector(KVConnectorBase_V1):
         # Worker-side tasks that outlive the metadata step that submitted them.
         self._pending_load_tasks: dict[str, PendingLoadTask] = {}
         self._finished_async_load_req_ids: set[str] = set()
-        self.cp_world_size = 1
         self.hash_block_size = self.block_size
         self.block_size *= self.cp_world_size
         self.request_block_hasher = None
@@ -1614,7 +1614,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
             if (
                 self.is_mla
                 or parallel.pipeline_parallel_size != 1
-                or self.cp_world_size != 1
+                or getattr(parallel, "prefill_context_parallel_size", 1) != 1
+                or getattr(parallel, "decode_context_parallel_size", 1) != 1
             ):
                 raise ValueError("ContextStore requires non-MLA attention and PP=CP=1")
             config["context_tp_size"] = self.tp_size

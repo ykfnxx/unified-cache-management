@@ -348,6 +348,106 @@ def test_connector_supplies_tp_config_and_rejects_unsupported_modes(role):
     with pytest.raises(ValueError, match="PP=CP=1"):
         connector._create_store(layout)
     parallel.pipeline_parallel_size = 1
-    connector.cp_world_size = 2
-    with pytest.raises(ValueError, match="PP=CP=1"):
-        connector._create_store(layout)
+    for field in ("prefill_context_parallel_size", "decode_context_parallel_size"):
+        setattr(parallel, field, 2)
+        with pytest.raises(ValueError, match="PP=CP=1"):
+            connector._create_store(layout)
+        setattr(parallel, field, 1)
+
+
+@pytest.mark.parametrize("layerwise", [False, True])
+@pytest.mark.parametrize("cp_size", [1, 2])
+def test_scheduler_constructor_context_store_initialization(layerwise, cp_size):
+    # Run the real constructors until the native-store factory boundary. Engine
+    # dependencies are fixtures; do not prepopulate cp_world_size on the object.
+    ns = connector_functions()
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            rank=0,
+            tensor_parallel_size=2,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=cp_size,
+            decode_context_parallel_size=1,
+        ),
+        cache_config=SimpleNamespace(block_size=16),
+        model_config=SimpleNamespace(
+            is_deepseek_mla=False,
+            get_num_layers=lambda _: 2,
+            get_num_kv_heads=lambda _: 2,
+            get_head_size=lambda: 8,
+            dtype=SimpleNamespace(itemsize=2),
+            hf_config=SimpleNamespace(),
+        ),
+        kv_transfer_config=SimpleNamespace(engine_id="constructor_test"),
+    )
+    launch = {
+        "ucm_connectors": [
+            {
+                "ucm_connector_name": "UcmPipelineStore",
+                "ucm_connector_config": {"store_pipeline": "ContextStore"},
+            }
+        ]
+    }
+
+    class FactoryReached(Exception):
+        pass
+
+    class Base(ns["Connector"]):
+        def __init__(self, vllm_config, role, kv_cache_config):
+            self._vllm_config, self._role = vllm_config, role
+            self._dp_rank, self._gc_owner = 0, False
+
+        def _set_default_shm_buffer_capacity(self, config):
+            pass
+
+        def _make_other_rank_hashers(self, config):
+            return []
+
+        def _create_store(self, layout):
+            assert self.cp_world_size == 1
+            return super()._create_store(layout)
+
+    def factory(name, store_config, path):
+        assert store_config["context_tp_size"] == 2
+        raise FactoryReached()
+
+    ns.update(
+        {
+            "Base": Base,
+            "torch": SimpleNamespace(),
+            "current_platform": SimpleNamespace(is_cuda_alike=lambda: True),
+            "Config": lambda _: SimpleNamespace(get_config=lambda: launch),
+            "RequestHasher": lambda *args: SimpleNamespace(seed=b"seed"),
+            "UcmConnectorFactoryV1": SimpleNamespace(create_connector=factory),
+        }
+    )
+    tree = ast.parse(
+        (ROOT / "ucm/integration/vllm/ucm_connector.py").read_text(encoding="utf-8-sig")
+    )
+    classes = []
+    for name, base in [
+        ("UCMDirectConnector", "Base"),
+        ("UCMLayerWiseConnector", "UCMDirectConnector"),
+    ]:
+        source = next(
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name
+        )
+        constructor = next(
+            n
+            for n in source.body
+            if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+        )
+        classes.append(
+            ast.ClassDef(
+                name=name,
+                bases=[ast.Name(id=base, ctx=ast.Load())],
+                keywords=[],
+                body=[constructor],
+                decorator_list=[],
+            )
+        )
+    code = ast.fix_missing_locations(ast.Module(body=classes, type_ignores=[]))
+    exec(compile(code, "connector_constructors", "exec"), ns)  # noqa: S102
+    cls = ns["UCMLayerWiseConnector" if layerwise else "UCMDirectConnector"]
+    with pytest.raises(FactoryReached if cp_size == 1 else ValueError):
+        cls(config, "scheduler", None)

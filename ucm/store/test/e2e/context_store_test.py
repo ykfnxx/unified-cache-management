@@ -100,6 +100,7 @@ def connector_functions():
                     "_generate_dispatch_meta",
                     "_observe_context_requests",
                     "_store_block_ids",
+                    "_consistency_manager_enabled",
                     "_create_store",
                 }
             ]
@@ -280,12 +281,13 @@ def test_tp_processes_intersect_readiness_and_independent_evictions():
 
 
 @pytest.mark.parametrize("rank", [0, 1, 3])
-def test_context_keys_match_io_on_every_rank(rank):
+@pytest.mark.parametrize("is_mla", [False, True])
+def test_context_keys_match_io_on_every_rank(rank, is_mla):
     connector = connector_functions()["Connector"]()
     connector._context_store_enabled = True
     connector.tp_rank = rank
     connector.tp_size = 4
-    connector.is_mla = False
+    connector.is_mla = is_mla
     connector.request_hasher = lambda key: bytes(x ^ 255 for x in key)
     blocks = [bytes([1]) * 16, bytes([2]) * 16]
     calls = []
@@ -302,7 +304,9 @@ def test_context_keys_match_io_on_every_rank(rank):
     assert connector._store_block_ids(blocks) == calls[0][3] == blocks
     # Existing stores retain their nonzero-rank hashing rule.
     connector._context_store_enabled = False
-    expected = blocks if rank == 0 else [connector.request_hasher(k) for k in blocks]
+    expected = (
+        blocks if rank == 0 or is_mla else [connector.request_hasher(k) for k in blocks]
+    )
     assert connector._store_block_ids(blocks) == expected
 
 
@@ -320,6 +324,7 @@ def test_connector_supplies_tp_config_and_rejects_unsupported_modes(role):
     connector.tp_size, connector.tp_rank = 4, 3
     connector.cp_world_size = 1
     connector.is_mla = False
+    connector._context_store_enabled = True
     connector._role = role
     connector.unique_id = "experiment"
     connector._dp_rank = 2
@@ -341,8 +346,10 @@ def test_connector_supplies_tp_config_and_rejects_unsupported_modes(role):
     assert config["context_tp_rank"] == (3 if role == "worker" else 0)
     assert config["share_buffer_enable"] is False
     connector.is_mla = True
-    with pytest.raises(ValueError, match="non-MLA"):
-        connector._create_store(layout)
+    mla_config = connector._create_store(layout)
+    assert mla_config["share_buffer_enable"] is True
+    if role == "worker":
+        assert mla_config["local_rank_size"] == 4
     connector.is_mla = False
     parallel.pipeline_parallel_size = 2
     with pytest.raises(ValueError, match="PP=CP=1"):
@@ -357,7 +364,8 @@ def test_connector_supplies_tp_config_and_rejects_unsupported_modes(role):
 
 @pytest.mark.parametrize("layerwise", [False, True])
 @pytest.mark.parametrize("cp_size", [1, 2])
-def test_scheduler_constructor_context_store_initialization(layerwise, cp_size):
+@pytest.mark.parametrize("is_mla", [False, True])
+def test_scheduler_constructor_context_store_initialization(layerwise, cp_size, is_mla):
     # Run the real constructors until the native-store factory boundary. Engine
     # dependencies are fixtures; do not prepopulate cp_world_size on the object.
     ns = connector_functions()
@@ -371,7 +379,7 @@ def test_scheduler_constructor_context_store_initialization(layerwise, cp_size):
         ),
         cache_config=SimpleNamespace(block_size=16),
         model_config=SimpleNamespace(
-            is_deepseek_mla=False,
+            is_deepseek_mla=is_mla,
             get_num_layers=lambda _: 2,
             get_num_kv_heads=lambda _: 2,
             get_head_size=lambda: 8,
@@ -451,3 +459,357 @@ def test_scheduler_constructor_context_store_initialization(layerwise, cp_size):
     cls = ns["UCMLayerWiseConnector" if layerwise else "UCMDirectConnector"]
     with pytest.raises(FactoryReached if cp_size == 1 else ValueError):
         cls(config, "scheduler", None)
+
+
+def mla_connector_methods():
+    ns = connector_functions()
+    tree = ast.parse(
+        (ROOT / "ucm/integration/vllm/ucm_connector.py").read_text(encoding="utf-8-sig")
+    )
+    selected = []
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == "UCMWorkerMetadata":
+            selected.append(node)
+        if isinstance(node, ast.ClassDef) and node.name in {
+            "UCMDirectConnector",
+            "UCMLayerWiseConnector",
+        }:
+            names = (
+                {"wait_for_save"}
+                if node.name == "UCMDirectConnector"
+                else {"save_kv_layer", "wait_for_layer_load"}
+            )
+            selected.extend(
+                n
+                for n in node.body
+                if isinstance(n, ast.FunctionDef) and n.name in names
+            )
+    ns.update(
+        {
+            "KVConnectorWorkerMetadata": object,
+            "Any": object,
+            "torch": SimpleNamespace(Tensor=object),
+            "UCMConnectorMetadata": SimpleNamespace,
+            "PendingDumpTask": lambda **kwargs: SimpleNamespace(**kwargs),
+            "ucmmetrics": SimpleNamespace(update_stats=lambda *args: None),
+            "logger": SimpleNamespace(
+                debug=lambda *args: None, info=lambda *args: None
+            ),
+        }
+    )
+    exec(  # noqa: S102
+        compile(
+            ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])),
+            "mla_methods",
+            "exec",
+        ),
+        ns,
+    )
+    return ns
+
+
+@pytest.mark.parametrize("layerwise", [False, True])
+@pytest.mark.parametrize("context", [False, True])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_mla_only_rank_zero_saves(layerwise, context, rank):
+    ns = mla_connector_methods()
+    connector = ns["Connector"]()
+    connector.is_mla, connector._context_store_enabled = True, context
+    connector.tp_rank, connector.tp_size = rank, 2
+    block = bytes([1]) * 16
+    metadata = SimpleNamespace(
+        request_meta={"r": SimpleNamespace(dump_block_ids=([block], [0]))}
+    )
+    connector._connector_metadata = metadata
+    connector._get_connector_metadata = lambda: metadata
+    connector._store_block_ids = lambda keys: keys
+    connector._dumped_layer_ids = set()
+    connector.layer_name_to_id = {"mtp": 2}
+    calls = []
+    connector._submit_layerwise_dump_task = lambda *args: calls.append(args) or True
+    connector._poll_pending_dump_tasks = lambda: None
+    connector._async_dump_req_ids = set()
+    connector._skip_null_vllm_blocks = False
+    connector._pending_dump_tasks = []
+    connector._get_dump_event_handle = lambda: 0
+    connector.kv_cache_layout = SimpleNamespace(
+        extract_block_addrs=lambda _: np.zeros((1, 3), dtype=np.uint64)
+    )
+    connector.store = object()
+    connector._rank_consistency = SimpleNamespace(
+        submit_dump=lambda *args: calls.append(args) or 1
+    )
+    connector.block_data_size = 64
+    if layerwise:
+        ns["save_kv_layer"](connector, "mtp", None, None)
+        ns["save_kv_layer"](connector, "mtp", None, None)
+    else:
+        ns["wait_for_save"](connector)
+    assert len(calls) == int(rank == 0)
+
+
+def test_mla_success_aggregation_uses_rank_zero_copy():
+    cls = mla_connector_methods()["UCMWorkerMetadata"]
+    first = cls(is_mla=True, dump_succeeded_blocks={b"a", b"b"})
+    second = cls(is_mla=True)
+    assert first.aggregate(second).dump_succeeded_blocks == {b"a", b"b"}
+
+
+def test_mla_mtp_last_layer_revisit_does_not_wait_twice():
+    ns = mla_connector_methods()
+    connector = SimpleNamespace(
+        _connector_metadata=True,
+        need_load=True,
+        layer_name_to_id={"mtp": 2},
+        layer_ids=[0, 1, 2],
+        first_layer_id=0,
+        load_tasks={2: {"r": "task"}},
+        _get_connector_metadata=lambda: SimpleNamespace(
+            request_meta={"r": SimpleNamespace(load_block_ids=([b"key"], [0]))}
+        ),
+        _layerwise_load_bytes=0,
+        kv_cache_layout=SimpleNamespace(shard_size=56),
+        _record_layerwise_load_duration=lambda *args: False,
+    )
+    waits = []
+    connector._rank_consistency = SimpleNamespace(
+        wait_load=lambda task: waits.append(task)
+    )
+    ns["wait_for_layer_load"](connector, "mtp")
+    ns["wait_for_layer_load"](connector, "mtp")
+    assert waits == ["task"]
+
+
+def test_dsa_shared_three_components_and_mtp_shard_native_readback():
+    module, library = native()
+    name = "dsa_" + uuid.uuid4().hex
+    sizes = [32, 16, 8]
+    config = {
+        "unique_id": name,
+        "share_buffer_enable": True,
+        "context_tp_size": 2,
+        "block_size": 168,
+        "shard_size": 56,
+        "tensor_size_list": sizes,
+        "context_memory_capacity_bytes": 168,
+        "context_simulated_ssd_capacity_bytes": 168 * 4,
+        "context_max_eviction_blocks": 1,
+    }
+    watcher = module.PipelineStore()
+    watcher.Stack(
+        "Context", str(library), {"unique_id": name, "share_buffer_enable": True}
+    )
+    # A reader can initialize before its owner; it allocates no payload.
+    reader = module.PipelineStore()
+    reader.Stack("Context", str(library), dict(config, device_id=1, context_tp_rank=1))
+    owner = module.PipelineStore()
+    owner.Stack("Context", str(library), dict(config, device_id=0, context_tp_rank=0))
+    owner.ObserveRequest("r", 1, 1, ids(1))
+    reader.ObserveRequest("r", 1, 1, ids(1))
+    for layer in range(3):
+        tensors = [
+            np.full(size, layer * 3 + i, dtype=np.uint8) for i, size in enumerate(sizes)
+        ]
+        task = owner.Dump(
+            ids(1),
+            np.array([layer], dtype=np.uint64),
+            np.array([[a.ctypes.data for a in tensors]], dtype=np.uint64),
+            0,
+        )
+        owner.Wait(task)
+        assert watcher.Lookup(ids(1)) == (b"\1" if layer == 2 else b"\0")
+    with pytest.raises(RuntimeError, match="-50008"):
+        reader.Dump(
+            ids(1),
+            np.array([0], dtype=np.uint64),
+            np.array([[a.ctypes.data for a in tensors]], dtype=np.uint64),
+            0,
+        )
+    # Read the single host copy on both ranks, first from Memory then SSD.
+    for evict in (False, True):
+        if evict:
+            owner.ObserveRequest("new", 2, 2, ids(2))
+            task = owner.Dump(
+                ids(2),
+                np.array([0], dtype=np.uint64),
+                np.array([[a.ctypes.data for a in tensors]], dtype=np.uint64),
+                0,
+            )
+            owner.Wait(task)
+            assert owner.ContextStats()["ssd_write_bytes"] == 168
+        for worker in (owner, reader):
+            for layer in range(3):
+                tensors = [np.zeros(size, dtype=np.uint8) for size in sizes]
+                task = worker.Load(
+                    ids(1),
+                    np.array([layer], dtype=np.uint64),
+                    np.array([[a.ctypes.data for a in tensors]], dtype=np.uint64),
+                )
+                worker.Wait(task)
+                for i, tensor in enumerate(tensors):
+                    assert np.all(tensor == layer * 3 + i)
+    assert reader.ContextStats().get("d2h_bytes", 0) == 0
+    assert reader.ContextStats().get("ssd_write_bytes", 0) == 0
+    assert watcher.Lookup(ids(1, 2)) == b"\1\0"
+    del reader
+    assert watcher.Lookup(ids(1)) == b"\1"
+
+
+@pytest.mark.parametrize("layerwise", [False, True])
+def test_dsa_layout_preserves_three_components_and_mtp_layer(layerwise):
+    import math
+    import re
+
+    class Tensor:
+        def __init__(self, array):
+            self.array, self.shape = array, array.shape
+
+        def __getitem__(self, index):
+            return Tensor(self.array[index])
+
+        def dim(self):
+            return self.array.ndim
+
+        def element_size(self):
+            return self.array.itemsize
+
+        def data_ptr(self):
+            return self.array.ctypes.data
+
+    ns = {
+        "np": np,
+        "math": math,
+        "List": list,
+        "dataclass": dataclasses.dataclass,
+        "torch": SimpleNamespace(Tensor=Tensor),
+        "logger": SimpleNamespace(info=lambda *args: None),
+        "extract_layer_index": lambda name: int(re.search(r"layers\.(\d+)", name)[1]),
+    }
+    tree = ast.parse(
+        (ROOT / "ucm/integration/vllm/ucm_connector.py").read_text(encoding="utf-8-sig")
+    )
+    selected = [
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef)
+        and n.name in {"KVCacheTensorInfo", "KVCacheLayout"}
+    ]
+    exec(  # noqa: S102
+        compile(
+            ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])),
+            "dsa_layout",
+            "exec",
+        ),
+        ns,
+    )
+    # Two target-model layers plus a registered MTP layer, each with 3 BF16-like
+    # components. NumPy backs the tensors; the layout implementation is real.
+    caches = {
+        f"model.layers.{layer}.self_attn": tuple(
+            Tensor(np.zeros((4, 2, 1, width), dtype=np.uint16))
+            for width in (512, 64, 128)
+        )
+        for layer in range(3)
+    }
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(num_hidden_layers=2)
+        ),
+    )
+    layout = ns["KVCacheLayout"](
+        caches, {"use_layerwise": layerwise}, config, SimpleNamespace(num_blocks=4)
+    )
+    sizes = [2048, 256, 512]
+    assert layout.tensor_size_list == (sizes if layerwise else sizes * 3)
+    assert layout.block_size == sum(sizes) * 3
+    assert layout.shard_size == (sum(sizes) if layerwise else sum(sizes) * 3)
+    addresses = layout.extract_block_addrs([1], layer_first=layerwise)
+    expected = [
+        component[1].data_ptr()
+        for components in caches.values()
+        for component in components
+    ]
+    assert addresses.reshape(-1).tolist() == expected
+
+
+def shared_mla_reader_process(pipe, config):
+    module, library = native()
+    reader = module.PipelineStore()
+    reader.Stack("Context", str(library), config)
+    pipe.send("ready")
+    while True:
+        command = pipe.recv()
+        if command == "close":
+            break
+        data = np.zeros(64, dtype=np.uint8)
+        try:
+            task = reader.Load(
+                ids(1),
+                np.array([0], dtype=np.uint64),
+                np.array([[data.ctypes.data]], dtype=np.uint64),
+            )
+            reader.Wait(task)
+            pipe.send((data.tobytes(), reader.ContextStats()))
+        except RuntimeError:
+            pipe.send("missing")
+    del reader
+    pipe.close()
+
+
+def test_mla_shared_payload_across_processes_and_owner_exit():
+    module, library = native()
+    config = {
+        "unique_id": "shared_" + uuid.uuid4().hex,
+        "share_buffer_enable": True,
+        "context_tp_size": 2,
+        "block_size": 64,
+        "shard_size": 64,
+        "tensor_size": 64,
+        "context_memory_capacity_bytes": 64,
+        "context_simulated_ssd_capacity_bytes": 512,
+        "context_max_eviction_blocks": 1,
+    }
+    ctx = multiprocessing.get_context("spawn")
+    parent, child = ctx.Pipe()
+    process = ctx.Process(
+        target=shared_mla_reader_process,
+        args=(child, dict(config, device_id=1, context_tp_rank=1)),
+    )
+    process.start()
+    child.close()
+    try:
+        assert parent.poll(30) and parent.recv() == "ready"
+        owner = module.PipelineStore()
+        owner.Stack(
+            "Context", str(library), dict(config, device_id=0, context_tp_rank=0)
+        )
+        source = np.arange(64, dtype=np.uint8)
+        for key in (1, 2):
+            owner.ObserveRequest(str(key), key, key, ids(key))
+            task = owner.Dump(
+                ids(key),
+                np.array([0], dtype=np.uint64),
+                np.array([[source.ctypes.data]], dtype=np.uint64),
+                0,
+            )
+            owner.Wait(task)
+            parent.send("load")
+            assert parent.poll(30)
+            data, stats = parent.recv()
+            assert data == source.tobytes()
+            assert stats.get("d2h_bytes", 0) == 0
+            assert stats.get("ssd_read_bytes", 0) == (64 if key == 2 else 0)
+        assert owner.ContextStats()["ssd_write_bytes"] == 64
+        del owner
+        parent.send("load")
+        assert parent.poll(30) and parent.recv() == "missing"
+    finally:
+        if process.is_alive():
+            parent.send("close")
+            process.join(10)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+        parent.close()
+    assert process.exitcode == 0

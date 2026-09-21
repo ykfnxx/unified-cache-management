@@ -36,17 +36,20 @@ namespace UC::Context {
 struct SharedMetadata::Header {
     std::atomic<uint64_t> ready{0};
     size_t capacity = 0;
+    uint64_t layout = 0;
     pthread_mutex_t lock;
     bool alive = true;
 };
 struct SharedMetadata::Entry {
     Key key{};
     uint8_t state = 0, copies = 0;
+    size_t memory = 0, ssd = 0, readers = 0;
+    bool busy = false;
 };
-static constexpr uint64_t magic = 0x43545853544f0001ULL;
+static constexpr uint64_t magic = 0x43545853544f0002ULL;
 static_assert(std::atomic<uint64_t>::is_always_lock_free);
 SharedMetadata::~SharedMetadata() { Close(); }
-Status SharedMetadata::Setup(const std::string& name, bool owner, size_t capacity)
+Status SharedMetadata::Setup(const std::string& name, bool owner, size_t capacity, uint64_t layout)
 {
     if (name.empty() || name.find_first_not_of(
                             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") !=
@@ -79,6 +82,7 @@ Status SharedMetadata::Setup(const std::string& name, bool owner, size_t capacit
     }
     header_ = new (mapping_) Header;
     header_->capacity = capacity;
+    header_->layout = layout;
     entries_ = reinterpret_cast<Entry*>(header_ + 1);
     for (size_t i = 0; i < capacity; ++i) { new (&entries_[i]) Entry; }
     pthread_mutexattr_t attr;
@@ -125,7 +129,7 @@ static bool Lock(pthread_mutex_t* lock, bool& alive)
     }
     return rc == 0;
 }
-Status SharedMetadata::Publish(const Key& key, uint8_t copies)
+Status SharedMetadata::Publish(const Key& key, uint8_t copies, size_t memory, size_t ssd)
 {
     if (!owner_ || !header_ || !Lock(&header_->lock, header_->alive)) {
         return Status::Error("metadata owner unavailable");
@@ -137,6 +141,9 @@ Status SharedMetadata::Publish(const Key& key, uint8_t copies)
         auto& entry = entries_[pos];
         if (entry.state == 1 && entry.key == key) {
             entry.copies = copies;
+            entry.memory = memory;
+            entry.ssd = ssd;
+            entry.busy = false;
             if (!copies) { entry.state = 2; }
             pthread_mutex_unlock(&header_->lock);
             return Status::OK();
@@ -144,9 +151,72 @@ Status SharedMetadata::Publish(const Key& key, uint8_t copies)
         if (entry.state != 1 && firstFree == header_->capacity) { firstFree = pos; }
         if (entry.state == 0) { break; }
     }
-    if (copies && firstFree != header_->capacity) { entries_[firstFree] = Entry{key, 1, copies}; }
+    if (copies && firstFree != header_->capacity) {
+        entries_[firstFree] = Entry{key, 1, copies, memory, ssd, 0, false};
+    }
     pthread_mutex_unlock(&header_->lock);
     return copies && firstFree == header_->capacity ? Status::NoSpace() : Status::OK();
+}
+SharedMetadata::Entry* SharedMetadata::Find(const Key& key)
+{
+    auto start = Detail::BlockIdHasher{}(key) % header_->capacity;
+    for (size_t n = 0; n < header_->capacity; ++n) {
+        auto& entry = entries_[(start + n) % header_->capacity];
+        if (entry.state == 0) { break; }
+        if (entry.state == 1 && entry.key == key) { return &entry; }
+    }
+    return nullptr;
+}
+Expected<SharedMetadata::Location> SharedMetadata::Acquire(const Key& key, uint64_t layout)
+{
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!mapping_) {
+        auto status = OpenWatcher();
+        if (status.Failure()) { return status; }
+    }
+    if (header_->ready.load(std::memory_order_acquire) != magic) { return Status::NotFound(); }
+    if (header_->layout != layout) { return Status::InvalidParam("context MLA layout mismatch"); }
+    if (!Lock(&header_->lock, header_->alive)) { return Status::Error("metadata writer failed"); }
+    auto* entry = header_->alive ? Find(key) : nullptr;
+    if (!entry || !entry->copies || entry->busy) {
+        pthread_mutex_unlock(&header_->lock);
+        return Status::NotFound();
+    }
+    ++entry->readers;
+    bool memory = entry->copies & 1;
+    Location location{memory ? entry->memory : entry->ssd, memory};
+    pthread_mutex_unlock(&header_->lock);
+    return location;
+}
+void SharedMetadata::Release(const Key& key)
+{
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (!header_ || !Lock(&header_->lock, header_->alive)) { return; }
+    auto* entry = Find(key);
+    if (entry && entry->readers) { --entry->readers; }
+    pthread_mutex_unlock(&header_->lock);
+}
+bool SharedMetadata::Evictable(const Key& key)
+{
+    if (!header_ || !Lock(&header_->lock, header_->alive)) { return false; }
+    auto* entry = Find(key);
+    bool result = entry && !entry->readers && !entry->busy;
+    pthread_mutex_unlock(&header_->lock);
+    return result;
+}
+bool SharedMetadata::ReserveEviction(const std::vector<Key>& keys)
+{
+    if (!header_ || !Lock(&header_->lock, header_->alive)) { return false; }
+    for (const auto& key : keys) {
+        auto* entry = Find(key);
+        if (!entry || entry->readers || entry->busy) {
+            pthread_mutex_unlock(&header_->lock);
+            return false;
+        }
+    }
+    for (const auto& key : keys) { Find(key)->busy = true; }
+    pthread_mutex_unlock(&header_->lock);
+    return true;
 }
 Expected<std::vector<uint8_t>> SharedMetadata::Lookup(const Key* keys, size_t count)
 {
@@ -169,7 +239,7 @@ Expected<std::vector<uint8_t>> SharedMetadata::Lookup(const Key* keys, size_t co
                 auto& entry = entries_[(start + n) % header_->capacity];
                 if (entry.state == 0) { break; }
                 if (entry.state == 1 && entry.key == keys[i]) {
-                    result[i] = entry.copies != 0;
+                    result[i] = entry.copies != 0 && !entry.busy;
                     break;
                 }
             }

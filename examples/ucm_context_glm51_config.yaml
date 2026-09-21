@@ -1,3 +1,10 @@
+# GLM-5.1-W4A8 experiment: single-host TP + MTP, DP=1, PP=CP=1.
+# Keep sparse C8 and enable_dsa_cp disabled in the engine configuration.
+# MTP/model/TP settings belong to the vLLM command, not this YAML.
+# MLA: rank 0 saves/evicts, all TP ranks load the same shared host copy.
+# Capacities below apply to the whole TP group, not each rank.
+# /dev/shm must hold both pools plus metadata.
+# CPU fixtures validated; actual model/device run still requires validation.
 # ContextStore: GQA uses per-rank pools; MLA uses one shared pool owned by rank 0.
 # Single-host GQA/MLA TP, PP=CP=1, direct or layerwise attention.
 use_layerwise: true

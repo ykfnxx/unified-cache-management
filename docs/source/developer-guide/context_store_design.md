@@ -1,6 +1,6 @@
 # ContextStore：context_lru 与 DRAM 模拟 SSD 实现方案
 
-状态：固定 retention / 固定淘汰粒度版本已实现。CPU simu 验证覆盖真实字节搬运和共享元数据；尚未完成 NPU 或真实 vLLM 推理验证。支持同机非 MLA 多 TP 的独立数据池和可用性交集查询；自适应参数未实现。
+状态：固定 retention / 固定淘汰粒度版本已实现。CPU simu 验证覆盖真实字节搬运和共享元数据；尚未完成 NPU 或真实 vLLM 推理验证。支持同机 GQA 独立多 TP 池，以及 MLA 单 rank 写入、多 rank 共享读取；自适应参数未实现。
 
 运行配置、接口和验证命令见 [ContextStore 使用说明](../../../examples/README_context_store.md)。
 
@@ -92,7 +92,7 @@ block B
 
 这里的 block 是该命名空间内的逻辑 block。TP rank 独立存储时，block_bytes 是该 rank 应保存的数据量，不是全模型各 rank 的总量。
 
-worker 私有拓扑节点保存 parent、children 和全局 depth；缓存条目保存两个 slot、写入就绪信息、引用和策略访问状态。共享元数据只发布查询所需的 BlockId 和 Memory/SSD 完整副本可用标志，不复制树、segment、slot 地址和传输引用。
+worker 私有拓扑节点保存 parent、children 和全局 depth；缓存条目保存两个 slot、写入就绪信息、引用和策略访问状态。共享元数据发布 BlockId 和完整副本可用标志；MLA 还共享 slot 索引、布局签名、读引用和淘汰占用状态。不共享树、segment 或进程私有指针。
 
 一个 shard 内多个 tensor 按固定 offset 布局，由初始化配置计算。一个 block 的所需 shard 全部成功完成 D2H 后，Memory 副本才 READY。
 
@@ -186,7 +186,7 @@ worker ContextStore：前缀树 + context_lru + 两个数据池 + 传输队列
     └─ 数据状态变更 → 发布共享可用状态
 ```
 
-共享查询参考 CacheStore 的 `SharedBufferWatcherStrategy`：worker 创建并初始化共享元数据，scheduler 按命名空间打开，仅映射查询区域。context_lru 索引及 payload 留在 worker，scheduler 不参与策略执行。
+共享查询参考 CacheStore 的 `SharedBufferWatcherStrategy`：worker 创建并初始化共享元数据，scheduler 按命名空间打开，仅映射查询区域。context_lru 索引留在 owner worker；MLA payload 由各 worker 共享，scheduler 不参与策略执行。
 
 上下文随现有 connector metadata 送达 worker，在相应 Load/Dump 之前调用 ObserveRequest。scheduler 不通过 Lookup 修改 worker 的策略索引，也不从 Load/Dump 后缀推导完整前缀。
 
@@ -201,11 +201,15 @@ worker ContextStore：前缀树 + context_lru + 两个数据池 + 传输队列
 
 Lookup 返回查询时的可用状态，不持有传输引用。worker 的 Load 必须重新查找并取得引用；若查询后数据已被淘汰，则返回加载失败，由 connector 走加载失败回退。该窗口和回退路径纳入接入验证。
 
-每个 TP rank 独立拥有策略索引、Memory 池、模拟 SSD 池和共享元数据表。connector 传入 context_tp_size/context_tp_rank，DP 命名空间由 connector 隔离，native store 追加 _tp<rank>。上下文与 Load/Dump 均使用 scheduler 的逻辑 block ID，不再对 ContextStore 的非零 rank 重算 hash。
+GQA 每个 TP rank 独立拥有策略索引、Memory、模拟 SSD 和元数据表，native 命名追加 `_tp<rank>`。scheduler 对各 rank 可用性逐 block 取交集。
 
-scheduler watcher 查询各 rank 元数据并逐 block 取交集，再计算连续前缀或 reverse lookup。每个 rank 只要在 Memory 或 SSD 有完整副本即可命中；未启动或退出的 rank 返回未命中。rank 独立淘汰，无需同步淘汰决策。查询与 Load 之间的淘汰由现有 Load 失败重算路径处理。
+MLA 沿用 CacheStore 的单 rank 写、多 rank 读。connector 自动设置 `share_buffer_enable: true`，native 命名追加 `_mla`；只有 rank 0 分配 Memory／模拟 SSD 的 POSIX 共享 payload，维护策略索引并执行 D2H、Dump/Drop。其他 rank 延迟映射同一份 payload，分别注册到自己的设备并执行 H2D。scheduler 只查询这份 owner 元数据。
 
-范围为共享同一个 POSIX shm namespace 的同机非 MLA 多 TP，PP=CP=1。MLA、跨机 TP 和自适应策略不在范围内。容量配置均为每 rank 容量，总 payload 容量为各 rank 之和；实验按相同总 Memory 容量比较。模拟 SSD 预设不会写满，不实现 SSD 回收；NoSpace 仅表示实验容量配置不足。
+共享表除了可用性，还记录 Memory/SSD slot、布局签名、在途读引用和淘汰占用状态。reader 在取得位置时增加引用，实际传输同步后释放；owner 筛选 victim 后在共享锁下再次原子确认并占用，避免查询与淘汰间的竞态。写回期间不接纳新的读取，完成后发布 SSD 位置并释放 Memory slot。若所有候选均被读取保护，可返回 NoSpace，不强制回收。
+
+所有 rank 的上下文和 I/O 使用 scheduler 逻辑 block ID。普通 KV、RoPE 和 indexer 按已有布局完整传输；MTP 注册层参与整个 block 的就绪，重复回调按批去重。MLA ObserveRequest 只有 rank 0 更新策略，其余 reader 不维护索引。MLA 保存成功反馈沿用单 rank 写语义。
+
+范围为同机 GQA/MLA TP、PP=CP=1。GLM-5.1-W4A8 的目标实验为 TP+MTP、DP=1、关闭 C8/CP，尚未进行真实模型验证。GQA 容量按 rank，MLA 按一份 TP 组共享池；模拟 SSD 预设不会写满，不增加其回收策略。MLA 的 `/dev/shm` 需容纳两个 payload 池和元数据。跨机、硬崩溃读引用回收及热重启不在本实验范围。
 
 ## 7. 读写流程与完成边界
 

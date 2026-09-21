@@ -14,26 +14,25 @@ latencies are host-memory transfer latencies, not SSD performance predictions.
 
 Use [ucm_context_config.yaml](ucm_context_config.yaml) through the normal
 `UCM_CONFIG_FILE` setting. The current vLLM integration supports direct/layerwise
-non-MLA attention with single-host TP and PP=CP=1. Each TP worker owns its data
-and policy. The scheduler lazily attaches to all rank lookup tables and intersects
-availability before prefix/reverse lookup. Each rank may serve a block from either
-Memory or simulated SSD. Payload and context indexes stay private to each worker.
-DP groups are isolated. All TP processes must share the same POSIX shm namespace.
+GQA/MLA attention with single-host TP and PP=CP=1. For GQA, each rank owns its
+pools/index and scheduler watchers intersect availability. For MLA, rank 0 alone
+saves and evicts; all ranks map one shared Memory/SSD copy, register it to their
+own devices and load with their own streams. Shared read references prevent
+recycling in-flight slots. Only rank 0 owns the MLA policy index. Registered MTP
+layers participate in whole-block readiness. The scheduler maps metadata only.
 
-All ranks use the scheduler's canonical block IDs for context and I/O. The native
-store appends `_tp<rank>` to the DP-scoped namespace. The connector supplies
-`context_tp_size` and `context_tp_rank` (defaults for direct Store callers: 1 and 0).
-Eviction is independent on each rank; ordinary load-miss/recompute handling still
-covers eviction between lookup and load. MLA, PP, CP and multi-host TP are excluded.
+All ranks use canonical block IDs. The connector supplies `context_tp_size` and
+`context_tp_rank`, and automatically enables `share_buffer_enable` for MLA.
+Native names append `_tp<rank>` for GQA or `_mla` for MLA to the DP-scoped ID.
+All processes must share a POSIX shm namespace. PP, CP and multi-host TP are excluded.
 
-Capacity can be given in integer GiB (`context_memory_capacity_gb`,
-`context_simulated_ssd_capacity_gb`) or exact bytes (`*_capacity_bytes`) for small
-experiments, but not both for the same pool. Capacity rounds down to full blocks.
-These are **per-rank** capacities: TP=4 with 8 GiB Memory and 32 GiB simulated
-SSD per rank uses 32 GiB + 128 GiB of host payload memory. Compare against the
-baseline at the same total Memory capacity. The simulated SSD must be sized so it
-does not fill during the experiment; there is no SSD reclamation policy. Its pool
-must have at least one slot. Metadata is allocated separately.
+Capacities can be integer GiB (`context_memory_capacity_gb`,
+`context_simulated_ssd_capacity_gb`) or exact bytes (`*_capacity_bytes`), not both
+for one pool. Capacity rounds down to full blocks and each pool needs one slot.
+GQA capacities are **per rank**; MLA capacities are **per TP group**. For TP=4,
+8 GiB Memory + 32 GiB SSD means 32 + 128 GiB total in GQA and 8 + 32 GiB total
+in MLA. MLA `/dev/shm` must hold both pools plus metadata. Size simulated SSD so
+it does not fill during the experiment; there is no SSD reclamation policy.
 
 `context_retention_ns: null` or `-1` means every eviction is Dump. A nonnegative
 value selects Drop only when idle time is strictly greater than that value.
@@ -47,7 +46,9 @@ and `tensor_size_list` (or uniform `tensor_size`). The unique ID accepts letters
 digits, `_`, and `-`; only one worker may own that namespace at a time. Watchers
 omit `device_id` (or set it to -1). A clean owner exit invalidates the table and
 unlinks its name. A hard crash requires removing that namespace's stale
-`/dev/shm/ucm_context_<unique_id>` only after its old processes have stopped.
+`/dev/shm/ucm_context_<unique_id>_tp<rank>` (GQA), or
+`/dev/shm/ucm_context_<unique_id>_mla` plus `_memory` and `_ssd` (MLA), only
+after all old processes have stopped. Reader crash recovery is not implemented.
 
 Transfer options are copied from CacheStore: `cache_stream_number`, `use_gdr`,
 `cache_sdma_direct`, `cache_io_aggregation`. SDMA direct and aggregation are
@@ -116,3 +117,8 @@ native stores and the pipeline extension together; do not mix old and new binari
 For a bandwidth baseline use Cache|Empty with a resident working set and the same
 transfer options. Report the simulated SSD capacity separately for tiered-cache
 experiments.
+
+For the GLM-5.1-W4A8 TP + MTP experiment (DP=1, no sparse C8 or CP), see
+[ucm_context_glm51_config.yaml](ucm_context_glm51_config.yaml) and the
+[store README](../ucm/store/context/README.md). Actual accelerator/model execution
+has not been validated.

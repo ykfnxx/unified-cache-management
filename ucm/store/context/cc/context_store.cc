@@ -83,6 +83,8 @@ class ContextStore final : public StoreV1 {
     int64_t retention_ = -1;
     uint64_t now_ = 0;
     bool useGdr_ = false, aggregation_ = false, sdma_ = false;
+    bool sharedMla_ = false, reader_ = false;
+    uint64_t layout_ = 1469598103934665603ULL;
     std::unique_ptr<Trans::GdrKVBufferConfig> registrations_;
     std::map<std::string, uint64_t> stats_;
 
@@ -126,7 +128,11 @@ public:
         return -1;
     }
     void Prefetch(const Key*, size_t) override {}
-    Expected<size_t> Dump(Detail::TaskDesc task) override { return Submit(dump_, std::move(task)); }
+    Expected<size_t> Dump(Detail::TaskDesc task) override
+    {
+        if (reader_) { return Status::Unsupported(); }
+        return Submit(dump_, std::move(task));
+    }
     Expected<size_t> Load(Detail::TaskDesc task) override { return Submit(load_, std::move(task)); }
     Expected<bool> Check(size_t task) override
     {
@@ -155,6 +161,7 @@ public:
                           const std::vector<Key>& blocks) override
     {
         if (deviceId_ < 0) { return Status::Unsupported(); }
+        if (reader_) { return Status::OK(); }
         std::lock_guard<std::mutex> lock(mutex_);
         auto previous = observed_.find(id);
         if (!blocks.empty() && previous != observed_.end() &&
@@ -184,8 +191,10 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto result = stats_;
-        result["memory_blocks"] = memoryCount_ - memory_.FreeCount();
-        result["ssd_blocks"] = ssdCount_ - ssd_.FreeCount();
+        if (!reader_) {
+            result["memory_blocks"] = memoryCount_ - memory_.FreeCount();
+            result["ssd_blocks"] = ssdCount_ - ssd_.FreeCount();
+        }
         result["topology_nodes"] = index_.Size();
         return result;
     }
@@ -203,11 +212,13 @@ private:
     }
     Expected<size_t> Submit(Queue& queue, Detail::TaskDesc task);
     Status Transfer(CopyStream& stream, Detail::TaskDesc& task, bool dump);
+    Status LoadShared(CopyStream& stream, Detail::TaskDesc& task);
     Status Evict(std::unique_lock<std::mutex>& lock, const std::set<Key>& protectedKeys);
     Status Publish(const Key& id, const Entry& entry)
     {
         return metadata_.Publish(id,
-                                 uint8_t(entry.ready ? 1 : 0) | uint8_t(entry.ssd != none ? 2 : 0));
+                                 uint8_t(entry.ready ? 1 : 0) | uint8_t(entry.ssd != none ? 2 : 0),
+                                 entry.memory, entry.ssd);
     }
     void ReleaseContext(const Key& key)
     {
@@ -225,6 +236,12 @@ Status ContextStore::Setup(const Detail::Dictionary& c)
 {
     std::string name;
     c.Get("unique_id", name);
+    if (name.empty() || name.find_first_not_of(
+                            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") !=
+                            std::string::npos) {
+        return Status::InvalidParam("invalid context unique_id");
+    }
+    c.Get("share_buffer_enable", sharedMla_);
     c.GetNumber("device_id", deviceId_);
     if (deviceId_ < -1) { return Status::InvalidParam("invalid context device_id"); }
     // Each rank owns its payload. Watchers intersect only availability metadata.
@@ -234,7 +251,10 @@ Status ContextStore::Setup(const Detail::Dictionary& c)
     if (!tpSize || tpRank >= tpSize) {
         return Status::InvalidParam("invalid context TP rank/size");
     }
+    reader_ = sharedMla_ && tpRank != 0 && deviceId_ >= 0;
+    if (sharedMla_) { name += "_mla"; }
     if (deviceId_ == -1) {
+        if (sharedMla_) { return metadata_.Setup(name, false); }
         for (size_t rank = 0; rank < tpSize; ++rank) {
             auto watcher = std::make_unique<SharedMetadata>();
             auto status = watcher->Setup(name + "_tp" + std::to_string(rank), false);
@@ -243,7 +263,7 @@ Status ContextStore::Setup(const Detail::Dictionary& c)
         }
         return Status::OK();
     }
-    name += "_tp" + std::to_string(tpRank);
+    if (!sharedMla_) { name += "_tp" + std::to_string(tpRank); }
     c.GetNumber("block_size", blockBytes_);
     c.GetNumber("shard_size", shardBytes_);
     c.GetNumbers("tensor_size_list", tensorSizes_);
@@ -294,15 +314,29 @@ Status ContextStore::Setup(const Detail::Dictionary& c)
         status = registrations_->Register(addresses, sizes);
         if (status.Failure()) { return status; }
     }
-    status = memory_.Setup(deviceId_, memoryCount_, blockBytes_, sdma_);
+    // Store a layout signature so peers cannot interpret different tensor layouts
+    // or capacity settings as the same shared block offsets.
+    for (size_t value : {blockBytes_, shardBytes_, memoryCount_, ssdCount_}) {
+        layout_ = (layout_ ^ uint64_t(value)) * 1099511628211ULL;
+    }
+    for (auto value : tensorSizes_) { layout_ = (layout_ ^ uint64_t(value)) * 1099511628211ULL; }
+    if (sharedMla_) {
+        status = memory_.SetupShared(name + "_memory", deviceId_, memoryCount_, blockBytes_,
+                                     !reader_, sdma_);
+        if (status.Failure()) { return status; }
+        status =
+            ssd_.SetupShared(name + "_ssd", deviceId_, ssdCount_, blockBytes_, !reader_, sdma_);
+    } else {
+        status = memory_.Setup(deviceId_, memoryCount_, blockBytes_, sdma_);
+        if (status.Failure()) { return status; }
+        status = ssd_.Setup(deviceId_, ssdCount_, blockBytes_, sdma_);
+    }
     if (status.Failure()) { return status; }
-    status = ssd_.Setup(deviceId_, ssdCount_, blockBytes_, sdma_);
-    if (status.Failure()) { return status; }
-    status = metadata_.Setup(name, true, 2 * (memoryCount_ + ssdCount_) + 1);
+    status = metadata_.Setup(name, !reader_, 2 * (memoryCount_ + ssdCount_) + 1, layout_);
     if (status.Failure()) { return status; }
     status = Start(load_, false);
     if (status.Failure()) { return status; }
-    return Start(dump_, true);
+    return reader_ ? Status::OK() : Start(dump_, true);
 }
 Status ContextStore::Start(Queue& queue, bool dump)
 {
@@ -336,9 +370,11 @@ Status ContextStore::Start(Queue& queue, bool dump)
                         .count();
                 ++stats_[dump ? "dump_tasks" : "load_tasks"];
                 if (result.Failure()) { ++stats_["failed_tasks"]; }
-                for (const auto& shard : job->desc) { ReleaseContext(shard.owner); }
-                for (auto it = job->desc.rbegin(); it != job->desc.rend(); ++it) {
-                    Prune(it->owner);
+                if (!reader_) {
+                    for (const auto& shard : job->desc) { ReleaseContext(shard.owner); }
+                    for (auto it = job->desc.rbegin(); it != job->desc.rend(); ++it) {
+                        Prune(it->owner);
+                    }
                 }
             }
             job->result.set_value(result);
@@ -361,7 +397,7 @@ Expected<size_t> ContextStore::Submit(Queue& queue, Detail::TaskDesc task)
     std::lock_guard<std::mutex> lock(queue.mutex);
     if (queue.stop) { return Status::Error("context store stopped"); }
     if (queue.jobs.size() >= queueDepth_) { return Status::NoSpace(); }
-    {
+    if (!reader_) {
         std::lock_guard<std::mutex> guard(mutex_);
         for (const auto& shard : job->desc) {
             if (!index_.Contains(shard.owner)) {
@@ -386,7 +422,8 @@ Status ContextStore::Evict(std::unique_lock<std::mutex>& lock, const std::set<Ke
     auto victim =
         index_.Select(alpha_ * memoryCount_, limit_, [this, &protectedKeys](const Key& k) {
             const auto& e = entries_.at(k);
-            return e.ready && !e.busy && e.references == 0 && !protectedKeys.count(k);
+            return e.ready && !e.busy && e.references == 0 && !protectedKeys.count(k) &&
+                   (!sharedMla_ || metadata_.Evictable(k));
         });
     stats_["decision_ns"] += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                  std::chrono::steady_clock::now() - decisionStart)
@@ -402,6 +439,10 @@ Status ContextStore::Evict(std::unique_lock<std::mutex>& lock, const std::set<Ke
         if (!drop && entries_.at(k).ssd == none) { ++writes; }
     }
     if (writes > ssd_.FreeCount()) {
+        ++stats_["no_space"];
+        return Status::NoSpace();
+    }
+    if (sharedMla_ && !metadata_.ReserveEviction(victim.blocks)) {
         ++stats_["no_space"];
         return Status::NoSpace();
     }
@@ -438,8 +479,48 @@ Status ContextStore::Evict(std::unique_lock<std::mutex>& lock, const std::set<Ke
     for (auto it = victim.blocks.rbegin(); it != victim.blocks.rend(); ++it) { Prune(*it); }
     return Status::OK();
 }
+Status ContextStore::LoadShared(CopyStream& stream, Detail::TaskDesc& task)
+{
+    std::map<Key, SharedMetadata::Location> held;
+    auto status = Status::OK();
+    for (auto& shard : task) {
+        if (held.count(shard.owner)) { continue; }
+        auto location = metadata_.Acquire(shard.owner, layout_);
+        if (!location) {
+            status = location.Error();
+            break;
+        }
+        held.emplace(shard.owner, location.Value());
+    }
+    if (status.Success()) { status = memory_.MapShared(); }
+    if (status.Success()) { status = ssd_.MapShared(); }
+    for (auto& shard : task) {
+        if (status.Failure()) { break; }
+        const auto& location = held.at(shard.owner);
+        auto& pool = location.memory ? memory_ : ssd_;
+        auto* host =
+            static_cast<char*>(pool.CopyAddress(location.slot)) + shard.index * shardBytes_;
+        status = stream.HostToDeviceAsync(host, shard.addrs.data(), tensorSizes_);
+    }
+    // Keep every cross-process lease until all submitted DMA has drained.
+    auto synced = stream.Synchronize();
+    if (synced.Failure()) { status = synced; }
+    if (status.Success()) {
+        const size_t payload = std::accumulate(tensorSizes_.begin(), tensorSizes_.end(), size_t(0));
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& shard : task) {
+            bool memory = held.at(shard.owner).memory;
+            stats_["h2d_bytes"] += payload;
+            ++stats_[memory ? "memory_load_shards" : "ssd_load_shards"];
+            if (!memory) { stats_["ssd_read_bytes"] += payload; }
+        }
+    }
+    for (const auto& pair : held) { metadata_.Release(pair.first); }
+    return status;
+}
 Status ContextStore::Transfer(CopyStream& stream, Detail::TaskDesc& task, bool dump)
 {
+    if (reader_) { return LoadShared(stream, task); }
     struct Held {
         Key key;
         size_t slot;

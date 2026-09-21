@@ -22,6 +22,10 @@
  * SOFTWARE.
  * */
 #pragma once
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 #include "trans/buffer.h"
 #include "trans/device.h"
@@ -31,6 +35,7 @@ public:
     ~BufferPool()
     {
         if (mapped_) { Trans::Buffer::UnregisterHostBuffer(data_.get()); }
+        if (created_) { shm_unlink(name_.c_str()); }
     }
     Status Setup(int deviceId, size_t count, size_t bytes, bool mapped)
     {
@@ -51,6 +56,59 @@ public:
         for (size_t i = count; i > 0; --i) { free_.push_back(i - 1); }
         return Status::OK();
     }
+    // Like CacheStore, each device registers its own mapping of the same payload.
+    Status SetupShared(const std::string& name, int deviceId, size_t count, size_t bytes,
+                       bool owner, bool deviceAddress)
+    {
+        name_ = "/ucm_context_" + name;
+        owner_ = owner;
+        deviceId_ = deviceId;
+        bytes_ = bytes;
+        total_ = count * bytes;
+        deviceAddress_ = deviceAddress;
+        if (!owner) { return Status::OK(); }  // Readers may initialize before rank 0.
+        auto status = MapShared();
+        if (status.Failure()) { return status; }
+        for (size_t i = count; i > 0; --i) { free_.push_back(i - 1); }
+        return Status::OK();
+    }
+    Status MapShared()
+    {
+        if (data_) { return Status::OK(); }
+        Trans::Device device;
+        auto status = device.Setup(deviceId_);
+        if (status.Failure()) { return status; }
+        int fd = shm_open(name_.c_str(), O_RDWR | (owner_ ? O_CREAT | O_EXCL : 0), 0600);
+        if (fd < 0) { return Status::Error("cannot open context shared payload"); }
+        if (owner_) { created_ = true; }
+        if (owner_ && ftruncate(fd, total_) != 0) {
+            close(fd);
+            return Status::Error("cannot size context shared payload");
+        }
+        // Reserve tmpfs backing now: otherwise a later DMA/memcpy could SIGBUS.
+        if (owner_ && posix_fallocate(fd, 0, total_) != 0) {
+            close(fd);
+            return Status::NoSpace();
+        }
+        struct stat info{};
+        if (fstat(fd, &info) != 0 || size_t(info.st_size) != total_) {
+            close(fd);
+            return Status::InvalidParam("context shared payload layout mismatch");
+        }
+        void* address = mmap(nullptr, total_, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        close(fd);
+        if (address == MAP_FAILED) { return Status::OutOfMemory(); }
+        void* deviceAddress = nullptr;
+        status = Trans::Buffer::RegisterHostBuffer(address, total_, &deviceAddress);
+        if (status.Failure()) {
+            munmap(address, total_);
+            return status;
+        }
+        data_ = std::shared_ptr<void>(address, [size = total_](void* p) { munmap(p, size); });
+        mapped_ = true;
+        deviceData_ = deviceAddress_ ? deviceAddress : address;
+        return Status::OK();
+    }
     bool Empty() const { return free_.empty(); }
     size_t FreeCount() const { return free_.size(); }
     size_t Allocate()
@@ -64,6 +122,10 @@ public:
     void* CopyAddress(size_t i) { return static_cast<char*>(deviceData_) + i * bytes_; }
 
 private:
+    std::string name_;
+    bool owner_ = false, created_ = false, deviceAddress_ = false;
+    int deviceId_ = -1;
+    size_t total_ = 0;
     std::shared_ptr<void> data_;
     void* deviceData_ = nullptr;
     size_t bytes_ = 0;

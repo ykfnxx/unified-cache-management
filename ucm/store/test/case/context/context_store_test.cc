@@ -27,6 +27,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "context_index.h"
+#include "shared_metadata.h"
 #include "ucmstore_v1.h"
 extern "C" UC::StoreV1* MakeContextStore();
 namespace {
@@ -43,12 +44,14 @@ protected:
     std::unique_ptr<StoreV1> store, watcher;
     std::string name;
     uint64_t clock = 0;
-    void Open(size_t memory = 2, size_t ssd = 8, int64_t retention = -1, size_t shards = 1)
+    void Open(size_t memory = 2, size_t ssd = 8, int64_t retention = -1, size_t shards = 1,
+              bool shared = false)
     {
         static unsigned next = 0;
         name = "test_" + std::to_string(getpid()) + "_" + std::to_string(++next);
         Detail::Dictionary config;
         config.Set("unique_id", name);
+        config.Set("share_buffer_enable", shared);
         watcher.reset(MakeContextStore());
         ASSERT_TRUE(watcher->Setup(config).Success());
         config.SetNumber("device_id", 0);
@@ -102,6 +105,60 @@ protected:
         return status;
     }
 };
+TEST_F(ContextStoreTest, SharedMlaLeasePreventsEviction)
+{
+    Open(1, 8, -1, 1, true);
+    Observe({1});
+    ASSERT_TRUE(Dump(1).Success());
+    Context::SharedMetadata peer;
+    ASSERT_TRUE(peer.Setup(name + "_mla", false).Success());
+    uint64_t layout = 1469598103934665603ULL;
+    for (size_t value : {64, 64, 1, 8, 64}) {
+        layout = (layout ^ uint64_t(value)) * 1099511628211ULL;
+    }
+    EXPECT_FALSE(bool(peer.Acquire(Id(1), layout + 1)));
+    auto lease = peer.Acquire(Id(1), layout);
+    ASSERT_TRUE(bool(lease));
+    EXPECT_TRUE(lease.Value().memory);
+    Observe({2});
+    EXPECT_EQ(Dump(2), Status::NoSpace());
+    EXPECT_TRUE(Found(1));
+    peer.Release(Id(1));
+    ASSERT_TRUE(Dump(2).Success());
+    lease = peer.Acquire(Id(1), layout);
+    ASSERT_TRUE(bool(lease));
+    EXPECT_FALSE(lease.Value().memory);
+    peer.Release(Id(1));
+    EXPECT_EQ(store->ContextStats()["ssd_write_bytes"], 64);
+    ASSERT_TRUE(Load(1).Success());
+}
+
+TEST_F(ContextStoreTest, SharedMlaEvictionReservationExcludesReaders)
+{
+    Context::SharedMetadata owner, peer;
+    std::string id = "lease_" + std::to_string(getpid());
+    ASSERT_TRUE(owner.Setup(id, true, 8, 123).Success());
+    ASSERT_TRUE(peer.Setup(id, false).Success());
+    ASSERT_TRUE(owner.Publish(Id(1), 1, 4, 0).Success());
+    ASSERT_TRUE(owner.Publish(Id(2), 1, 5, 0).Success());
+    ASSERT_TRUE(bool(peer.Acquire(Id(2), 123)));
+    EXPECT_FALSE(owner.ReserveEviction({Id(1), Id(2)}));
+    // Failed reservation is atomic: it must not leave the first entry busy.
+    ASSERT_TRUE(bool(peer.Acquire(Id(1), 123)));
+    peer.Release(Id(1));
+    peer.Release(Id(2));
+    ASSERT_TRUE(owner.ReserveEviction({Id(1), Id(2)}));
+    EXPECT_FALSE(bool(peer.Acquire(Id(1), 123)));
+    ASSERT_TRUE(owner.Publish(Id(1), 2, 0, 6).Success());
+    auto lease = peer.Acquire(Id(1), 123);
+    ASSERT_TRUE(bool(lease));
+    EXPECT_FALSE(lease.Value().memory);
+    EXPECT_EQ(lease.Value().slot, 6);
+    peer.Release(Id(1));
+    owner.Deactivate();
+    EXPECT_FALSE(bool(peer.Acquire(Id(1), 123)));
+}
+
 TEST_F(ContextStoreTest, WritesOnlyOnEvictionAndLoadsSsdBytes)
 {
     Open();

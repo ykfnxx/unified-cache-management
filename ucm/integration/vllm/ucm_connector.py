@@ -1353,7 +1353,7 @@ class UCMWorkerMetadata(KVConnectorWorkerMetadata):
         # TODO: Support PP-aware Dump success aggregation.
         # for mla, blocks can only be dumped by 1 rank, for FAWA, the dump is distributed across ranks
         # for non-mla, blocks should be dumped by all ranks
-        # so for mla, aggregation logic is union, for non-mla, aggregation is intersection
+        # MLA shares one host copy written by rank 0; other models need all ranks.
         if self.is_mla:
             self.dump_succeeded_blocks.update(other.dump_succeeded_blocks)
         else:
@@ -1612,19 +1612,19 @@ class UCMDirectConnector(KVConnectorBase_V1):
         if config.get("store_pipeline") == "ContextStore":
             parallel = self._vllm_config.parallel_config
             if (
-                self.is_mla
-                or parallel.pipeline_parallel_size != 1
+                parallel.pipeline_parallel_size != 1
                 or getattr(parallel, "prefill_context_parallel_size", 1) != 1
                 or getattr(parallel, "decode_context_parallel_size", 1) != 1
             ):
-                raise ValueError("ContextStore requires non-MLA attention and PP=CP=1")
+                raise ValueError("ContextStore requires PP=CP=1")
             config["context_tp_size"] = self.tp_size
             config["context_tp_rank"] = (
                 self.tp_rank % self.tp_size if self._role == KVConnectorRole.WORKER else 0
             )
-            config["share_buffer_enable"] = False
+            config["share_buffer_enable"] = self.is_mla
         config.setdefault("share_buffer_enable", self.is_mla)
-        self._set_default_shm_buffer_capacity(config)
+        if config.get("store_pipeline") != "ContextStore":
+            self._set_default_shm_buffer_capacity(config)
         if "storage_backends" in config:
             backends = [path for path in config["storage_backends"].split(":")]
             config["storage_backends"] = backends

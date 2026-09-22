@@ -45,7 +45,8 @@ public:
     Expected<uint64_t> BeginLoad(const Key& signature, size_t rank, uint64_t timeoutMs);
     Expected<Location> WaitAcquire(const Key& key, uint64_t layout, uint64_t batch);
     void FailLoad(uint64_t batch, const Status& status);
-    Status WaitReaders(uint64_t batch);
+    // With wait=false, Retry means readers are pending before the batch deadline.
+    Status WaitReaders(uint64_t batch, bool wait = true);
     void EndLoad(uint64_t batch, size_t rank);
 
     bool Evictable(const Key& key);

@@ -176,6 +176,7 @@ Status SharedMetadata::Publish(const Key& key, uint8_t copies, size_t memory)
         size_t pos = (start + n) % header_->capacity;
         auto& entry = entries_[pos];
         if (entry.state == 1 && entry.key == key) {
+            const bool changed = entry.copies != copies || entry.memory != memory || entry.busy;
             entry.copies = copies;
             entry.memory = memory;
             entry.busy = false;
@@ -193,7 +194,7 @@ Status SharedMetadata::Publish(const Key& key, uint8_t copies, size_t memory)
                 }
                 entries_[hole] = Entry{};
             }
-            pthread_cond_broadcast(&header_->changed);
+            if (changed) { pthread_cond_broadcast(&header_->changed); }
             pthread_mutex_unlock(&header_->lock);
             return Status::OK();
         }
@@ -202,8 +203,8 @@ Status SharedMetadata::Publish(const Key& key, uint8_t copies, size_t memory)
     }
     if (copies && firstFree != header_->capacity) {
         entries_[firstFree] = Entry{key, 1, copies, memory, 0, false};
+        pthread_cond_broadcast(&header_->changed);
     }
-    pthread_cond_broadcast(&header_->changed);
     pthread_mutex_unlock(&header_->lock);
     return copies && firstFree == header_->capacity ? Status::NoSpace() : Status::OK();
 }
@@ -411,13 +412,21 @@ void SharedMetadata::FailLoad(uint64_t batch, const Status& status)
     pthread_cond_broadcast(&header_->changed);
     pthread_mutex_unlock(&header_->lock);
 }
-Status SharedMetadata::WaitReaders(uint64_t batch)
+Status SharedMetadata::WaitReaders(uint64_t batch, bool wait)
 {
     if (!Lock(&header_->lock, header_->alive)) { return Status::Error("metadata writer failed"); }
     auto* b = FindBatch(batch);
     Status status = Status::OK();
     const auto readers = (UINT64_MAX >> (64 - header_->ranks)) & ~uint64_t(1);
     while (b && header_->alive && !b->failure && (b->done & readers) != readers) {
+        if (!wait) {
+            timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            bool expired = now.tv_sec > b->deadline.tv_sec ||
+                           (now.tv_sec == b->deadline.tv_sec && now.tv_nsec >= b->deadline.tv_nsec);
+            status = expired ? Status::Timeout() : Status::Retry();
+            break;
+        }
         status = WaitChange(*b);
         if (status.Failure()) { break; }
     }
@@ -439,6 +448,12 @@ void SharedMetadata::EndLoad(uint64_t batch, size_t rank)
 {
     if (!batch || !Lock(&header_->lock, header_->alive)) { return; }
     if (auto* b = FindBatch(batch)) { b->done |= uint64_t(1) << rank; }
+    // Only fully completed trailing slots leave the matching scan. Retain their
+    // IDs until reuse, so completion inspection remains valid after EndLoad.
+    const auto all = UINT64_MAX >> (64 - header_->ranks);
+    while (header_->batchUsed && batches_[header_->batchUsed - 1].done == all) {
+        --header_->batchUsed;
+    }
     pthread_cond_broadcast(&header_->changed);
     pthread_mutex_unlock(&header_->lock);
 }

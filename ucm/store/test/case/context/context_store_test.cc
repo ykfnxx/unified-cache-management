@@ -160,6 +160,25 @@ protected:
         return status;
     }
 };
+TEST_F(ContextStoreTest, RejectedSubmitRollsBackReferencesAndRetiredResidentStillLoads)
+{
+    Open();
+    Observe({1});
+    std::array<unsigned char, 64> output{};
+    auto rejected = store->Load({
+        {Id(1),  0, {output.data()}},
+        {Id(1),  0, {output.data()}},
+        {Id(99), 0, {output.data()}}
+    });
+    ASSERT_FALSE(rejected);
+    EXPECT_EQ(rejected.Error(), Status::InvalidParam());
+    ASSERT_TRUE(store->ObserveRequest("1", 2, 2, {}).Success());
+    EXPECT_EQ(store->ContextStats()["topology_nodes"], 0);
+    Observe({2}, 3);
+    ASSERT_TRUE(Dump(2).Success());
+    ASSERT_TRUE(store->ObserveRequest("2", 4, 4, {}).Success());
+    EXPECT_TRUE(Load(2).Success());
+}
 TEST_F(ContextStoreTest, ShardOrderMatchesCacheWithSmallTransferQueue)
 {
     Detail::Dictionary config;
@@ -431,6 +450,60 @@ TEST(ContextBufferTest, ReaderCreatedPayloadIsNotTruncatedByOwner)
     EXPECT_EQ(static_cast<unsigned char*>(owner.Data(0))[0], 83);
     EXPECT_EQ(mismatch.SetupShared(name, 2, 1, 128, false, false), Status::InvalidParam());
     EXPECT_EQ(static_cast<unsigned char*>(owner.Data(0))[0], 83);
+}
+TEST_F(ContextStoreTest, MlaCompletedBatchReleasesSlotsBehindPendingBatch)
+{
+    Detail::Dictionary config;
+    config.Set("unique_id", "release_order_" + std::to_string(getpid()));
+    config.Set<StoreV1*>("store_backend", &backend);
+    config.Set("share_buffer_enable", true);
+    config.SetNumber("context_tp_size", 2);
+    config.SetNumber("block_size", 64);
+    config.SetNumber("shard_size", 64);
+    config.SetNumber("tensor_size", 64);
+    config.SetNumber("context_memory_capacity_bytes", 128);
+    config.SetNumber("waiting_queue_depth", 2);
+    config.SetNumber("timeout_ms", 5000);
+    config.SetNumber("device_id", 0);
+    config.SetNumber("context_tp_rank", 0);
+    store.reset(MakeContextStore());
+    ASSERT_TRUE(store->Setup(config).Success());
+    config.SetNumber("device_id", 1);
+    config.SetNumber("context_tp_rank", 1);
+    std::unique_ptr<StoreV1> reader(MakeContextStore());
+    ASSERT_TRUE(reader->Setup(config).Success());
+    Observe({1, 2, 3});
+    ASSERT_TRUE(Dump(1, 0, 11).Success());
+    ASSERT_TRUE(Dump(2, 0, 22).Success());
+    ASSERT_TRUE(Load(1, 0, 11).Success());
+    ASSERT_TRUE(Load(2, 0, 22).Success());
+    std::array<unsigned char, 64> output{};
+    auto read = [&](unsigned key, unsigned char value) {
+        auto task = reader->Load({
+            {Id(key), 0, {output.data()}}
+        });
+        ASSERT_TRUE(task);
+        ASSERT_TRUE(reader->Wait(task.Value()).Success());
+        for (auto byte : output) { EXPECT_EQ(byte, value); }
+    };
+    read(2, 22);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    Status saved = Status::NoSpace();
+    do {
+        saved = Dump(3, 0, 33);
+        if (saved.Success()) { break; }
+        ASSERT_EQ(saved, Status::NoSpace());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    ASSERT_TRUE(saved.Success()) << saved.ToString();
+    ASSERT_TRUE(Load(3, 0, 33).Success());
+    read(3, 33);  // The small completion queue continues to make progress.
+    read(1, 11);  // The pending batch's slot was never reclaimed early.
+    ASSERT_TRUE(Load(1, 0, 11).Success());
+    // Shutdown must drain a pending completion without waiting for its 5s deadline.
+    auto stopped = std::async(std::launch::async, [&] { store.reset(); });
+    EXPECT_EQ(stopped.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    stopped.get();
 }
 TEST_F(ContextStoreTest, MlaReaderCompletionDoesNotBlockNextLayerH2d)
 {
@@ -912,6 +985,64 @@ TEST(ContextMetadataTest, ProbeChainsSurviveCollisionsAndChurn)
         }
     }
 }
+TEST(ContextMetadataTest, NonblockingCompletionHonorsDeadlineAndFailure)
+{
+    Context::SharedMetadata owner, peer;
+    ASSERT_TRUE(owner.Setup("poll_" + std::to_string(getpid()), true, 7, 123, 2, 4).Success());
+    ASSERT_TRUE(peer.Setup("poll_" + std::to_string(getpid()), false).Success());
+    auto batch = owner.BeginLoad(Id(1), 0, 50);
+    ASSERT_TRUE(batch);
+    EXPECT_EQ(owner.WaitReaders(batch.Value(), false), Status::Retry());
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    EXPECT_EQ(owner.WaitReaders(batch.Value(), false), Status::Timeout());
+    owner.FailLoad(batch.Value(), Status::NoSpace());
+    EXPECT_EQ(owner.WaitReaders(batch.Value(), false), Status::NoSpace());
+    owner.EndLoad(batch.Value(), 0);
+    auto next = owner.BeginLoad(Id(2), 0, 1000);
+    ASSERT_TRUE(next);
+    auto reader = peer.BeginLoad(Id(2), 1, 1000);
+    ASSERT_TRUE(reader);
+    ASSERT_EQ(reader.Value(), next.Value());
+    peer.EndLoad(reader.Value(), 1);
+    EXPECT_TRUE(owner.WaitReaders(next.Value(), false).Success());
+    owner.EndLoad(next.Value(), 0);
+    EXPECT_TRUE(owner.WaitReaders(next.Value(), false).Success());
+    owner.Deactivate();
+    EXPECT_EQ(owner.WaitReaders(next.Value(), false), Status::Error());
+}
+TEST(ContextMetadataTest, CompletedTailReusePreservesPendingBatchOrder)
+{
+    Context::SharedMetadata owner, peer;
+    const auto name = "trim_" + std::to_string(getpid());
+    ASSERT_TRUE(owner.Setup(name, true, 7, 123, 2, 64).Success());
+    ASSERT_TRUE(peer.Setup(name, false).Success());
+    auto pending = owner.BeginLoad(Id(1), 0, 5000);
+    ASSERT_TRUE(pending);
+    std::vector<uint64_t> batches;
+    for (unsigned i = 2; i < 64; ++i) {
+        auto batch = owner.BeginLoad(Id(i), 0, 5000);
+        ASSERT_TRUE(batch);
+        batches.push_back(batch.Value());
+    }
+    for (unsigned i = 2; i < 64; ++i) {
+        auto batch = peer.BeginLoad(Id(i), 1, 5000);
+        ASSERT_TRUE(batch);
+        EXPECT_EQ(batch.Value(), batches[i - 2]);
+        peer.EndLoad(batch.Value(), 1);
+        owner.EndLoad(batch.Value(), 0);
+    }
+    auto newer = owner.BeginLoad(Id(1), 0, 5000);
+    ASSERT_TRUE(newer);
+    EXPECT_NE(newer.Value(), pending.Value());
+    for (auto expected : {pending.Value(), newer.Value()}) {
+        auto batch = peer.BeginLoad(Id(1), 1, 5000);
+        ASSERT_TRUE(batch);
+        EXPECT_EQ(batch.Value(), expected);
+        peer.EndLoad(batch.Value(), 1);
+        EXPECT_TRUE(owner.WaitReaders(expected, false).Success());
+        owner.EndLoad(expected, 0);
+    }
+}
 TEST(ContextMetadataTest, NotificationsFailuresAndBatchReuse)
 {
     Context::SharedMetadata owner, peer;
@@ -930,6 +1061,16 @@ TEST(ContextMetadataTest, NotificationsFailuresAndBatchReuse)
     ASSERT_TRUE(bool(location));
     EXPECT_EQ(location.Value().slot, 4);
     EXPECT_FALSE(owner.ReserveEviction({Id(1)}));
+    peer.Release(Id(1));
+    ASSERT_TRUE(owner.ReserveEviction({Id(1)}));
+    auto busy = std::async(std::launch::async,
+                           [&] { return peer.WaitAcquire(Id(1), 123, reader.Value()); });
+    EXPECT_EQ(busy.wait_for(std::chrono::milliseconds(10)), std::future_status::timeout);
+    // Identical copies/slot still requires notification when clearing busy.
+    ASSERT_TRUE(owner.Publish(Id(1), 1, 4).Success());
+    auto republished = busy.get();
+    ASSERT_TRUE(republished);
+    EXPECT_EQ(republished.Value().slot, 4);
     peer.Release(Id(1));
     peer.EndLoad(reader.Value(), 1);
     EXPECT_TRUE(owner.WaitReaders(writer.Value()).Success());

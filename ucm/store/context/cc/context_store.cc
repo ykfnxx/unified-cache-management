@@ -32,6 +32,7 @@
 #include <numeric>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include "buffer_pool.h"
 #include "context_index.h"
 #include "copy_stream.h"
@@ -261,7 +262,8 @@ private:
     void PrepareLoad(const std::shared_ptr<Job>& job);
     void Complete(const std::shared_ptr<Job>& job, Status status, bool dump,
                   std::chrono::steady_clock::time_point started);
-    Status Evict(std::unique_lock<std::mutex>& lock, const std::set<Key>& protectedKeys);
+    Status Evict(std::unique_lock<std::mutex>& lock,
+                 const std::unordered_set<Key, Detail::BlockIdHasher>& protectedKeys);
     Status Publish(const Key& id, const Entry& entry)
     { return metadata_.Publish(id, entry.ready ? 1 : 0, entry.memory); }
     Key BackendKey(Key key, size_t rank) const
@@ -297,10 +299,12 @@ private:
         }
         return found;
     }
-    void ReleaseContext(const Key& key)
+    bool ReleaseContext(const Key& key)
     {
         auto it = contextReferences_.find(key);
-        if (--it->second == 0) { contextReferences_.erase(it); }
+        if (--it->second != 0) { return false; }
+        contextReferences_.erase(it);
+        return true;
     }
     void Prune(const Key& id)
     {
@@ -470,8 +474,11 @@ void ContextStore::Complete(const std::shared_ptr<Job>& job, Status status, bool
         ++stats_[dump ? "dump_tasks" : "load_tasks"];
         if (status.Failure()) { ++stats_["failed_tasks"]; }
         if (!reader_) {
-            for (const auto& shard : job->desc) { ReleaseContext(shard.owner); }
-            for (auto it = job->desc.rbegin(); it != job->desc.rend(); ++it) { Prune(it->owner); }
+            std::vector<Key> unreferenced;
+            for (const auto& shard : job->desc) {
+                if (ReleaseContext(shard.owner)) { unreferenced.push_back(shard.owner); }
+            }
+            for (auto it = unreferenced.rbegin(); it != unreferenced.rend(); ++it) { Prune(*it); }
         }
     }
     job->result.set_value(status);
@@ -484,16 +491,29 @@ Status ContextStore::StartReadTransfer()
         completion_.thread = std::thread([this] {
             for (;;) {
                 std::shared_ptr<Job> job;
+                Status result = Status::OK();
                 {
                     std::unique_lock<std::mutex> lock(completion_.mutex);
                     completion_.wake.wait(
                         lock, [&] { return completion_.stop || !completion_.jobs.empty(); });
                     if (completion_.jobs.empty()) { return; }
-                    job = std::move(completion_.jobs.front());
-                    completion_.jobs.pop_front();
-                    completion_.wake.notify_all();
+                    // Pending jobs stay in the bounded queue. A slow reader must
+                    // not prevent a later completed batch from releasing its slots.
+                    for (auto it = completion_.jobs.begin(); it != completion_.jobs.end(); ++it) {
+                        result = metadata_.WaitReaders((*it)->batch, false);
+                        if (result == Status::Retry()) { continue; }
+                        job = std::move(*it);
+                        completion_.jobs.erase(it);
+                        completion_.wake.notify_all();
+                        break;
+                    }
+                    if (!job) {
+                        // Reader notifications use a process-shared condition variable;
+                        // bound polling here and also wake immediately on new submissions.
+                        completion_.wake.wait_for(lock, std::chrono::microseconds(100));
+                        continue;
+                    }
                 }
-                auto result = metadata_.WaitReaders(job->batch);
                 UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_load_mla_completion_wait_ms"),
                                          Milliseconds(Clock::now() - job->h2dDone));
                 if (result.Failure()) {
@@ -654,12 +674,17 @@ Expected<size_t> ContextStore::Submit(Queue& queue, Detail::TaskDesc task)
     if (queue.jobs.size() >= queueDepth_) { return reject(Status::NoSpace()); }
     if (!reader_) {
         std::lock_guard<std::mutex> guard(mutex_);
-        for (const auto& shard : job->desc) {
-            if (!index_.Contains(shard.owner)) {
+        for (size_t i = 0; i < job->desc.size(); ++i) {
+            const auto& key = job->desc[i].owner;
+            auto [ref, inserted] = contextReferences_.try_emplace(key, 0);
+            // A positive context reference already guarantees this topology node exists.
+            if (inserted && !index_.Contains(key)) {
+                contextReferences_.erase(ref);
+                for (size_t j = 0; j < i; ++j) { ReleaseContext(job->desc[j].owner); }
                 return reject(Status::InvalidParam("ObserveRequest required before transfer"));
             }
+            ++ref->second;
         }
-        for (const auto& shard : job->desc) { ++contextReferences_[shard.owner]; }
     }
     size_t id;
     {
@@ -671,7 +696,8 @@ Expected<size_t> ContextStore::Submit(Queue& queue, Detail::TaskDesc task)
     queue.wake.notify_one();
     return id;
 }
-Status ContextStore::Evict(std::unique_lock<std::mutex>& lock, const std::set<Key>& protectedKeys)
+Status ContextStore::Evict(std::unique_lock<std::mutex>& lock,
+                           const std::unordered_set<Key, Detail::BlockIdHasher>& protectedKeys)
 {
     auto decisionStart = std::chrono::steady_clock::now();
     auto victim =
@@ -767,13 +793,16 @@ void ContextStore::PrepareLoad(const std::shared_ptr<Job>& job)
         for (size_t i = slice; i < job->desc.size(); i += localRankSize_) { order.push_back(i); }
     }
     std::vector<std::pair<Key, size_t>> rows;
-    std::set<Key> protectedKeys;
+    rows.reserve(job->desc.size());
+    std::unordered_set<Key, Detail::BlockIdHasher> protectedKeys;
+    protectedKeys.reserve(job->desc.size());
     for (auto i : order) {
         if (protectedKeys.insert(job->desc[i].owner).second) {
             rows.emplace_back(job->desc[i].owner, i);
         }
     }
     std::unordered_map<Key, ReadItem, Detail::BlockIdHasher> prepared;
+    prepared.reserve(rows.size());
     size_t nextRow = 0;
     auto publish = [&](ReadItem item) {
         prepared.emplace(item.key, std::move(item));
@@ -789,7 +818,7 @@ void ContextStore::PrepareLoad(const std::shared_ptr<Job>& job)
         }
     };
     auto status = Status::OK();
-    std::map<Key, bool> backendReady;
+    std::unordered_map<Key, bool, Detail::BlockIdHasher> backendReady;
     struct Pending {
         ReadItem item;
         bool allocated;
@@ -862,6 +891,8 @@ void ContextStore::PrepareLoad(const std::shared_ptr<Job>& job)
             // a second scan of entries_; remaining keys are checked in one backend call.
             lock.unlock();
             std::vector<Key> backendKeys;
+            backendKeys.reserve(rows.end() - row);
+            backendReady.reserve(rows.end() - row);
             for (auto next = row; next != rows.end(); ++next) {
                 backendKeys.push_back(BackendKey(next->first, tpRank_));
             }
@@ -969,7 +1000,7 @@ Status ContextStore::DumpTask(CopyStream& stream, Detail::TaskDesc& task)
     };
     std::map<Key, Held> held;
     std::vector<size_t> copied;
-    std::set<Key> protectedKeys;
+    std::unordered_set<Key, Detail::BlockIdHasher> protectedKeys;
     for (const auto& shard : task) { protectedKeys.insert(shard.owner); }
     auto status = Status::OK();
     std::unique_lock<std::mutex> lock(mutex_);

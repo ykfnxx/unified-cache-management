@@ -33,6 +33,7 @@
 #include "buffer_pool.h"
 #include "context_index.h"
 #include "copy_stream.h"
+#include "metrics_api.h"
 #include "shared_metadata.h"
 #include "trans/cuda/gdr/gdr_config.h"
 #include "ucmstore_v1.h"
@@ -512,6 +513,12 @@ Status ContextStore::Evict(std::unique_lock<std::mutex>& lock, const std::set<Ke
         index_.Remove(k);
         ++stats_[drop ? "drop_blocks" : "dump_blocks"];
         ++stats_["evicted_blocks"];
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_evict_blocks_total"), 1.0);
+        if (drop) {
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_drop_blocks_total"), 1.0);
+        } else {
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_dump_blocks_total"), 1.0);
+        }
         entries_.erase(k);
     }
     for (auto it = victim.blocks.rbegin(); it != victim.blocks.rend(); ++it) { Prune(*it); }

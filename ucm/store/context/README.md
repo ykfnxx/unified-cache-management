@@ -104,4 +104,27 @@ python -m pip install -v -e . --no-build-isolation
 | `drop_blocks` / `dump_blocks` / `evicted_blocks` | 策略 Drop / Dump / 总淘汰次数 |
 | `decision_ns` / `queue_wait_ns` / `failed_tasks` / `no_space` | 策略耗时、队列等待、失败任务、无可用淘汰空间 |
 
-以上均不是累计 unique block 计数，也不是已接入 Prometheus 的指标。GQA 汇总后端次数会包含各 rank；MLA 后端计数只来自 rank 0，H2D 字节数仍需按各 rank 求和。
+上述 ContextStats 项均不是累计 unique block 计数。GQA 汇总后端次数会包含各 rank；MLA 后端计数只来自 rank 0，H2D 字节数仍需按各 rank 求和。
+
+
+### Prometheus 淘汰计数
+
+以下三个 Counter 默认通过 UCM metrics 接入 vLLM 的 `/metrics`：
+
+| 指标 | 口径 |
+| --- | --- |
+| `ucm:context_evict_blocks_total` | 成功释放 Memory 的逻辑 block 次数，等于 Dump + Drop |
+| `ucm:context_dump_blocks_total` | 淘汰策略选择 Dump 并成功释放 Memory 的 block 次数；包括后端已有记录而跳过写入的情况，不包含设备写入 Memory |
+| `ucm:context_drop_blocks_total` | 淘汰策略选择 Drop 并成功释放 Memory 的 block 次数 |
+
+按完整 block 计数，不按 layer/shard 计数，不对历史 block ID 去重。失败且未释放的 victim 不计数。GQA 各 rank 分别计数；MLA 只有 rank 0 执行淘汰，不会因其他 rank 读取而重复计数。
+
+默认启用 metrics。若使用自定义 `metrics_config_path` 或内联 `metrics_config`，需将这三个指标加入其 `counter` 列表，并启用 `consumers.vllm_connector: true`。定义见 [metrics 配置](../../../examples/metrics/metrics_configs.yaml)。修改后需重建 ContextStore 并更新 Python 配置。
+
+例如查询最近 5 分钟的总淘汰次数：
+
+```promql
+sum(increase(ucm:context_evict_blocks_total[5m]))
+```
+
+多实验共用 Prometheus 时，加上实际的模型、engine 等标签过滤；按 rank 查看可用 `sum by (worker_rank) (...)`。原生采集接口返回区间增量，由现有 exporter 累加为 Prometheus Counter。

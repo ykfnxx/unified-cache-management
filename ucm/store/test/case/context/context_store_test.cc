@@ -29,6 +29,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "context_index.h"
+#include "metrics_api.h"
 #include "shared_metadata.h"
 #include "ucmstore_v1.h"
 extern "C" UC::StoreV1* MakeContextStore();
@@ -149,6 +150,46 @@ protected:
         return status;
     }
 };
+TEST_F(ContextStoreTest, MetricsCountCompletedBlockEvictions)
+{
+    Metrics::SetUp();
+    for (const auto* name :
+         {"context_evict_blocks_total", "context_dump_blocks_total", "context_drop_blocks_total"}) {
+        Metrics::CreateStats(name, "counter");
+    }
+    auto check = [](double evict, double dump, double drop) {
+        auto counters = std::get<0>(Metrics::GetAllStatsAndClear());
+        EXPECT_EQ(counters["context_evict_blocks_total"], evict);
+        EXPECT_EQ(counters["context_dump_blocks_total"], dump);
+        EXPECT_EQ(counters["context_drop_blocks_total"], drop);
+        EXPECT_EQ(evict, dump + drop);
+    };
+    Open(1, 5, 2);
+    Observe({1}, 1);
+    ASSERT_TRUE(Dump(1, 0).Success());
+    ASSERT_TRUE(Dump(1, 1).Success());
+    check(0, 0, 0);  // Device saves are not policy Dump evictions.
+    Observe({2}, 2);
+    backend.failDump = true;
+    EXPECT_TRUE(Dump(2).Failure());
+    check(0, 0, 0);  // A failed backend write retains the victim.
+    backend.failDump = false;
+    ASSERT_TRUE(Dump(2, 0).Success());
+    ASSERT_TRUE(Dump(2, 1).Success());
+    check(1, 1, 0);  // Both layers form one logical block.
+    ASSERT_TRUE(Load(1).Success());
+    check(1, 1, 0);  // Admission can also trigger an eviction.
+    Observe({3}, 3);
+    ASSERT_TRUE(Dump(3, 0).Success());
+    ASSERT_TRUE(Dump(3, 1).Success());
+    EXPECT_EQ(store->ContextStats()["backend_dump_skipped_blocks"], 1);
+    check(1, 1, 0);  // Backend-already-present still counts as policy Dump.
+    Observe({4}, 20);
+    ASSERT_TRUE(Dump(4).Success());
+    check(1, 0, 1);
+    check(0, 0, 0);  // Collection drains deltas, without counting them twice.
+}
+
 TEST_F(ContextStoreTest, SharedMlaLeasePreventsEviction)
 {
     Open(1, -1, 1, true);

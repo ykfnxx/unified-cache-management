@@ -18,6 +18,14 @@ consumers:
 
 # Counter metrics configuration
 counter:
+  # -- ContextStore: completed logical-block evictions (not unique IDs) -----
+  - name: "context_evict_blocks_total"
+    documentation: "Logical blocks successfully evicted from ContextStore Memory (Dump plus Drop)"
+  - name: "context_dump_blocks_total"
+    documentation: "Logical blocks evicted by ContextStore Dump policy, including backend-already-present skips; excludes device-to-Memory saves"
+  - name: "context_drop_blocks_total"
+    documentation: "Logical blocks evicted by ContextStore Drop policy without backend writes"
+
   # -- Pipeline Cache stage: lookup hit/miss breakdown ----------------------
   # Hit counters let Prometheus compute hit rate without losing precision:
   #   rate(ucm:cache_lookup_hit_blocks_total[5m])

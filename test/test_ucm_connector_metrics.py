@@ -360,6 +360,7 @@ def _install_stubs():
     _install_module(
         "ucm.integration.vllm.device",
         create_device=lambda *args, **kwargs: None,
+        get_current_device_id=lambda: 0,
     )
     _install_module("ucm.logger", init_logger=lambda name: _Logger())
     _install_module("ucm.shared.metrics", ucmmetrics=fake_ucmmetrics)
@@ -2959,3 +2960,23 @@ def test_pipeline_dashboard_contains_only_performance_panels_with_chinese_hints(
         any("\u4e00" <= char <= "\u9fff" for char in panel["description"])
         for panel in all_panels
     )
+
+
+def test_context_eviction_counters_export_per_worker():
+    _reset_fakes()
+    prom = UCMPromMetrics(
+        _vllm_config(DEFAULT_METRICS_CONFIG),
+        _metric_types(),
+        ["model_name", "engine"],
+        {0: ["model-a", "0"]},
+    )
+    values = {
+        "context_evict_blocks_total": 7.0,
+        "context_dump_blocks_total": 5.0,
+        "context_drop_blocks_total": 2.0,
+    }
+    prom.observe({"counters_by_rank": {"0": values}}, engine_idx=0)
+    for name, value in values.items():
+        counter = FakeCounter.created["ucm:" + name]
+        assert counter.labelnames == ["model_name", "engine", "worker_rank"]
+        assert counter.children[("model-a", "0", "0")].increments == [value]

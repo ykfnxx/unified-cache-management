@@ -13,6 +13,18 @@ from typing import Any
 # fmt: off
 _COUNTER_METRICS = [
     (
+        "context_evict_blocks_total",
+        "Logical blocks successfully evicted from ContextStore Memory (Dump plus Drop)",
+    ),
+    (
+        "context_dump_blocks_total",
+        "Logical blocks evicted by ContextStore Dump policy, including backend-already-present skips; excludes device-to-Memory saves",
+    ),
+    (
+        "context_drop_blocks_total",
+        "Logical blocks evicted by ContextStore Drop policy without backend writes",
+    ),
+    (
         "cache_lookup_hit_blocks_total",
         "Number of lookup hits served by the Cache stage (no descent to backend)",
     ),

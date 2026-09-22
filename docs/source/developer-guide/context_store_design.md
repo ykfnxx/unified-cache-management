@@ -20,7 +20,7 @@ Load 优先固定已驻留 Memory。后端命中时按需淘汰并分配一个�
 
 GQA 每 rank 独立策略和 Memory；canonical hash 用于前缀关系，后端 hash 的高 8 字节与 TP rank 做 XOR，区分同一逻辑 block 的 rank 副本。scheduler 逐 rank 合并 Memory 和后端命中后取交集。各进程使用一致的 TP 和 DP 命名配置。
 
-MLA worker 在 Setup 阶段完成共享 payload 映射和设备注册。reader 先启动时等待 owner 元数据就绪（上限 timeout_ms），注册完成后才接受 Load，初始化开销不计入首层 Load。各 TP worker 并行初始化。
+MLA worker 在 Setup 阶段完成共享 payload 映射和设备注册。任意 rank 可先创建共享 payload，文件锁仅保护容量检查和空间预分配，各 rank 独立完成设备注册后才接受 Load，不等待 owner 元数据；初始化开销不计入首层 Load。
 
 MLA 只由 rank 0 Dump、淘汰和回源入驻，其他 rank 通过进程共享条件变量等待 READY 或失败，持有读引用完成 H2D。在途批次按 block/shard 描述及重复提交顺序匹配，使用有界共享表记录参与/完成 rank 和首个失败码。rank 0 本地同步后立即完成 Load/Wait，独立后台线程等待 reader 完成后释放 block 引用，H2D 线程继续处理后续层；完成队列有界，容量复用 waiting_queue_depth，保留 task 引用到该批次成功或失败；读者的实际 DMA 始终由自身读引用保护。正常完成的批次可复用；超时且所有已加入参与者结束的批次可回收。支持最多 64 个 MLA TP rank，不维护长期请求状态。
 

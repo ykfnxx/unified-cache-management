@@ -143,7 +143,7 @@ Load 分为 prepare 和 H2D 两个线程，使用 CacheStore 的 SPSC 队列及�
 
 节点、驻留项与引用计数使用哈希查询，淘汰顺序仍由原有有序索引决定。传输条目数不超过 Memory slot 数时直接通过容量上限检查；只有可能超容量时才构造唯一 block 集合，避免逐层重复去重。策略索引合并入驻/淘汰产生的祖先增量，在选择 victim 或删除拓扑节点前刷新；ObserveRequest 保留逐 block 的访问顺序和时间，但同一 segment 的冷排序索引只刷新一次。
 
-共享元数据删除时修复哈希探测链，不保留 tombstone。MLA READY、失败和退出会通知等待者；所有 worker 在初始化阶段完成共享 Memory 映射和设备注册，首次 Load 不再承担该开销。reader 先启动时等待 owner 发布初始化完成标记，等待上限为 `timeout_ms`；各 TP worker 需并行启动。
+共享元数据删除时修复哈希探测链，不保留 tombstone。MLA READY、失败和退出会通知等待者；所有 worker 在初始化阶段完成共享 Memory 映射和设备注册，首次 Load 不再承担该开销。任意 rank 均可先创建共享 payload；文件锁仅保护容量检查和空间预分配，各 rank 独立注册，不等待 owner 元数据。
 
 以下 Histogram 默认导出为 `ucm:<名称>`，单位毫秒。使用自定义 metrics 配置时需同步添加定义：
 

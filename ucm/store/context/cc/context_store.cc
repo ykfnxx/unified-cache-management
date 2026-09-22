@@ -416,13 +416,6 @@ Status ContextStore::Setup(const Detail::Dictionary& c)
     status = metadata_.Setup(name, !reader_, 2 * memoryCount_ + 1, layout_,
                              sharedMla_ ? tpSize_ : 1, sharedMla_ && tpSize_ > 1 ? queueDepth_ : 0);
     if (status.Failure()) { return status; }
-    if (reader_) {
-        status = metadata_.WaitReady(layout_, timeoutMs_);
-        if (status.Failure()) { return status; }
-        // Register the entire shared pool before accepting any timed Load batch.
-        status = memory_.MapShared();
-        if (status.Failure()) { return status; }
-    }
     status = StartReadTransfer();
     if (status.Failure()) { return status; }
     status = Start(load_, false);

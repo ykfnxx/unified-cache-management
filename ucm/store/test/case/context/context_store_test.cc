@@ -32,6 +32,7 @@
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include "buffer_pool.h"
 #include "context_index.h"
 #include "metrics_api.h"
 #include "shared_metadata.h"
@@ -378,14 +379,12 @@ TEST_F(ContextStoreTest, MlaReaderRegistersBeforeFirstLoad)
     config.SetNumber("device_id", 1);
     config.SetNumber("context_tp_rank", 1);
     std::unique_ptr<StoreV1> reader(MakeContextStore());
-    auto initializing = std::async(std::launch::async, [&] { return reader->Setup(config); });
-    EXPECT_EQ(initializing.wait_for(std::chrono::milliseconds(30)), std::future_status::timeout);
+    ASSERT_TRUE(reader->Setup(config).Success());  // No owner exists yet.
     auto ownerConfig = config;
     ownerConfig.SetNumber("device_id", 0);
     ownerConfig.SetNumber("context_tp_rank", 0);
     store.reset(MakeContextStore());
     ASSERT_TRUE(store->Setup(ownerConfig).Success());
-    ASSERT_TRUE(initializing.get().Success());
     // Existing mappings survive unlink. A lazy first-Load mapping would now fail.
     ASSERT_EQ(shm_unlink(("/ucm_context_" + id + "_mla_memory").c_str()), 0);
     Observe({1});
@@ -403,13 +402,35 @@ TEST_F(ContextStoreTest, MlaReaderRegistersBeforeFirstLoad)
     EXPECT_TRUE(store->Wait(ownerTask.Value()).Success());
     EXPECT_EQ(ownerOut, readerOut);
 }
-TEST(ContextMetadataTest, InitializationWaitTimesOutWithoutOwner)
+TEST(ContextBufferTest, RanksCanInitializeSharedPayloadConcurrently)
 {
-    Context::SharedMetadata reader;
-    ASSERT_TRUE(reader.Setup("absent_owner_" + std::to_string(getpid()), false).Success());
-    auto result = reader.WaitReady(123, 20);
-    EXPECT_EQ(result, Status::Timeout());
-    EXPECT_NE(result.ToString().find("initialization"), std::string::npos);
+    std::array<Context::BufferPool, 4> pools;
+    std::array<std::future<Status>, 4> initialized;
+    const auto name = "parallel_payload_" + std::to_string(getpid());
+    for (size_t rank = 0; rank < pools.size(); ++rank) {
+        initialized[rank] = std::async(std::launch::async, [&, rank] {
+            return pools[rank].SetupShared(name, rank, 8, 4096, rank == 0, false);
+        });
+    }
+    for (auto& result : initialized) { ASSERT_TRUE(result.get().Success()); }
+    std::memset(pools[0].Data(7), 97, 4096);
+    for (size_t rank = 0; rank < pools.size(); ++rank) {
+        EXPECT_EQ(static_cast<unsigned char*>(pools[rank].Data(7))[4095], 97);
+        EXPECT_EQ(pools[rank].FreeCount(), rank == 0 ? 8 : 0);
+    }
+}
+TEST(ContextBufferTest, ReaderCreatedPayloadIsNotTruncatedByOwner)
+{
+    Context::BufferPool reader, owner, mismatch;
+    auto name = "reader_payload_" + std::to_string(getpid());
+    ASSERT_TRUE(reader.SetupShared(name, 1, 1, 64, false, false).Success());
+    EXPECT_EQ(reader.FreeCount(), 0);
+    std::memset(reader.Data(0), 83, 64);
+    ASSERT_TRUE(owner.SetupShared(name, 0, 1, 64, true, false).Success());
+    EXPECT_EQ(owner.FreeCount(), 1);
+    EXPECT_EQ(static_cast<unsigned char*>(owner.Data(0))[0], 83);
+    EXPECT_EQ(mismatch.SetupShared(name, 2, 1, 128, false, false), Status::InvalidParam());
+    EXPECT_EQ(static_cast<unsigned char*>(owner.Data(0))[0], 83);
 }
 TEST_F(ContextStoreTest, MlaReaderCompletionDoesNotBlockNextLayerH2d)
 {

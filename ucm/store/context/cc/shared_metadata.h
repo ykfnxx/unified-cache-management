@@ -35,6 +35,7 @@ public:
     ~SharedMetadata();
     Status Setup(const std::string& name, bool owner, size_t capacity = 0, uint64_t layout = 0,
                  size_t ranks = 1, size_t batches = 0);
+    Status WaitReady(uint64_t layout, uint64_t timeoutMs);
     struct Location {
         size_t slot;
     };

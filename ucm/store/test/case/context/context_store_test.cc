@@ -28,6 +28,7 @@
 #include <mutex>
 #include <numeric>
 #include <random>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -158,6 +159,40 @@ protected:
         return status;
     }
 };
+TEST_F(ContextStoreTest, ShardOrderMatchesCacheWithSmallTransferQueue)
+{
+    Detail::Dictionary config;
+    config.Set("unique_id", "shard_order_" + std::to_string(getpid()));
+    config.Set<StoreV1*>("store_backend", &backend);
+    config.SetNumber("device_id", 1);
+    config.SetNumber("local_rank_size", 2);
+    config.SetNumber("running_queue_depth", 2);
+    config.SetNumber("cache_stream_number", 1);
+    config.SetNumber("block_size", 384);
+    config.SetNumber("shard_size", 64);
+    config.SetNumber("tensor_size", 64);
+    config.SetNumber("context_memory_capacity_bytes", 384);
+    store.reset(MakeContextStore());
+    ASSERT_TRUE(store->Setup(config).Success());
+    Observe({1});
+    for (size_t layer = 0; layer < 6; ++layer) { ASSERT_TRUE(Dump(1, layer, layer + 1).Success()); }
+    // CPU-simu + one stream permits observing the submission order via one destination.
+    // Cache rank/device 1 with local size 2 submits rows 1,3,5,0,2,4.
+    std::array<unsigned char, 64> output{};
+    for (unsigned repeat = 0; repeat < 20; ++repeat) {
+        Detail::TaskDesc desc;
+        for (size_t layer = 0; layer < 6; ++layer) {
+            desc.push_back({Id(1), layer, {output.data()}});
+        }
+        auto task = store->Load(std::move(desc));
+        ASSERT_TRUE(task);
+        ASSERT_TRUE(store->Wait(task.Value()).Success());
+        EXPECT_EQ(output[0], 5);
+    }
+    // Multiple non-contiguous shard items must release exactly one block reference.
+    Observe({2});
+    EXPECT_TRUE(Dump(2).Success());
+}
 TEST_F(ContextStoreTest, BatchedReadmissionRollsBackAndRetries)
 {
     Open(70, -1, 2);
@@ -186,7 +221,12 @@ TEST_F(ContextStoreTest, BatchedReadmissionRollsBackAndRetries)
     EXPECT_TRUE(store->Wait(partial.Value()).Failure());
     EXPECT_EQ(store->ContextStats()["memory_blocks"], 32);
     EXPECT_EQ(backend.loads, 2);
-    for (size_t i = 0; i < 32; ++i) { EXPECT_EQ(output[i][0], i + 1); }
+    size_t completed = 0;
+    for (size_t slice = 0; slice < 8; ++slice) {
+        for (size_t i = slice; i < output.size(); i += 8) {
+            EXPECT_EQ(output[i][0], completed++ < 32 ? i + 1 : 0);
+        }
+    }
     backend.beforeLoad = nullptr;
     backend.failLoad = false;
     backend.loads = backend.lookups = 0;
@@ -322,6 +362,55 @@ TEST_F(ContextStoreTest, OversizedLoadFailsBeforeEviction)
     EXPECT_EQ(store->ContextStats()["evicted_blocks"], 0);
     EXPECT_TRUE(Found(1));
 }
+TEST_F(ContextStoreTest, MlaReaderRegistersBeforeFirstLoad)
+{
+    const auto id = "early_reader_" + std::to_string(getpid());
+    Detail::Dictionary config;
+    config.Set("unique_id", id);
+    config.Set<StoreV1*>("store_backend", &backend);
+    config.Set("share_buffer_enable", true);
+    config.SetNumber("context_tp_size", 2);
+    config.SetNumber("block_size", 64);
+    config.SetNumber("shard_size", 64);
+    config.SetNumber("tensor_size", 64);
+    config.SetNumber("context_memory_capacity_bytes", 64);
+    config.SetNumber("timeout_ms", 2000);
+    config.SetNumber("device_id", 1);
+    config.SetNumber("context_tp_rank", 1);
+    std::unique_ptr<StoreV1> reader(MakeContextStore());
+    auto initializing = std::async(std::launch::async, [&] { return reader->Setup(config); });
+    EXPECT_EQ(initializing.wait_for(std::chrono::milliseconds(30)), std::future_status::timeout);
+    auto ownerConfig = config;
+    ownerConfig.SetNumber("device_id", 0);
+    ownerConfig.SetNumber("context_tp_rank", 0);
+    store.reset(MakeContextStore());
+    ASSERT_TRUE(store->Setup(ownerConfig).Success());
+    ASSERT_TRUE(initializing.get().Success());
+    // Existing mappings survive unlink. A lazy first-Load mapping would now fail.
+    ASSERT_EQ(shm_unlink(("/ucm_context_" + id + "_mla_memory").c_str()), 0);
+    Observe({1});
+    ASSERT_TRUE(Dump(1).Success());
+    std::array<unsigned char, 64> ownerOut{}, readerOut{};
+    auto ownerTask = store->Load({
+        Detail::Shard{Id(1), 0, {ownerOut.data()}}
+    });
+    auto readerTask = reader->Load({
+        Detail::Shard{Id(1), 0, {readerOut.data()}}
+    });
+    ASSERT_TRUE(bool(ownerTask));
+    ASSERT_TRUE(bool(readerTask));
+    EXPECT_TRUE(reader->Wait(readerTask.Value()).Success());
+    EXPECT_TRUE(store->Wait(ownerTask.Value()).Success());
+    EXPECT_EQ(ownerOut, readerOut);
+}
+TEST(ContextMetadataTest, InitializationWaitTimesOutWithoutOwner)
+{
+    Context::SharedMetadata reader;
+    ASSERT_TRUE(reader.Setup("absent_owner_" + std::to_string(getpid()), false).Success());
+    auto result = reader.WaitReady(123, 20);
+    EXPECT_EQ(result, Status::Timeout());
+    EXPECT_NE(result.ToString().find("initialization"), std::string::npos);
+}
 TEST_F(ContextStoreTest, MlaReaderCompletionDoesNotBlockNextLayerH2d)
 {
     Metrics::SetUp();
@@ -367,6 +456,14 @@ TEST_F(ContextStoreTest, MlaReaderCompletionDoesNotBlockNextLayerH2d)
                                       it->second.bucketCounts.end(), uint64_t(0));
         }
         std::this_thread::yield();
+    }
+    for (auto task : ownerTasks) {
+        auto ready = store->Check(task);
+        while (ready && !ready.Value() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+            ready = store->Check(task);
+        }
+        EXPECT_TRUE(ready && ready.Value());
     }
     // Join readers even on a regression, before asserting the overlap result.
     for (size_t layer = 0; layer < 2; ++layer) {

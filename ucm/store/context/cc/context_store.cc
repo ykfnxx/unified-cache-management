@@ -37,6 +37,7 @@
 #include "copy_stream.h"
 #include "metrics_api.h"
 #include "shared_metadata.h"
+#include "template/spsc_ring_queue.h"
 #include "trans/cuda/gdr/gdr_config.h"
 #include "ucmstore_v1.h"
 
@@ -55,8 +56,8 @@ class ContextStore final : public StoreV1 {
         Detail::TaskDesc desc;
         std::promise<Status> result;
         uint64_t batch = 0;
+        bool localComplete = false;
         std::vector<Key> held;
-        size_t memoryShards = 0, backendShards = 0;
         Clock::time_point h2dDone;
         std::atomic<int32_t> transferFailure{0};
         std::chrono::steady_clock::time_point prepareStarted;
@@ -73,15 +74,14 @@ class ContextStore final : public StoreV1 {
         std::shared_ptr<Job> job;
         Key key{};
         size_t slot = none;
-        std::vector<size_t> rows;
+        size_t row = 0;
+        bool ownsReference = false;
         bool backend = false, terminal = false;
         Status status = Status::OK();
     };
     struct ReadQueue {
-        std::mutex mutex;
-        std::condition_variable readable, writable;
-        std::deque<ReadItem> items;
-        bool stop = false;
+        SpscRingQueue<ReadItem> items;
+        std::atomic_bool stop{false};
         std::thread thread;
     } readQueue_;
     std::mutex mutex_;
@@ -105,6 +105,7 @@ class ContextStore final : public StoreV1 {
     size_t nextTask_ = 0;
     int deviceId_ = -1;
     size_t blockBytes_ = 0, shardBytes_ = 0, shardCount_ = 0, memoryCount_ = 0;
+    size_t runningDepth_ = 524288, localRankSize_ = 8;
     size_t streams_ = 4, queueDepth_ = 8192, limit_ = 64, timeoutMs_ = 30000;
     std::vector<size_t> tensorSizes_;
     double alpha_ = .01;
@@ -121,12 +122,10 @@ public:
     {
         metadata_.Deactivate();
         Stop(load_);
-        {
-            std::lock_guard<std::mutex> lock(readQueue_.mutex);
-            readQueue_.stop = true;
+        if (readQueue_.thread.joinable()) {
+            if (!readQueue_.stop.load()) { readQueue_.items.Push(ReadItem{}); }
+            readQueue_.thread.join();
         }
-        readQueue_.readable.notify_all();
-        if (readQueue_.thread.joinable()) { readQueue_.thread.join(); }
         Stop(completion_);
         Stop(dump_);
         metadata_.Close();
@@ -190,7 +189,16 @@ public:
             result.wait_for(std::chrono::milliseconds(timeoutMs_)) != std::future_status::ready;
         // A deadline does not revoke device access to the caller's tensor addresses.
         auto status = result.get();
-        return timeout ? Status::Timeout() : status;
+        if (status.Failure()) {
+            UC_ERROR("Context load/dump wait failed: rank={}, task={}, status={}", tpRank_, task,
+                     status);
+            return status;
+        }
+        return timeout ? Status{Status::Timeout().Underlying(),
+                                fmt::format(
+                                    "context task wait timeout: rank={}, task={}, timeout_ms={}",
+                                    tpRank_, task, timeoutMs_)}
+                       : status;
     }
     Status ObserveRequest(const std::string& id, uint64_t observation, uint64_t time,
                           const std::vector<Key>& blocks) override
@@ -368,14 +376,17 @@ Status ContextStore::Setup(const Detail::Dictionary& c)
     c.GetNumber("context_retention_ns", retention_);
     c.GetNumber("context_max_eviction_blocks", limit_);
     c.GetNumber("cache_stream_number", streams_);
+    c.GetNumber("running_queue_depth", runningDepth_);
+    c.GetNumber("local_rank_size", localRankSize_);
     c.GetNumber("waiting_queue_depth", queueDepth_);
     c.GetNumber("timeout_ms", timeoutMs_);
     c.Get("use_gdr", useGdr_);
     c.Get("cache_io_aggregation", aggregation_);
     c.Get("cache_sdma_direct", sdma_);
     if (!memoryCount_ || !std::isfinite(alpha_) || alpha_ <= 0 || alpha_ > 1 || !limit_ ||
-        !streams_ || streams_ > 32 || !queueDepth_ || !timeoutMs_ || retention_ < -1 ||
-        (aggregation_ && sdma_) || (useGdr_ && (aggregation_ || sdma_))) {
+        !streams_ || streams_ > 32 || runningDepth_ < 2 || !localRankSize_ || !queueDepth_ ||
+        !timeoutMs_ || retention_ < -1 || (aggregation_ && sdma_) ||
+        (useGdr_ && (aggregation_ || sdma_))) {
         return Status::InvalidParam("invalid context capacity/policy/transfer configuration");
     }
     std::vector<uintptr_t> addresses;
@@ -405,6 +416,13 @@ Status ContextStore::Setup(const Detail::Dictionary& c)
     status = metadata_.Setup(name, !reader_, 2 * memoryCount_ + 1, layout_,
                              sharedMla_ ? tpSize_ : 1, sharedMla_ && tpSize_ > 1 ? queueDepth_ : 0);
     if (status.Failure()) { return status; }
+    if (reader_) {
+        status = metadata_.WaitReady(layout_, timeoutMs_);
+        if (status.Failure()) { return status; }
+        // Register the entire shared pool before accepting any timed Load batch.
+        status = memory_.MapShared();
+        if (status.Failure()) { return status; }
+    }
     status = StartReadTransfer();
     if (status.Failure()) { return status; }
     status = Start(load_, false);
@@ -465,15 +483,10 @@ void ContextStore::Complete(const std::shared_ptr<Job>& job, Status status, bool
     }
     job->result.set_value(status);
 }
-void ContextStore::PushRead(ReadItem item)
-{
-    std::unique_lock<std::mutex> lock(readQueue_.mutex);
-    readQueue_.writable.wait(lock, [&] { return readQueue_.items.size() < queueDepth_; });
-    readQueue_.items.push_back(std::move(item));
-    readQueue_.readable.notify_one();
-}
+void ContextStore::PushRead(ReadItem item) { readQueue_.items.Push(std::move(item)); }
 Status ContextStore::StartReadTransfer()
 {
+    readQueue_.items.Setup(runningDepth_);
     if (sharedMla_ && tpSize_ > 1 && !reader_) {
         completion_.thread = std::thread([this] {
             for (;;) {
@@ -490,6 +503,10 @@ Status ContextStore::StartReadTransfer()
                 auto result = metadata_.WaitReaders(job->batch);
                 UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_load_mla_completion_wait_ms"),
                                          Milliseconds(Clock::now() - job->h2dDone));
+                if (result.Failure()) {
+                    UC_ERROR("Context MLA deferred release failed: rank={}, batch={}, status={}",
+                             tpRank_, job->batch, result);
+                }
                 metadata_.FailLoad(job->batch, result);
                 FinishRead(job, result);
             }
@@ -503,43 +520,38 @@ Status ContextStore::StartReadTransfer()
                       : sdma_      ? stream.SetupSdmaDirect(deviceId_, useGdr_)
                                    : stream.Setup(deviceId_, streams_, useGdr_);
         start.set_value(status);
-        if (status.Failure()) { return; }
+        if (status.Failure()) {
+            readQueue_.stop.store(true);
+            return;
+        }
         std::vector<Key> held;
         size_t memoryShards = 0, backendShards = 0;
         Status result = Status::OK();
-        for (;;) {
-            ReadItem item;
-            {
-                std::unique_lock<std::mutex> lock(readQueue_.mutex);
-                readQueue_.readable.wait(
-                    lock, [&] { return readQueue_.stop || !readQueue_.items.empty(); });
-                if (readQueue_.items.empty()) { return; }
-                item = std::move(readQueue_.items.front());
-                readQueue_.items.pop_front();
-                readQueue_.writable.notify_one();
+        readQueue_.items.ConsumerLoop(readQueue_.stop, [&](ReadItem&& item) {
+            if (!item.job) {
+                readQueue_.stop.store(true);
+                return;
             }
             auto& job = item.job;
             if (!item.terminal) {
-                bool first = held.empty();
-                for (auto row : item.rows) {
-                    if (result.Failure()) { break; }
-                    auto& shard = job->desc[row];
+                bool first = memoryShards + backendShards == 0;
+                if (result.Success()) {
+                    auto& shard = job->desc[item.row];
                     auto* host = static_cast<char*>(memory_.CopyAddress(item.slot)) +
                                  shard.index * shardBytes_;
                     result = stream.HostToDeviceAsync(host, shard.addrs.data(), tensorSizes_);
                     if (first && result.Success()) {
                         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_load_first_h2d_ms"),
                                                  Milliseconds(Clock::now() - job->submitted));
-                        first = false;
                     }
                 }
                 if (result.Failure()) {
                     job->transferFailure.store(result.Underlying());
                     if (job->batch) { metadata_.FailLoad(job->batch, result); }
                 }
-                (item.backend ? backendShards : memoryShards) += item.rows.size();
-                held.push_back(item.key);
-                continue;
+                ++(item.backend ? backendShards : memoryShards);
+                if (item.ownsReference) { held.push_back(item.key); }
+                return;
             }
             // A failed prepare still sends a terminal marker: drain and release all earlier work.
             if (result.Success()) { result = item.status; }
@@ -549,11 +561,19 @@ Status ContextStore::StartReadTransfer()
                                      Milliseconds(Clock::now() - syncStart));
             if (synced.Failure()) { result = synced; }
             job->held = std::move(held);
-            job->memoryShards = memoryShards;
-            job->backendShards = backendShards;
+            if (result.Success()) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                const auto payload =
+                    std::accumulate(tensorSizes_.begin(), tensorSizes_.end(), size_t(0));
+                stats_["h2d_bytes"] += payload * job->desc.size();
+                stats_["backend_h2d_shards"] += backendShards;
+                stats_["memory_load_shards"] += memoryShards;
+            }
             if (job->batch) { metadata_.FailLoad(job->batch, result); }
             if (job->batch && !reader_ && result.Success()) {
                 job->h2dDone = Clock::now();
+                job->localComplete = true;
+                Complete(job, result, false, job->prepareStarted);
                 // Protect slots until readers finish, without blocking the next layer's H2D.
                 std::unique_lock<std::mutex> lock(completion_.mutex);
                 completion_.wake.wait(lock, [&] { return completion_.jobs.size() < queueDepth_; });
@@ -565,7 +585,7 @@ Status ContextStore::StartReadTransfer()
             held.clear();
             memoryShards = backendShards = 0;
             result = Status::OK();
-        }
+        });
     });
     return ready.get();
 }
@@ -573,12 +593,6 @@ void ContextStore::FinishRead(const std::shared_ptr<Job>& job, Status status)
 {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (status.Success()) {
-            size_t payload = std::accumulate(tensorSizes_.begin(), tensorSizes_.end(), size_t(0));
-            stats_["h2d_bytes"] += payload * job->desc.size();
-            stats_["backend_h2d_shards"] += job->backendShards;
-            stats_["memory_load_shards"] += job->memoryShards;
-        }
         for (const auto& key : job->held) {
             if (reader_) {
                 metadata_.Release(key);
@@ -588,7 +602,7 @@ void ContextStore::FinishRead(const std::shared_ptr<Job>& job, Status status)
         }
     }
     if (job->batch) { metadata_.EndLoad(job->batch, tpRank_); }
-    Complete(job, status, false, job->prepareStarted);
+    if (!job->localComplete) { Complete(job, status, false, job->prepareStarted); }
 }
 Expected<size_t> ContextStore::Submit(Queue& queue, Detail::TaskDesc task)
 {
@@ -753,15 +767,36 @@ void ContextStore::PrepareLoad(const std::shared_ptr<Job>& job)
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_load_prepare_queue_wait_ms"),
                              Milliseconds(job->prepareStarted - job->submitted));
     double mlaWait = 0;
-    std::map<Key, std::vector<size_t>> rows;
-    std::set<Key> protectedKeys;
-    for (size_t i = 0; i < job->desc.size(); ++i) {
-        rows[job->desc[i].owner].push_back(i);
-        protectedKeys.insert(job->desc[i].owner);
+    std::vector<size_t> order;
+    order.reserve(job->desc.size());
+    for (size_t r = 0; r < localRankSize_; ++r) {
+        size_t slice = (size_t(deviceId_) + r) % localRankSize_;
+        for (size_t i = slice; i < job->desc.size(); i += localRankSize_) { order.push_back(i); }
     }
+    std::vector<std::pair<Key, size_t>> rows;
+    std::set<Key> protectedKeys;
+    for (auto i : order) {
+        if (protectedKeys.insert(job->desc[i].owner).second) {
+            rows.emplace_back(job->desc[i].owner, i);
+        }
+    }
+    std::unordered_map<Key, ReadItem, Detail::BlockIdHasher> prepared;
+    size_t nextRow = 0;
+    auto publish = [&](ReadItem item) {
+        prepared.emplace(item.key, std::move(item));
+        while (nextRow < order.size()) {
+            auto row = order[nextRow];
+            auto found = prepared.find(job->desc[row].owner);
+            if (found == prepared.end()) { break; }
+            auto shard = found->second;
+            shard.row = row;
+            found->second.ownsReference = false;
+            PushRead(std::move(shard));
+            ++nextRow;
+        }
+    };
     auto status = Status::OK();
     std::map<Key, bool> backendReady;
-    if (reader_) { status = memory_.MapShared(); }
     struct Pending {
         ReadItem item;
         bool allocated;
@@ -801,7 +836,7 @@ void ContextStore::PrepareLoad(const std::shared_ptr<Job>& job)
                 }
             }
             if (result.Success()) {
-                PushRead(std::move(p.item));
+                publish(std::move(p.item));
             } else if (status.Success()) {
                 status = result;
             }
@@ -824,7 +859,7 @@ void ContextStore::PrepareLoad(const std::shared_ptr<Job>& job)
                 status = location.Error();
                 break;
             }
-            PushRead(ReadItem{job, key, location.Value().slot, std::move(requested)});
+            publish(ReadItem{job, key, location.Value().slot, requested, true});
             continue;
         }
         std::unique_lock<std::mutex> lock(mutex_);
@@ -890,7 +925,7 @@ void ContextStore::PrepareLoad(const std::shared_ptr<Job>& job)
                 }
             }
             pending.push_back({
-                ReadItem{job, key, e.memory, std::move(requested), true},
+                ReadItem{job, key, e.memory, requested, true, true},
                 allocate,
                 fetch.size() - before
             });
@@ -906,11 +941,21 @@ void ContextStore::PrepareLoad(const std::shared_ptr<Job>& job)
             ++it->second.references;
             auto slot = it->second.memory;
             lock.unlock();
-            PushRead(ReadItem{job, key, slot, std::move(requested)});
+            publish(ReadItem{job, key, slot, requested, true});
         }
     }
     // Even a later preparation error must complete and release earlier reservations.
     flush();
+    for (auto& [key, item] : prepared) {
+        if (!item.ownsReference) { continue; }
+        // A preceding failed block may have prevented this ready block from submitting.
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (reader_) {
+            metadata_.Release(key);
+        } else {
+            --entries_.at(key).references;
+        }
+    }
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_load_prepare_duration_ms"),
                              Milliseconds(Clock::now() - job->prepareStarted));
     if (reader_) {

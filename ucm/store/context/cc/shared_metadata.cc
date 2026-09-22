@@ -23,6 +23,7 @@
  * */
 #include "shared_metadata.h"
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
@@ -31,6 +32,7 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 
 namespace UC::Context {
@@ -140,18 +142,37 @@ Status SharedMetadata::OpenWatcher()
         return Status::Error("watcher mmap failed");
     }
     header_ = static_cast<Header*>(mapping_);
-    if (header_->ready.load(std::memory_order_acquire) != magic ||
-        header_->capacity > (bytes_ - sizeof(Header)) / sizeof(Entry) ||
+    const auto ready = header_->ready.load(std::memory_order_acquire);
+    if (ready != magic || header_->capacity > (bytes_ - sizeof(Header)) / sizeof(Entry) ||
         header_->batchCapacity >
             (bytes_ - sizeof(Header) - header_->capacity * sizeof(Entry)) / sizeof(Batch)) {
         munmap(mapping_, bytes_);
         mapping_ = nullptr;
         header_ = nullptr;
-        return Status::InvalidParam("incompatible context metadata layout");
+        return ready == 0 ? Status::NotFound()
+                          : Status::InvalidParam("incompatible context metadata layout");
     }
     entries_ = reinterpret_cast<Entry*>(header_ + 1);
     batches_ = reinterpret_cast<Batch*>(entries_ + header_->capacity);
     return Status::OK();
+}
+Status SharedMetadata::WaitReady(uint64_t layout, uint64_t timeoutMs)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    for (;;) {
+        auto status = OpenWatcher();
+        if (status.Success()) {
+            return header_->layout == layout
+                       ? Status::OK()
+                       : Status::InvalidParam("context MLA initialization layout mismatch");
+        }
+        if (status != Status::NotFound()) { return status; }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return Status{Status::Timeout().Underlying(),
+                          "context initialization waiting for owner metadata"};
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
 }
 static bool Lock(pthread_mutex_t* lock, bool& alive)
 {
@@ -394,6 +415,12 @@ Expected<SharedMetadata::Location> SharedMetadata::WaitAcquire(const Key& key, u
         status = WaitChange(*b);
         if (status.Failure()) { break; }
     }
+    if (status == Status::Timeout() && b) {
+        status =
+            Status{status.Underlying(),
+                   fmt::format("context WaitAcquire timeout: batch={}, joined={:#x}, done={:#x}",
+                               batch, b->joined, b->done)};
+    }
     pthread_mutex_unlock(&header_->lock);
     return status.Success() ? Expected<Location>(Location{location}) : Expected<Location>(status);
 }
@@ -418,6 +445,12 @@ Status SharedMetadata::WaitReaders(uint64_t batch)
         status = Status::Error("context owner stopped or batch missing");
     } else if (b->failure) {
         status = Status{b->failure, "context peer load failed"};
+    }
+    if (status == Status::Timeout() && b) {
+        status = Status{status.Underlying(),
+                        fmt::format("context WaitReaders timeout: batch={}, joined={:#x}, "
+                                    "done={:#x}, expected_readers={:#x}",
+                                    batch, b->joined, b->done, readers)};
     }
     pthread_mutex_unlock(&header_->lock);
     return status;

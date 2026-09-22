@@ -20,11 +20,13 @@ Load 优先固定已驻留 Memory。后端命中时按需淘汰并分配一个�
 
 GQA 每 rank 独立策略和 Memory；canonical hash 用于前缀关系，后端 hash 的高 8 字节与 TP rank 做 XOR，区分同一逻辑 block 的 rank 副本。scheduler 逐 rank 合并 Memory 和后端命中后取交集。各进程使用一致的 TP 和 DP 命名配置。
 
-MLA 只由 rank 0 Dump、淘汰和回源入驻，其他 rank 通过进程共享条件变量等待 READY 或失败，持有读引用完成 H2D。在途批次按 block/shard 描述及重复提交顺序匹配，使用有界共享表记录参与/完成 rank 和首个失败码。rank 0 本地同步后由独立完成线程等待 reader 完成，H2D 线程继续处理后续层；完成队列有界，容量复用 waiting_queue_depth，保留 task 引用到该批次成功或失败；读者的实际 DMA 始终由自身读引用保护。正常完成的批次可复用；超时且所有已加入参与者结束的批次可回收。支持最多 64 个 MLA TP rank，不维护长期请求状态。
+MLA worker 在 Setup 阶段完成共享 payload 映射和设备注册。reader 先启动时等待 owner 元数据就绪（上限 timeout_ms），注册完成后才接受 Load，初始化开销不计入首层 Load。各 TP worker 并行初始化。
+
+MLA 只由 rank 0 Dump、淘汰和回源入驻，其他 rank 通过进程共享条件变量等待 READY 或失败，持有读引用完成 H2D。在途批次按 block/shard 描述及重复提交顺序匹配，使用有界共享表记录参与/完成 rank 和首个失败码。rank 0 本地同步后立即完成 Load/Wait，独立后台线程等待 reader 完成后释放 block 引用，H2D 线程继续处理后续层；完成队列有界，容量复用 waiting_queue_depth，保留 task 引用到该批次成功或失败；读者的实际 DMA 始终由自身读引用保护。正常完成的批次可复用；超时且所有已加入参与者结束的批次可回收。支持最多 64 个 MLA TP rank，不维护长期请求状态。
 
 节点、驻留项、引用计数使用哈希查询；策略排序保持原有有序结构。索引将入驻/淘汰的祖先增量合并，在 Select 和实际删除拓扑节点前从深到浅刷新，保证策略查询看到精确计数。ObserveRequest 不跳过新的访问时间，但同一 segment 的冷排序索引只刷新一次。
 
-Dump 保留一个消费队列。Load 使用 prepare 和 H2D 两个线程；有界队列逐 block 移交 slot 引用及本次 shard 下标，传输与后续准备重叠。失败仍投递任务结束标记，传输线程同步所有已提交 DMA 后完成任务、释放引用。Load 在改变容量前检查不同 block 数不超过 Memory slot 数；条目数已不超过 slot 数时无需重复构造去重集合。不实现滑动窗口。
+Dump 保留一个消费队列。Load 使用 prepare 和 H2D 两个线程；复用 CacheStore SPSC 队列及消费循环，逐 shard 移交 slot 地址；按 device_id 和 local_rank_size 错开提交顺序，每个 block 仅持有一次引用，传输与后续准备重叠。失败仍投递任务结束标记，传输线程同步所有已提交 DMA 后完成本地任务；MLA owner 的 block 引用延迟到 reader 结束才释放。Load 在改变容量前检查不同 block 数不超过 Memory slot 数；条目数已不超过 slot 数时无需重复构造去重集合。不实现滑动窗口。
 
 首次 Memory miss 时批量查询剩余 block，全命中不做额外预扫描或后端查询，并按最多 32 blocks 合并 Load/Wait 与描述分配；部分准备失败仍处理之前已预留的 block，后端失败释放新槽位并保留原有 shard 状态。
 

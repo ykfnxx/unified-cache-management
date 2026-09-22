@@ -615,11 +615,11 @@ def test_dsa_shared_three_components_and_mtp_shard_native_readback():
     watcher.Stack(
         "Context", str(library), {"unique_id": name, "share_buffer_enable": True}
     )
-    # A reader can initialize before its owner; it allocates no payload.
+    # Worker initialization finishes with the shared payload already registered.
     reader = module.PipelineStore()
-    reader.Stack("Context", str(library), dict(config, device_id=1, context_tp_rank=1))
     owner = module.PipelineStore()
     owner.Stack("Context", str(library), dict(config, device_id=0, context_tp_rank=0))
+    reader.Stack("Context", str(library), dict(config, device_id=1, context_tp_rank=1))
     owner.ObserveRequest("r", 1, 1, ids(1))
     reader.ObserveRequest("r", 1, 1, ids(1))
     for layer in range(3):
@@ -807,11 +807,11 @@ def test_mla_shared_payload_across_processes_and_owner_exit():
     process.start()
     child.close()
     try:
-        assert parent.poll(30) and parent.recv() == "ready"
         owner = module.PipelineStore()
         owner.Stack(
             "Context", str(library), dict(config, device_id=0, context_tp_rank=0)
         )
+        assert parent.poll(30) and parent.recv() == "ready"
         source = np.arange(64, dtype=np.uint8)
         for key in (1, 2):
             owner.ObserveRequest(str(key), key, key, ids(key))
@@ -958,7 +958,7 @@ def test_mla_late_reader_protection_and_owner_failure(partial):
         while not owner.ContextStats().get("backend_load_blocks", 0):
             assert time.monotonic() < deadline
             time.sleep(0.001)
-        assert not owner.Check(owner_task)
+        owner.Wait(owner_task)  # Local H2D completes before the reader submits.
         owner.ObserveRequest("3", 3, 3, ids(3))
         with pytest.raises(RuntimeError, match="-50009"):
             owner.Wait(owner.Dump(ids(3), index, address, 0))
@@ -966,7 +966,13 @@ def test_mla_late_reader_protection_and_owner_failure(partial):
             ids(1), index, np.array([[out_reader.ctypes.data]], dtype=np.uint64)
         )
         reader.Wait(reader_task)
-        owner.Wait(owner_task)
         np.testing.assert_array_equal(out_owner, out_reader)
-        owner.Wait(owner.Dump(ids(3), index, address, 0))
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                owner.Wait(owner.Dump(ids(3), index, address, 0))
+                break
+            except RuntimeError as error:
+                assert "-50009" in str(error) and time.monotonic() < deadline
+                time.sleep(0.001)
         assert owner.ContextStats()["memory_blocks"] == 1

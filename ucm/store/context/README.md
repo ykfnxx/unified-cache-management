@@ -36,6 +36,8 @@ ucm_connectors:
       context_max_eviction_blocks: 64
       cache_stream_number: 4
       waiting_queue_depth: 8192
+      running_queue_depth: 524288
+      local_rank_size: 8
       timeout_ms: 30000
       use_gdr: false
       cache_sdma_direct: false
@@ -51,7 +53,9 @@ ucm_connectors:
 | `context_retention_ns` | 淘汰候选空闲时间严格大于此值才 Drop；`null` / `-1` 表示始终 Dump，默认 -1 |
 | `context_max_eviction_blocks` | 一次策略选择最多淘汰的 block 数，默认 64 |
 | `cache_stream_number` | 传输 stream 数，默认 4，范围 1–32 |
-| `waiting_queue_depth` | 每个传输等待队列深度，默认 8192 |
+| `waiting_queue_depth` | 任务等待队列、MLA 批次表和后台释放队列容量，默认 8192 |
+| `running_queue_depth` | 与 Cache 相同的 SPSC H2D 队列容量，默认 524288，至少 2，实际可容纳容量减 1 个条目 |
+| `local_rank_size` | 与 Cache 相同的 shard 错序分片数，默认 8；按 device_id 偏移 |
 | `timeout_ms` | Wait 超时阈值，默认 30000；返回前仍排空传输，保证地址生命周期；MLA 批次从首次提交起也使用此截止时间，超时会通知参与者 |
 
 retention 只控制淘汰时的 Drop/Dump，不是驻留 TTL；没有后台到期删除或结束时刷写。SDMA direct 与 IO aggregation 互斥，二者不能与 GDR 同时启用，须使用相应设备运行时。
@@ -61,8 +65,8 @@ retention 只控制淘汰时的 Drop/Dump，不是驻留 TTL；没有后台到�
 支持单机 GQA/MLA TP，PP=CP=1，direct 或 layerwise。MLA 包括普通 DSA KV 的多个 tensor component 以及已注册的 MTP 层；不包含 sparse C8、CP 或 hybrid attention 适配。
 
 - GQA：各 rank 独立 Memory 和策略；策略使用原始逻辑 hash，后端 ID 区分 TP rank。scheduler 对每个 rank 的 `Memory 或 Fake` 可用性取交集。
-- MLA：rank 0 独占 Dump、淘汰和 Fake 回源入驻；其余 rank 通过共享条件变量等待 READY 或失败，再持有跨进程读引用执行 H2D。rank 0 通过独立、有界的完成队列等待 reader，保留整个 Load 的本地引用；H2D 线程可继续提交后续层；晚到的 reader 不会错过已经发布的数据。
-- MLA 的一次 Load 必须由整个 TP 组共同提交，最多支持 64 ranks。相同 block/shard 描述的重复 Load 按各 rank 的提交顺序匹配，设备地址不参与匹配。直接调用时先在所有 rank 提交，再等待结果；不要在提交 reader 前同步等待 owner。批次表有界，容量复用 `waiting_queue_depth`。
+- MLA：rank 0 独占 Dump、淘汰和 Fake 回源入驻；其余 rank 通过共享条件变量等待 READY 或失败，再持有跨进程读引用执行 H2D。rank 0 本地 H2D 完成即返回，通过独立、有界的后台队列等待 reader，保留整个 Load 的 block 引用；H2D 线程可继续提交后续层；晚到的 reader 不会错过已经发布的数据。
+- MLA 的一次 Load 必须由整个 TP 组共同提交，最多支持 64 ranks。相同 block/shard 描述的重复 Load 按各 rank 的提交顺序匹配，设备地址不参与匹配。每个 rank 的 Wait 只等待本地 H2D，owner 可先返回；所有 rank 仍须在批次期限内提交并完成。批次表有界，容量复用 `waiting_queue_depth`。
 - 全部进程使用相同 DP 组 unique_id 和共享内存命名空间。connector 自动设置 `context_tp_size`、`context_tp_rank`、`share_buffer_enable`、设备和 KV 布局参数。
 
 配置 8 GiB Memory 时，TP=4 GQA 占 32 GiB payload，MLA 占 8 GiB payload；另有 Fake 和策略元数据。MLA 的 `/dev/shm` 必须容纳共享 Memory。Fake 只在共享内存中存元数据。
@@ -133,13 +137,13 @@ sum(increase(ucm:context_evict_blocks_total[5m]))
 
 ### 读流水线与耗时
 
-Load 分为 prepare 和 H2D 两个线程，中间使用有界 block 队列。每准备好一个 block 就提交本次需要的 shard，不再等待整个任务完成入驻。全部 DMA 排空后才释放引用、完成任务；准备中途失败也会处理已经提交的拷贝。MLA owner 使用额外的完成线程等待 reader，不占用 H2D 线程，完成队列容量复用 `waiting_queue_depth`。
+Load 分为 prepare 和 H2D 两个线程，使用 CacheStore 的 SPSC 队列及消费循环，逐 shard 提交。shard 顺序与 Cache 一致：按 device_id 和 local_rank_size 错开，不按 block key 排序。准备阶段仍按 block 管理入驻，按指定 shard 顺序将就绪地址交给传输线程。准备中途失败也会排空已经提交的 DMA。每个 rank 的 Load/Wait 在本地 H2D 同步后完成；MLA owner 的后台线程等待其他 rank 结束后释放 block 引用，等待期间禁止淘汰，后台失败单独记录日志，不改写已返回的本地成功。
 
 首次 Memory miss 时批量 Lookup 剩余 block，每最多 32 个 block 合并一次后端 Load/Wait，并预留 shard 描述容量；全 Memory 命中不做额外预扫描或后端 Lookup，直接进入传输队列。只有整个 block 就绪才发布 READY，失败保留原有 shard 并释放新分配槽位。
 
 节点、驻留项与引用计数使用哈希查询，淘汰顺序仍由原有有序索引决定。传输条目数不超过 Memory slot 数时直接通过容量上限检查；只有可能超容量时才构造唯一 block 集合，避免逐层重复去重。策略索引合并入驻/淘汰产生的祖先增量，在选择 victim 或删除拓扑节点前刷新；ObserveRequest 保留逐 block 的访问顺序和时间，但同一 segment 的冷排序索引只刷新一次。
 
-共享元数据删除时修复哈希探测链，不保留 tombstone。MLA READY、失败和退出会通知等待者；首次 reader 映射、注册共享 Memory 仍有冷启动开销。
+共享元数据删除时修复哈希探测链，不保留 tombstone。MLA READY、失败和退出会通知等待者；所有 worker 在初始化阶段完成共享 Memory 映射和设备注册，首次 Load 不再承担该开销。reader 先启动时等待 owner 发布初始化完成标记，等待上限为 `timeout_ms`；各 TP worker 需并行启动。
 
 以下 Histogram 默认导出为 `ucm:<名称>`，单位毫秒。使用自定义 metrics 配置时需同步添加定义：
 
@@ -149,7 +153,7 @@ Load 分为 prepare 和 H2D 两个线程，中间使用有界 block 队列。每
 | `context_load_prepare_queue_wait_ms` | 提交到 prepare 开始 |
 | `context_load_prepare_duration_ms` | prepare 开始到全部 block 交给传输队列；包含查找、淘汰、入驻、MLA READY 等待及队列反压 |
 | `context_load_mla_ready_wait_ms` | reader 一个 Load 内等待 READY 的累计时间 |
-| `context_load_mla_completion_wait_ms` | rank 0 本地 H2D 同步到完成线程确认 reader 结束的时间，含完成队列等待 |
+| `context_load_mla_completion_wait_ms` | rank 0 本地 H2D 同步到完成线程确认 reader 结束的时间，含后台队列等待，不代表本地 Load/Wait 耗时 |
 | `context_load_first_h2d_ms` | 提交到首次 H2D 成功提交；没有提交 H2D 的失败任务不产生此样本 |
 | `context_load_h2d_sync_ms` | 最终 stream 同步等待，不等于完整 DMA 用时 |
 

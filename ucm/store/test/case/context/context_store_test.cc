@@ -23,10 +23,13 @@
  * */
 #include <array>
 #include <cstring>
+#include <future>
 #include <gtest/gtest.h>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 #include "context_index.h"
 #include "metrics_api.h"
@@ -49,11 +52,14 @@ public:
     std::mutex mutex;
     std::map<std::pair<Key, size_t>, std::array<unsigned char, 64>> data;
     bool failDump = false, failLoad = false;
+    size_t lookups = 0, loads = 0;
+    std::function<void()> beforeLoad;
     Status Setup(const Detail::Dictionary&) override { return Status::OK(); }
     std::string Readme() const override { return "TestBackend"; }
     Expected<std::vector<uint8_t>> Lookup(const Key* keys, size_t n) override
     {
         std::lock_guard<std::mutex> lock(mutex);
+        ++lookups;
         std::vector<uint8_t> result;
         for (size_t i = 0; i < n; ++i) { result.push_back(data.count({keys[i], 0})); }
         return result;
@@ -71,7 +77,9 @@ public:
     }
     Expected<size_t> Load(Detail::TaskDesc desc) override
     {
+        if (beforeLoad) { beforeLoad(); }
         std::lock_guard<std::mutex> lock(mutex);
+        ++loads;
         if (failLoad) { return Status::Error("injected load failure"); }
         for (const auto& shard : desc) {
             auto it = data.find({shard.owner, shard.index});
@@ -150,6 +158,50 @@ protected:
         return status;
     }
 };
+TEST_F(ContextStoreTest, BatchedReadmissionRollsBackAndRetries)
+{
+    Open(70, -1, 2);
+    std::vector<Key> path;
+    std::vector<std::array<unsigned char, 64>> output(70);
+    Detail::TaskDesc desc;
+    for (unsigned i = 1; i <= 70; ++i) {
+        path.push_back(Id(i));
+        for (size_t shard = 0; shard < 2; ++shard) { backend.data[{Id(i), shard}].fill(i); }
+        desc.push_back({Id(i), 0, {output[i - 1].data()}});
+    }
+    ASSERT_TRUE(store->ObserveRequest("batch", 1, 1, path).Success());
+    backend.failLoad = true;
+    auto failed = store->Load(desc);
+    ASSERT_TRUE(failed);
+    EXPECT_TRUE(store->Wait(failed.Value()).Failure());
+    EXPECT_EQ(store->ContextStats()["memory_blocks"], 0);
+    EXPECT_EQ(backend.loads, 1);
+    backend.failLoad = false;
+    backend.loads = backend.lookups = 0;
+    backend.beforeLoad = [&] {
+        if (backend.loads == 1) { backend.failLoad = true; }
+    };
+    auto partial = store->Load(desc);
+    ASSERT_TRUE(partial);
+    EXPECT_TRUE(store->Wait(partial.Value()).Failure());
+    EXPECT_EQ(store->ContextStats()["memory_blocks"], 32);
+    EXPECT_EQ(backend.loads, 2);
+    for (size_t i = 0; i < 32; ++i) { EXPECT_EQ(output[i][0], i + 1); }
+    backend.beforeLoad = nullptr;
+    backend.failLoad = false;
+    backend.loads = backend.lookups = 0;
+    auto task = store->Load(desc);
+    ASSERT_TRUE(task);
+    ASSERT_TRUE(store->Wait(task.Value()).Success());
+    EXPECT_EQ(backend.lookups, 1);
+    EXPECT_EQ(backend.loads, 2);
+    EXPECT_EQ(store->ContextStats()["backend_load_shards"], 140);
+    for (size_t i = 0; i < output.size(); ++i) {
+        EXPECT_TRUE(std::all_of(output[i].begin(), output[i].end(),
+                                [i](unsigned char b) { return b == i + 1; }));
+    }
+}
+
 TEST_F(ContextStoreTest, MetricsCountCompletedBlockEvictions)
 {
     Metrics::SetUp();
@@ -188,6 +240,145 @@ TEST_F(ContextStoreTest, MetricsCountCompletedBlockEvictions)
     ASSERT_TRUE(Dump(4).Success());
     check(1, 0, 1);
     check(0, 0, 0);  // Collection drains deltas, without counting them twice.
+}
+
+TEST_F(ContextStoreTest, H2dStartsBeforeLaterBlockAdmissionCompletes)
+{
+    Metrics::SetUp();
+    Metrics::CreateStats("context_load_first_h2d_ms", "histogram", {1, 1000});
+    Open(2);
+    Observe({1});
+    ASSERT_TRUE(Dump(1).Success());
+    Observe({2});
+    backend.data[{Id(2), 0}].fill(83);
+    std::promise<void> entered, unblock;
+    auto enteredFuture = entered.get_future();
+    auto released = unblock.get_future().share();
+    backend.beforeLoad = [&] {
+        entered.set_value();
+        released.wait();
+    };
+    std::array<unsigned char, 64> first{}, second{};
+    auto task = store->Load(Detail::TaskDesc{
+        Detail::Shard{Id(1), 0, {first.data()} },
+        Detail::Shard{Id(2), 0, {second.data()}}
+    });
+    ASSERT_TRUE(bool(task));
+    auto preparing = enteredFuture.wait_for(std::chrono::seconds(2));
+    bool submitted = false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (preparing == std::future_status::ready && !submitted &&
+           std::chrono::steady_clock::now() < deadline) {
+        auto histograms = std::get<2>(Metrics::GetAllStatsAndClear());
+        auto it = histograms.find("context_load_first_h2d_ms");
+        submitted = it != histograms.end() &&
+                    std::accumulate(it->second.bucketCounts.begin(), it->second.bucketCounts.end(),
+                                    uint64_t(0)) > 0;
+        if (!submitted) { std::this_thread::yield(); }
+    }
+    // Always unblock before assertions so a regression cannot hang store destruction.
+    unblock.set_value();
+    EXPECT_EQ(preparing, std::future_status::ready);
+    EXPECT_TRUE(submitted);
+    ASSERT_TRUE(store->Wait(task.Value()).Success());
+    for (auto value : first) { EXPECT_EQ(value, 71); }
+    for (auto value : second) { EXPECT_EQ(value, 83); }
+}
+TEST_F(ContextStoreTest, PartialPrepareFailureDrainsEarlierCopies)
+{
+    Open(2);
+    Observe({1});
+    ASSERT_TRUE(Dump(1).Success());
+    Observe({2});
+    std::array<unsigned char, 64> first{}, second{};
+    auto task = store->Load(Detail::TaskDesc{
+        Detail::Shard{Id(1), 0, {first.data()} },
+        Detail::Shard{Id(2), 0, {second.data()}}
+    });
+    ASSERT_TRUE(bool(task));
+    EXPECT_EQ(store->Wait(task.Value()), Status::NotFound());
+    for (auto value : first) { EXPECT_EQ(value, 71); }
+    for (auto value : second) { EXPECT_EQ(value, 0); }
+    // No leaked local read references after the failed task.
+    ASSERT_TRUE(Dump(2).Success());
+    Observe({3});
+    ASSERT_TRUE(Dump(3).Success());
+}
+TEST_F(ContextStoreTest, OversizedLoadFailsBeforeEviction)
+{
+    Open(1);
+    Observe({1});
+    ASSERT_TRUE(Dump(1).Success());
+    Observe({2});
+    std::array<unsigned char, 64> first{}, second{};
+    auto task = store->Load(Detail::TaskDesc{
+        Detail::Shard{Id(1), 0, {first.data()} },
+        Detail::Shard{Id(2), 0, {second.data()}}
+    });
+    ASSERT_FALSE(bool(task));
+    EXPECT_EQ(task.Error(), Status::NoSpace());
+    EXPECT_NE(task.Error().ToString().find("load requires 2 blocks; Memory holds 1"),
+              std::string::npos);
+    EXPECT_EQ(store->ContextStats()["evicted_blocks"], 0);
+    EXPECT_TRUE(Found(1));
+}
+TEST_F(ContextStoreTest, MlaReaderCompletionDoesNotBlockNextLayerH2d)
+{
+    Metrics::SetUp();
+    Metrics::CreateStats("context_load_h2d_sync_ms", "histogram", {1000000});
+    Detail::Dictionary config;
+    config.Set("unique_id", "layers_" + std::to_string(getpid()));
+    config.Set<StoreV1*>("store_backend", &backend);
+    config.Set("share_buffer_enable", true);
+    config.SetNumber("context_tp_size", 2);
+    config.SetNumber("block_size", 128);
+    config.SetNumber("shard_size", 64);
+    config.SetNumber("tensor_size", 64);
+    config.SetNumber("context_memory_capacity_bytes", 128);
+    config.SetNumber("timeout_ms", 5000);
+    config.SetNumber("device_id", 0);
+    config.SetNumber("context_tp_rank", 0);
+    store.reset(MakeContextStore());
+    ASSERT_TRUE(store->Setup(config).Success());
+    config.SetNumber("device_id", 1);
+    config.SetNumber("context_tp_rank", 1);
+    std::unique_ptr<StoreV1> reader(MakeContextStore());
+    ASSERT_TRUE(reader->Setup(config).Success());
+    Observe({1});
+    ASSERT_TRUE(Dump(1, 0, 11).Success());
+    ASSERT_TRUE(Dump(1, 1, 22).Success());
+    Metrics::GetAllStatsAndClear();
+    std::array<std::array<unsigned char, 64>, 2> ownerOut{}, readerOut{};
+    std::vector<size_t> ownerTasks;
+    for (size_t layer = 0; layer < 2; ++layer) {
+        auto task = store->Load({
+            Detail::Shard{Id(1), layer, {ownerOut[layer].data()}}
+        });
+        ASSERT_TRUE(task);
+        ownerTasks.push_back(task.Value());
+    }
+    uint64_t synced = 0;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (synced < 2 && std::chrono::steady_clock::now() < deadline) {
+        auto histograms = std::get<2>(Metrics::GetAllStatsAndClear());
+        auto it = histograms.find("context_load_h2d_sync_ms");
+        if (it != histograms.end()) {
+            synced += std::accumulate(it->second.bucketCounts.begin(),
+                                      it->second.bucketCounts.end(), uint64_t(0));
+        }
+        std::this_thread::yield();
+    }
+    // Join readers even on a regression, before asserting the overlap result.
+    for (size_t layer = 0; layer < 2; ++layer) {
+        auto task = reader->Load({
+            Detail::Shard{Id(1), layer, {readerOut[layer].data()}}
+        });
+        ASSERT_TRUE(task);
+        EXPECT_TRUE(reader->Wait(task.Value()).Success());
+        EXPECT_TRUE(store->Wait(ownerTasks[layer]).Success());
+        EXPECT_EQ(ownerOut[layer], readerOut[layer]);
+    }
+    EXPECT_EQ(synced, 2);
 }
 
 TEST_F(ContextStoreTest, SharedMlaLeasePreventsEviction)
@@ -568,5 +759,79 @@ TEST(ContextIndexTest, IncrementalIndexMatchesTreeScan)
             index.Remove(key);
         }
     }
+}
+}  // namespace
+
+namespace {
+TEST(ContextMetadataTest, ProbeChainsSurviveCollisionsAndChurn)
+{
+    Context::SharedMetadata metadata;
+    ASSERT_TRUE(metadata.Setup("churn_" + std::to_string(getpid()), true, 7, 1).Success());
+    std::vector<Key> collisions;
+    for (unsigned i = 0; i < 256 && collisions.size() < 5; ++i) {
+        if (Detail::BlockIdHasher{}(Id(i)) % 7 == 6) { collisions.push_back(Id(i)); }
+    }
+    ASSERT_EQ(collisions.size(), 5);
+    for (size_t round = 0; round < 100; ++round) {
+        for (size_t i = 0; i < collisions.size(); ++i) {
+            ASSERT_TRUE(metadata.Publish(collisions[i], 1, i).Success());
+        }
+        // Pin the entry that deletion will shift across the table boundary.
+        ASSERT_TRUE(bool(metadata.Acquire(collisions[4], 1)));
+        ASSERT_TRUE(metadata.Publish(collisions[1], 0).Success());
+        ASSERT_TRUE(metadata.Publish(collisions[0], 0).Success());
+        auto found = metadata.Lookup(collisions.data(), collisions.size());
+        ASSERT_TRUE(bool(found));
+        EXPECT_EQ(found.Value(), (std::vector<uint8_t>{0, 0, 1, 1, 1}));
+        EXPECT_FALSE(metadata.Evictable(collisions[4]));
+        metadata.Release(collisions[4]);
+        for (size_t i = 2; i < collisions.size(); ++i) {
+            auto held = metadata.Acquire(collisions[i], 1);
+            ASSERT_TRUE(bool(held));
+            EXPECT_EQ(held.Value().slot, i);
+            metadata.Release(collisions[i]);
+            ASSERT_TRUE(metadata.Publish(collisions[i], 0).Success());
+        }
+    }
+}
+TEST(ContextMetadataTest, NotificationsFailuresAndBatchReuse)
+{
+    Context::SharedMetadata owner, peer;
+    auto name = "notify_" + std::to_string(getpid());
+    ASSERT_TRUE(owner.Setup(name, true, 7, 123, 2, 2).Success());
+    ASSERT_TRUE(peer.Setup(name, false).Success());
+    auto reader = peer.BeginLoad(Id(9), 1, 1000);
+    auto writer = owner.BeginLoad(Id(9), 0, 1000);
+    ASSERT_TRUE(bool(reader));
+    ASSERT_TRUE(bool(writer));
+    ASSERT_EQ(reader.Value(), writer.Value());
+    auto waiting = std::async(std::launch::async,
+                              [&] { return peer.WaitAcquire(Id(1), 123, reader.Value()); });
+    ASSERT_TRUE(owner.Publish(Id(1), 1, 4).Success());
+    auto location = waiting.get();
+    ASSERT_TRUE(bool(location));
+    EXPECT_EQ(location.Value().slot, 4);
+    EXPECT_FALSE(owner.ReserveEviction({Id(1)}));
+    peer.Release(Id(1));
+    peer.EndLoad(reader.Value(), 1);
+    EXPECT_TRUE(owner.WaitReaders(writer.Value()).Success());
+    owner.EndLoad(writer.Value(), 0);
+    writer = owner.BeginLoad(Id(9), 0, 1000);
+    ASSERT_TRUE(bool(writer));
+    owner.FailLoad(writer.Value(), Status::NoSpace());
+    // A late reader sees the failed batch, not an old ready copy of this key.
+    reader = peer.BeginLoad(Id(9), 1, 1000);
+    ASSERT_TRUE(bool(reader));
+    EXPECT_EQ(reader.Value(), writer.Value());
+    auto failed = peer.WaitAcquire(Id(1), 123, reader.Value());
+    ASSERT_FALSE(bool(failed));
+    EXPECT_EQ(failed.Error(), Status::NoSpace());
+    peer.EndLoad(reader.Value(), 1);
+    owner.EndLoad(writer.Value(), 0);
+    writer = owner.BeginLoad(Id(10), 0, 20);
+    ASSERT_TRUE(bool(writer));
+    EXPECT_EQ(owner.WaitReaders(writer.Value()), Status::Timeout());
+    owner.FailLoad(writer.Value(), Status::Timeout());
+    owner.EndLoad(writer.Value(), 0);
 }
 }  // namespace

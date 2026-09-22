@@ -88,39 +88,56 @@ Status ContextIndex::Observe(const std::vector<Key>& path, uint64_t timestamp)
         }
         parent = id;
     }
+    // Finish topology changes before collecting segment IDs: Add can split a segment.
     parent.reset();
     for (const auto& id : path) {
         if (!nodes_.count(id)) { Add(id, parent); }
-        Touch(id, timestamp);
         parent = id;
     }
+    std::set<size_t> touched;
+    for (const auto& id : path) {
+        auto& n = nodes_.at(id);
+        if (n.resident) {
+            if (touched.insert(n.segment).second) { Unpublish(n.segment); }
+            segments_.at(n.segment).members.erase({n.sequence, id});
+        }
+        n.sequence = ++sequence_;
+        n.timestamp = timestamp;
+        if (n.resident) { segments_.at(n.segment).members.insert({n.sequence, id}); }
+    }
+    for (auto segment : touched) { Publish(segment); }
     return Status::OK();
-}
-void ContextIndex::Touch(const Key& id, uint64_t timestamp)
-{
-    auto& n = nodes_.at(id);
-    if (n.resident) {
-        Unpublish(n.segment);
-        segments_.at(n.segment).members.erase({n.sequence, id});
-    }
-    n.sequence = ++sequence_;
-    n.timestamp = timestamp;
-    if (n.resident) {
-        segments_.at(n.segment).members.insert({n.sequence, id});
-        Publish(n.segment);
-    }
 }
 void ContextIndex::ChangeAncestors(const Key& id, bool insert)
 {
-    for (std::optional<Key> key = id; key; key = nodes_.at(*key).parent) {
-        auto& n = nodes_.at(*key);
-        if (insert) {
-            ++n.subtree;
-        } else {
-            assert(n.subtree);
-            --n.subtree;
+    auto& delta = pendingAncestors_[id];
+    delta += insert ? 1 : -1;
+    if (!delta) { pendingAncestors_.erase(id); }
+}
+void ContextIndex::FlushAncestors()
+{
+    if (pendingAncestors_.empty()) { return; }
+    // Coalesce mutations until subtree counts are actually needed by Select/Prune.
+    // Each affected ancestor is visited once, including across shared prefixes.
+    std::map<Key, int64_t> deltas;
+    for (const auto& [id, delta] : pendingAncestors_) {
+        for (std::optional<Key> key = id; key; key = nodes_.at(*key).parent) {
+            if (!deltas.emplace(*key, 0).second) { break; }
         }
+        deltas.at(id) += delta;
     }
+    std::vector<std::pair<size_t, Key>> order;
+    order.reserve(deltas.size());
+    for (const auto& [id, delta] : deltas) { order.emplace_back(nodes_.at(id).depth, id); }
+    std::sort(order.rbegin(), order.rend());
+    for (const auto& [depth, id] : order) {
+        auto& n = nodes_.at(id);
+        auto delta = deltas.at(id);
+        assert(int64_t(n.subtree) + delta >= 0);
+        n.subtree = int64_t(n.subtree) + delta;
+        if (n.parent) { deltas.at(*n.parent) += delta; }
+    }
+    pendingAncestors_.clear();
 }
 void ContextIndex::Insert(const Key& id)
 {
@@ -146,8 +163,10 @@ void ContextIndex::Prune(const Key& id, const std::function<bool(const Key&)>& r
 {
     std::optional<Key> key = id;
     while (key && nodes_.count(*key)) {
-        const auto n = nodes_.at(*key);
-        if (n.resident || !n.children.empty() || retained(*key)) { break; }
+        const auto& current = nodes_.at(*key);
+        if (current.resident || !current.children.empty() || retained(*key)) { break; }
+        const auto n = current;
+        FlushAncestors();
         auto& segment = segments_.at(n.segment);
         Unpublish(n.segment);
         assert(segment.path.back() == *key);
@@ -180,8 +199,9 @@ void ContextIndex::Prune(const Key& id, const std::function<bool(const Key&)>& r
     }
 }
 ContextIndex::Victim ContextIndex::Select(double budget, size_t limit,
-                                          const std::function<bool(const Key&)>& available) const
+                                          const std::function<bool(const Key&)>& available)
 {
+    FlushAncestors();
     using Score = std::tuple<size_t, size_t, uint64_t, Key>;
     std::optional<Score> best;
     Victim result;

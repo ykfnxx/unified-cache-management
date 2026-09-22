@@ -252,6 +252,29 @@ gauge:
 
 # Histogram metrics configuration
 histogram:
+  # -- ContextStore read pipeline -----------------------------------------
+  - name: "context_observe_duration_ms"
+    documentation: "ContextStore non-deduplicated ObserveRequest duration including lock wait (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000]
+  - name: "context_load_prepare_queue_wait_ms"
+    documentation: "ContextStore Load submission to prepare start (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000]
+  - name: "context_load_prepare_duration_ms"
+    documentation: "ContextStore Load preparation including lookup, eviction, admission, MLA readiness and transfer queue backpressure (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000]
+  - name: "context_load_mla_ready_wait_ms"
+    documentation: "ContextStore MLA reader time waiting for ready blocks per Load task (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000]
+  - name: "context_load_mla_completion_wait_ms"
+    documentation: "ContextStore MLA owner time waiting for readers after local H2D sync (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000]
+  - name: "context_load_first_h2d_ms"
+    documentation: "ContextStore Load submission to first successful H2D submission (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000]
+  - name: "context_load_h2d_sync_ms"
+    documentation: "ContextStore Load final H2D stream synchronization time (ms), not total DMA duration"
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000]
+
   # -- End-to-end connector metrics -----------------------------------------
   - name: "save_duration"
     documentation: "Time from UCM connector wait_for_save entry to async dump task completion (ms)"

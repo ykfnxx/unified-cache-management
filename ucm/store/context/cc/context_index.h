@@ -26,6 +26,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <unordered_map>
 #include <vector>
 #include "status/status.h"
 #include "type/types.h"
@@ -51,8 +52,7 @@ public:
     void Insert(const Key& id);
     void Remove(const Key& id);
     void Prune(const Key& id, const std::function<bool(const Key&)>& retained);
-    Victim Select(double budget, size_t limit,
-                  const std::function<bool(const Key&)>& available) const;
+    Victim Select(double budget, size_t limit, const std::function<bool(const Key&)>& available);
     size_t Size() const { return nodes_.size(); }
 
 private:
@@ -61,7 +61,7 @@ private:
         std::vector<Key> path;
         std::set<Recency> members;
     };
-    std::map<Key, Node> nodes_;
+    std::unordered_map<Key, Node, Detail::BlockIdHasher> nodes_;
     std::map<size_t, Segment> segments_;
     std::set<std::pair<uint64_t, size_t>> cold_;
     size_t nextSegment_ = 0;
@@ -69,7 +69,8 @@ private:
     void Unpublish(size_t segment);
     void Publish(size_t segment);
     void Add(const Key& id, std::optional<Key> parent);
-    void Touch(const Key& id, uint64_t timestamp);
+    std::map<Key, int64_t> pendingAncestors_;
     void ChangeAncestors(const Key& id, bool insert);
+    void FlushAncestors();
 };
 }  // namespace UC::Context

@@ -461,6 +461,41 @@ _CONNECTOR_INTERFACE_DURATION_BUCKETS = [
 ]
 _HISTOGRAM_METRICS = [
     (
+        "context_observe_duration_ms",
+        "ContextStore non-deduplicated ObserveRequest duration including lock wait (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000],
+    ),
+    (
+        "context_load_prepare_queue_wait_ms",
+        "ContextStore Load submission to prepare start (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000],
+    ),
+    (
+        "context_load_prepare_duration_ms",
+        "ContextStore Load preparation including lookup, eviction, admission, MLA readiness and transfer queue backpressure (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000],
+    ),
+    (
+        "context_load_mla_ready_wait_ms",
+        "ContextStore MLA reader time waiting for ready blocks per Load task (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000],
+    ),
+    (
+        "context_load_mla_completion_wait_ms",
+        "ContextStore MLA owner time waiting for readers after local H2D sync (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000],
+    ),
+    (
+        "context_load_first_h2d_ms",
+        "ContextStore Load submission to first successful H2D submission (ms)",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000],
+    ),
+    (
+        "context_load_h2d_sync_ms",
+        "ContextStore Load final H2D stream synchronization time (ms), not total DMA duration",
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000],
+    ),
+    (
         "save_duration",
         "Time from UCM connector wait_for_save entry to async dump task completion (ms)",
         [0, 50, 100, 150, 200, 250, 300, 350, 400, 550, 600, 750, 800, 850, 900, 950, 1000],

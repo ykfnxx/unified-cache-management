@@ -22,6 +22,7 @@
  * SOFTWARE.
  * */
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -30,6 +31,7 @@
 #include <limits>
 #include <numeric>
 #include <thread>
+#include <unordered_map>
 #include "buffer_pool.h"
 #include "context_index.h"
 #include "copy_stream.h"
@@ -40,6 +42,9 @@
 
 namespace UC::Context {
 class ContextStore final : public StoreV1 {
+    using Clock = std::chrono::steady_clock;
+    static double Milliseconds(Clock::duration duration)
+    { return std::chrono::duration<double, std::milli>(duration).count(); }
     static constexpr size_t none = std::numeric_limits<size_t>::max();
     struct Entry {
         size_t memory = none, references = 0;
@@ -49,6 +54,12 @@ class ContextStore final : public StoreV1 {
     struct Job {
         Detail::TaskDesc desc;
         std::promise<Status> result;
+        uint64_t batch = 0;
+        std::vector<Key> held;
+        size_t memoryShards = 0, backendShards = 0;
+        Clock::time_point h2dDone;
+        std::atomic<int32_t> transferFailure{0};
+        std::chrono::steady_clock::time_point prepareStarted;
         std::chrono::steady_clock::time_point submitted = std::chrono::steady_clock::now();
     };
     struct Queue {
@@ -58,22 +69,37 @@ class ContextStore final : public StoreV1 {
         bool stop = false;
         std::thread thread;
     };
+    struct ReadItem {
+        std::shared_ptr<Job> job;
+        Key key{};
+        size_t slot = none;
+        std::vector<size_t> rows;
+        bool backend = false, terminal = false;
+        Status status = Status::OK();
+    };
+    struct ReadQueue {
+        std::mutex mutex;
+        std::condition_variable readable, writable;
+        std::deque<ReadItem> items;
+        bool stop = false;
+        std::thread thread;
+    } readQueue_;
     std::mutex mutex_;
     ContextIndex index_;
-    std::map<Key, Entry> entries_;
+    std::unordered_map<Key, Entry, Detail::BlockIdHasher> entries_;
     // Only the most recent observation is retained per live request; connector retires it.
     struct Observation {
         uint64_t sequence;
         std::vector<Key> path;
     };
     std::map<std::string, Observation> observed_;
-    std::map<Key, size_t> contextReferences_;
+    std::unordered_map<Key, size_t, Detail::BlockIdHasher> contextReferences_;
     BufferPool memory_;
     StoreV1* backend_ = nullptr;
-    size_t tpRank_ = 0;
+    size_t tpRank_ = 0, tpSize_ = 1;
     SharedMetadata metadata_;
     std::vector<std::unique_ptr<SharedMetadata>> rankMetadata_;
-    Queue load_, dump_;
+    Queue load_, dump_, completion_;
     std::mutex tasksMutex_;
     std::map<size_t, std::shared_future<Status>> tasks_;
     size_t nextTask_ = 0;
@@ -95,6 +121,13 @@ public:
     {
         metadata_.Deactivate();
         Stop(load_);
+        {
+            std::lock_guard<std::mutex> lock(readQueue_.mutex);
+            readQueue_.stop = true;
+        }
+        readQueue_.readable.notify_all();
+        if (readQueue_.thread.joinable()) { readQueue_.thread.join(); }
+        Stop(completion_);
         Stop(dump_);
         metadata_.Close();
     }
@@ -164,6 +197,7 @@ public:
     {
         if (deviceId_ < 0) { return Status::Unsupported(); }
         if (reader_) { return Status::OK(); }
+        auto started = Clock::now();
         std::lock_guard<std::mutex> lock(mutex_);
         auto previous = observed_.find(id);
         if (!blocks.empty() && previous != observed_.end() &&
@@ -187,6 +221,8 @@ public:
         }
         if (!blocks.empty()) { observed_[id] = Observation{observation, blocks}; }
         for (auto it = old.rbegin(); it != old.rend(); ++it) { Prune(*it); }
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_observe_duration_ms"),
+                                 Milliseconds(Clock::now() - started));
         return Status::OK();
     }
     std::map<std::string, uint64_t> ContextStats() override
@@ -210,8 +246,13 @@ private:
         if (queue.thread.joinable()) { queue.thread.join(); }
     }
     Expected<size_t> Submit(Queue& queue, Detail::TaskDesc task);
-    Status Transfer(CopyStream& stream, Detail::TaskDesc& task, bool dump);
-    Status LoadTask(CopyStream& stream, Detail::TaskDesc& task);
+    Status DumpTask(CopyStream& stream, Detail::TaskDesc& task);
+    Status StartReadTransfer();
+    void PushRead(ReadItem item);
+    void FinishRead(const std::shared_ptr<Job>& job, Status status);
+    void PrepareLoad(const std::shared_ptr<Job>& job);
+    void Complete(const std::shared_ptr<Job>& job, Status status, bool dump,
+                  std::chrono::steady_clock::time_point started);
     Status Evict(std::unique_lock<std::mutex>& lock, const std::set<Key>& protectedKeys);
     Status Publish(const Key& id, const Entry& entry)
     { return metadata_.Publish(id, entry.ready ? 1 : 0, entry.memory); }
@@ -281,7 +322,11 @@ Status ContextStore::Setup(const Detail::Dictionary& c)
     if (!tpSize || tpRank >= tpSize) {
         return Status::InvalidParam("invalid context TP rank/size");
     }
+    if (sharedMla_ && tpSize > 64) {
+        return Status::InvalidParam("ContextStore MLA supports at most 64 TP ranks");
+    }
     tpRank_ = tpRank;
+    tpSize_ = tpSize;
     reader_ = sharedMla_ && tpRank != 0 && deviceId_ >= 0;
     if (sharedMla_) { name += "_mla"; }
     if (deviceId_ == -1) {
@@ -357,7 +402,10 @@ Status ContextStore::Setup(const Detail::Dictionary& c)
         status = memory_.Setup(deviceId_, memoryCount_, blockBytes_, sdma_);
     }
     if (status.Failure()) { return status; }
-    status = metadata_.Setup(name, !reader_, 2 * memoryCount_ + 1, layout_);
+    status = metadata_.Setup(name, !reader_, 2 * memoryCount_ + 1, layout_,
+                             sharedMla_ ? tpSize_ : 1, sharedMla_ && tpSize_ > 1 ? queueDepth_ : 0);
+    if (status.Failure()) { return status; }
+    status = StartReadTransfer();
     if (status.Failure()) { return status; }
     status = Start(load_, false);
     if (status.Failure()) { return status; }
@@ -369,9 +417,12 @@ Status ContextStore::Start(Queue& queue, bool dump)
     auto ready = started.get_future();
     queue.thread = std::thread([this, &queue, dump, start = std::move(started)]() mutable {
         CopyStream stream;
-        auto status = aggregation_ ? stream.SetupIoAggregation(deviceId_, useGdr_)
-                      : sdma_      ? stream.SetupSdmaDirect(deviceId_, useGdr_)
-                                   : stream.Setup(deviceId_, streams_, useGdr_);
+        auto status = Status::OK();
+        if (dump) {
+            status = aggregation_ ? stream.SetupIoAggregation(deviceId_, useGdr_)
+                     : sdma_      ? stream.SetupSdmaDirect(deviceId_, useGdr_)
+                                  : stream.Setup(deviceId_, streams_, useGdr_);
+        }
         start.set_value(status);
         if (status.Failure()) { return; }
         for (;;) {
@@ -383,29 +434,161 @@ Status ContextStore::Start(Queue& queue, bool dump)
                 job = std::move(queue.jobs.front());
                 queue.jobs.pop_front();
             }
-            auto started = std::chrono::steady_clock::now();
-            auto result = Transfer(stream, job->desc, dump);
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                auto elapsed = std::chrono::steady_clock::now() - started;
-                stats_[dump ? "dump_ns" : "load_ns"] +=
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
-                stats_["queue_wait_ns"] +=
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(started - job->submitted)
-                        .count();
-                ++stats_[dump ? "dump_tasks" : "load_tasks"];
-                if (result.Failure()) { ++stats_["failed_tasks"]; }
-                if (!reader_) {
-                    for (const auto& shard : job->desc) { ReleaseContext(shard.owner); }
-                    for (auto it = job->desc.rbegin(); it != job->desc.rend(); ++it) {
-                        Prune(it->owner);
-                    }
-                }
+            if (!dump) {
+                PrepareLoad(job);
+                continue;
             }
-            job->result.set_value(result);
+            auto started = std::chrono::steady_clock::now();
+            auto result = DumpTask(stream, job->desc);
+            Complete(job, result, true, started);
         }
     });
     return ready.get();
+}
+void ContextStore::Complete(const std::shared_ptr<Job>& job, Status status, bool dump,
+                            std::chrono::steady_clock::time_point started)
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_[dump ? "dump_ns" : "load_ns"] +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 started)
+                .count();
+        stats_["queue_wait_ns"] +=
+            std::chrono::duration_cast<std::chrono::nanoseconds>(started - job->submitted).count();
+        ++stats_[dump ? "dump_tasks" : "load_tasks"];
+        if (status.Failure()) { ++stats_["failed_tasks"]; }
+        if (!reader_) {
+            for (const auto& shard : job->desc) { ReleaseContext(shard.owner); }
+            for (auto it = job->desc.rbegin(); it != job->desc.rend(); ++it) { Prune(it->owner); }
+        }
+    }
+    job->result.set_value(status);
+}
+void ContextStore::PushRead(ReadItem item)
+{
+    std::unique_lock<std::mutex> lock(readQueue_.mutex);
+    readQueue_.writable.wait(lock, [&] { return readQueue_.items.size() < queueDepth_; });
+    readQueue_.items.push_back(std::move(item));
+    readQueue_.readable.notify_one();
+}
+Status ContextStore::StartReadTransfer()
+{
+    if (sharedMla_ && tpSize_ > 1 && !reader_) {
+        completion_.thread = std::thread([this] {
+            for (;;) {
+                std::shared_ptr<Job> job;
+                {
+                    std::unique_lock<std::mutex> lock(completion_.mutex);
+                    completion_.wake.wait(
+                        lock, [&] { return completion_.stop || !completion_.jobs.empty(); });
+                    if (completion_.jobs.empty()) { return; }
+                    job = std::move(completion_.jobs.front());
+                    completion_.jobs.pop_front();
+                    completion_.wake.notify_all();
+                }
+                auto result = metadata_.WaitReaders(job->batch);
+                UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_load_mla_completion_wait_ms"),
+                                         Milliseconds(Clock::now() - job->h2dDone));
+                metadata_.FailLoad(job->batch, result);
+                FinishRead(job, result);
+            }
+        });
+    }
+    std::promise<Status> started;
+    auto ready = started.get_future();
+    readQueue_.thread = std::thread([this, start = std::move(started)]() mutable {
+        CopyStream stream;
+        auto status = aggregation_ ? stream.SetupIoAggregation(deviceId_, useGdr_)
+                      : sdma_      ? stream.SetupSdmaDirect(deviceId_, useGdr_)
+                                   : stream.Setup(deviceId_, streams_, useGdr_);
+        start.set_value(status);
+        if (status.Failure()) { return; }
+        std::vector<Key> held;
+        size_t memoryShards = 0, backendShards = 0;
+        Status result = Status::OK();
+        for (;;) {
+            ReadItem item;
+            {
+                std::unique_lock<std::mutex> lock(readQueue_.mutex);
+                readQueue_.readable.wait(
+                    lock, [&] { return readQueue_.stop || !readQueue_.items.empty(); });
+                if (readQueue_.items.empty()) { return; }
+                item = std::move(readQueue_.items.front());
+                readQueue_.items.pop_front();
+                readQueue_.writable.notify_one();
+            }
+            auto& job = item.job;
+            if (!item.terminal) {
+                bool first = held.empty();
+                for (auto row : item.rows) {
+                    if (result.Failure()) { break; }
+                    auto& shard = job->desc[row];
+                    auto* host = static_cast<char*>(memory_.CopyAddress(item.slot)) +
+                                 shard.index * shardBytes_;
+                    result = stream.HostToDeviceAsync(host, shard.addrs.data(), tensorSizes_);
+                    if (first && result.Success()) {
+                        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_load_first_h2d_ms"),
+                                                 Milliseconds(Clock::now() - job->submitted));
+                        first = false;
+                    }
+                }
+                if (result.Failure()) {
+                    job->transferFailure.store(result.Underlying());
+                    if (job->batch) { metadata_.FailLoad(job->batch, result); }
+                }
+                (item.backend ? backendShards : memoryShards) += item.rows.size();
+                held.push_back(item.key);
+                continue;
+            }
+            // A failed prepare still sends a terminal marker: drain and release all earlier work.
+            if (result.Success()) { result = item.status; }
+            auto syncStart = Clock::now();
+            auto synced = stream.Synchronize();
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_load_h2d_sync_ms"),
+                                     Milliseconds(Clock::now() - syncStart));
+            if (synced.Failure()) { result = synced; }
+            job->held = std::move(held);
+            job->memoryShards = memoryShards;
+            job->backendShards = backendShards;
+            if (job->batch) { metadata_.FailLoad(job->batch, result); }
+            if (job->batch && !reader_ && result.Success()) {
+                job->h2dDone = Clock::now();
+                // Protect slots until readers finish, without blocking the next layer's H2D.
+                std::unique_lock<std::mutex> lock(completion_.mutex);
+                completion_.wake.wait(lock, [&] { return completion_.jobs.size() < queueDepth_; });
+                completion_.jobs.push_back(job);
+                completion_.wake.notify_all();
+            } else {
+                FinishRead(job, result);
+            }
+            held.clear();
+            memoryShards = backendShards = 0;
+            result = Status::OK();
+        }
+    });
+    return ready.get();
+}
+void ContextStore::FinishRead(const std::shared_ptr<Job>& job, Status status)
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (status.Success()) {
+            size_t payload = std::accumulate(tensorSizes_.begin(), tensorSizes_.end(), size_t(0));
+            stats_["h2d_bytes"] += payload * job->desc.size();
+            stats_["backend_h2d_shards"] += job->backendShards;
+            stats_["memory_load_shards"] += job->memoryShards;
+        }
+        for (const auto& key : job->held) {
+            if (reader_) {
+                metadata_.Release(key);
+            } else {
+                --entries_.at(key).references;
+            }
+        }
+    }
+    if (job->batch) { metadata_.EndLoad(job->batch, tpRank_); }
+    Complete(job, status, false, job->prepareStarted);
 }
 Expected<size_t> ContextStore::Submit(Queue& queue, Detail::TaskDesc task)
 {
@@ -417,16 +600,56 @@ Expected<size_t> ContextStore::Submit(Queue& queue, Detail::TaskDesc task)
             return Status::InvalidParam("invalid context transfer shard");
         }
     }
+    const bool load = &queue == &load_;
+    // Distinct blocks cannot exceed shard rows; avoid per-layer set construction.
+    if (load && task.size() > memoryCount_) {
+        std::set<Key> blocks;
+        for (const auto& shard : task) { blocks.insert(shard.owner); }
+        if (blocks.size() > memoryCount_) {
+            return Status{Status::NoSpace().Underlying(),
+                          "load requires " + std::to_string(blocks.size()) +
+                              " blocks; Memory holds " + std::to_string(memoryCount_)};
+        }
+    }
     auto job = std::make_shared<Job>();
     job->desc = std::move(task);
+    if (load && sharedMla_ && tpSize_ > 1) {
+        // The signature excludes device addresses and includes every (block, shard).
+        uint64_t a = 1469598103934665603ULL, b = 1099511628211ULL;
+        for (const auto& shard : job->desc) {
+            for (auto byte : shard.owner) {
+                a = (a ^ uint8_t(byte)) * 1099511628211ULL;
+                b = (b ^ uint8_t(byte)) * 0x9e3779b185ebca87ULL;
+            }
+            for (size_t i = 0; i < 8; ++i) {
+                a = (a ^ ((uint64_t(shard.index) >> (i * 8)) & 255)) * 1099511628211ULL;
+                b = (b ^ ((uint64_t(shard.index) >> (i * 8)) & 255)) * 0x9e3779b185ebca87ULL;
+            }
+        }
+        Key signature{};
+        for (size_t i = 0; i < 8; ++i) {
+            signature[i] = std::byte(a >> (i * 8));
+            signature[8 + i] = std::byte(b >> (i * 8));
+        }
+        auto batch = metadata_.BeginLoad(signature, tpRank_, timeoutMs_);
+        if (!batch) { return batch.Error(); }
+        job->batch = batch.Value();
+    }
+    auto reject = [&](Status status) -> Expected<size_t> {
+        if (job->batch) {
+            metadata_.FailLoad(job->batch, status);
+            metadata_.EndLoad(job->batch, tpRank_);
+        }
+        return status;
+    };
     std::lock_guard<std::mutex> lock(queue.mutex);
-    if (queue.stop) { return Status::Error("context store stopped"); }
-    if (queue.jobs.size() >= queueDepth_) { return Status::NoSpace(); }
+    if (queue.stop) { return reject(Status::Error("context store stopped")); }
+    if (queue.jobs.size() >= queueDepth_) { return reject(Status::NoSpace()); }
     if (!reader_) {
         std::lock_guard<std::mutex> guard(mutex_);
         for (const auto& shard : job->desc) {
             if (!index_.Contains(shard.owner)) {
-                return Status::InvalidParam("ObserveRequest required before transfer");
+                return reject(Status::InvalidParam("ObserveRequest required before transfer"));
             }
         }
         for (const auto& shard : job->desc) { ++contextReferences_[shard.owner]; }
@@ -524,44 +747,108 @@ Status ContextStore::Evict(std::unique_lock<std::mutex>& lock, const std::set<Ke
     for (auto it = victim.blocks.rbegin(); it != victim.blocks.rend(); ++it) { Prune(*it); }
     return Status::OK();
 }
-Status ContextStore::LoadTask(CopyStream& stream, Detail::TaskDesc& task)
+void ContextStore::PrepareLoad(const std::shared_ptr<Job>& job)
 {
-    std::map<Key, size_t> held;
-    std::set<Key> protectedKeys, admitted;
-    for (const auto& shard : task) { protectedKeys.insert(shard.owner); }
+    job->prepareStarted = Clock::now();
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_load_prepare_queue_wait_ms"),
+                             Milliseconds(job->prepareStarted - job->submitted));
+    double mlaWait = 0;
+    std::map<Key, std::vector<size_t>> rows;
+    std::set<Key> protectedKeys;
+    for (size_t i = 0; i < job->desc.size(); ++i) {
+        rows[job->desc[i].owner].push_back(i);
+        protectedKeys.insert(job->desc[i].owner);
+    }
     auto status = Status::OK();
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs_);
-    for (const auto& key : protectedKeys) {
-        if (reader_) {
-            // Rank 0 admits the whole backend block once. Readers wait for publication,
-            // then pin the shared slot until their own H2D has drained.
-            for (;;) {
-                auto location = metadata_.Acquire(key, layout_);
-                if (location) {
-                    held.emplace(key, location.Value().slot);
-                    break;
+    std::map<Key, bool> backendReady;
+    if (reader_) { status = memory_.MapShared(); }
+    struct Pending {
+        ReadItem item;
+        bool allocated;
+        size_t fetched;
+    };
+    std::vector<Pending> pending;
+    Detail::TaskDesc fetch;
+    // Small batches amortize backend calls without waiting for the whole request.
+    constexpr size_t admissionBatch = 32;
+    pending.reserve(admissionBatch);
+    auto flush = [&]() {
+        if (pending.empty()) { return; }
+        auto task = backend_->Load(std::move(fetch));
+        auto loaded = task ? backend_->Wait(task.Value()) : task.Error();
+        for (auto& p : pending) {
+            auto result = loaded;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto& e = entries_.at(p.item.key);
+                e.busy = false;
+                if (result.Success()) {
+                    e.ready = true;
+                    result = Publish(p.item.key, e);
                 }
-                status = location.Error();
-                if (status != Status::NotFound()) { break; }
-                auto backendKey = BackendKey(key, tpRank_);
-                auto found = backend_->Lookup(&backendKey, 1);
-                if (!found) {
-                    status = found.Error();
-                    break;
+                if (result.Success()) {
+                    e.shards.assign(shardCount_, true);
+                    ++stats_["backend_load_blocks"];
+                    stats_["backend_load_shards"] += p.fetched;
+                } else {
+                    e.ready = false;
+                    --e.references;
+                    if (p.allocated) {
+                        memory_.Release(e.memory);
+                        index_.Remove(p.item.key);
+                        entries_.erase(p.item.key);
+                    }
                 }
-                if (!found.Value()[0]) { break; }
-                if (std::chrono::steady_clock::now() >= deadline) {
-                    status = Status::Timeout();
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
-            if (!held.count(key)) { break; }
-            status = Status::OK();
+            if (result.Success()) {
+                PushRead(std::move(p.item));
+            } else if (status.Success()) {
+                status = result;
+            }
+        }
+        pending.clear();
+        fetch = Detail::TaskDesc{};
+    };
+    for (auto row = rows.begin(); row != rows.end(); ++row) {
+        auto& [key, requested] = *row;
+        if (status.Failure()) { break; }
+        if (auto failure = job->transferFailure.load()) {
+            status = Status{failure, "context H2D submission failed"};
+            break;
+        }
+        if (reader_) {
+            auto waitStart = Clock::now();
+            auto location = metadata_.WaitAcquire(key, layout_, job->batch);
+            mlaWait += Milliseconds(Clock::now() - waitStart);
+            if (!location) {
+                status = location.Error();
+                break;
+            }
+            PushRead(ReadItem{job, key, location.Value().slot, std::move(requested)});
             continue;
         }
         std::unique_lock<std::mutex> lock(mutex_);
         auto it = entries_.find(key);
+        if ((it == entries_.end() || !it->second.ready) && !backendReady.count(key)) {
+            // Only build the backend lookup on the first miss. Resident layers avoid
+            // a second scan of entries_; remaining keys are checked in one backend call.
+            lock.unlock();
+            std::vector<Key> backendKeys;
+            for (auto next = row; next != rows.end(); ++next) {
+                backendKeys.push_back(BackendKey(next->first, tpRank_));
+            }
+            auto found = backend_->Lookup(backendKeys.data(), backendKeys.size());
+            if (!found) {
+                status = found.Error();
+                break;
+            }
+            size_t i = 0;
+            for (auto next = row; next != rows.end(); ++next) {
+                backendReady.emplace(next->first, found.Value()[i++]);
+            }
+            lock.lock();
+            it = entries_.find(key);
+        }
         if (it == entries_.end() || !it->second.ready) {
             const bool allocate = it == entries_.end();
             if (!allocate && (it->second.busy || it->second.references)) {
@@ -569,104 +856,75 @@ Status ContextStore::LoadTask(CopyStream& stream, Detail::TaskDesc& task)
                 break;
             }
             auto backendKey = BackendKey(key, tpRank_);
-            // Fake is metadata-only; the lookup is also needed because Fake.Load
-            // itself reports success even for missing blocks.
-            auto found = backend_->Lookup(&backendKey, 1);
-            if (!found) {
-                status = found.Error();
-                break;
-            }
-            if (!found.Value()[0]) {
-                status = Status::NotFound();
-                break;
+            if (!backendReady.at(key)) {
+                // Fake membership may have appeared after the batched lookup,
+                // when another task evicted this previously resident block.
+                auto found = backend_->Lookup(&backendKey, 1);
+                if (!found || !found.Value()[0]) {
+                    status = found ? Status::NotFound() : found.Error();
+                    break;
+                }
             }
             if (allocate && memory_.Empty()) {
                 status = Evict(lock, protectedKeys);
                 if (status.Failure()) { break; }
             }
-            auto& entry = entries_[key];
+            auto& e = entries_[key];
             if (allocate) {
-                entry.memory = memory_.Allocate();
-                entry.shards.assign(shardCount_, false);
+                e.memory = memory_.Allocate();
+                e.shards.assign(shardCount_, false);
                 index_.Insert(key);
             }
-            entry.busy = true;
-            const auto savedShards = entry.shards;
-            Detail::TaskDesc desc;
+            e.busy = true;
+            ++e.references;
+            if (pending.empty()) {
+                fetch.reserve(std::min(admissionBatch, rows.size()) * shardCount_);
+            }
+            auto before = fetch.size();
             for (size_t i = 0; i < shardCount_; ++i) {
-                if (entry.shards[i]) { continue; }
-                desc.push_back(Detail::Shard{
-                    backendKey,
-                    i,
-                    {static_cast<char*>(memory_.Data(entry.memory)) + i * shardBytes_}});
-            }
-            const auto fetchedShards = desc.size();
-            lock.unlock();
-            auto pending = backend_->Load(std::move(desc));
-            status = pending ? backend_->Wait(pending.Value()) : pending.Error();
-            lock.lock();
-            entry.busy = false;
-            if (status.Success()) {
-                entry.shards.assign(shardCount_, true);
-                entry.ready = true;
-                status = Publish(key, entry);
-            }
-            if (status.Failure()) {
-                entry.ready = false;
-                entry.shards = savedShards;
-                if (allocate) {
-                    memory_.Release(entry.memory);
-                    index_.Remove(key);
-                    entries_.erase(key);
+                if (!e.shards[i]) {
+                    fetch.push_back(
+                        {backendKey,
+                         i,
+                         {static_cast<char*>(memory_.Data(e.memory)) + i * shardBytes_}});
                 }
+            }
+            pending.push_back({
+                ReadItem{job, key, e.memory, std::move(requested), true},
+                allocate,
+                fetch.size() - before
+            });
+            stats_["memory_peak_blocks"] = std::max(stats_["memory_peak_blocks"],
+                                                    uint64_t(memoryCount_ - memory_.FreeCount()));
+            lock.unlock();
+            if (pending.size() == admissionBatch) { flush(); }
+        } else {
+            if (it->second.busy) {
+                status = Status::NotFound();
                 break;
             }
-            ++stats_["backend_load_blocks"];
-            stats_["backend_load_shards"] += fetchedShards;
-            admitted.insert(key);
-            it = entries_.find(key);
-        }
-        if (!it->second.ready || it->second.busy) {
-            status = Status::NotFound();
-            break;
-        }
-        ++it->second.references;
-        held.emplace(key, it->second.memory);
-    }
-    if (status.Success() && reader_ && !held.empty()) { status = memory_.MapShared(); }
-    for (auto& shard : task) {
-        if (status.Failure()) { break; }
-        auto* host = static_cast<char*>(memory_.CopyAddress(held.at(shard.owner))) +
-                     shard.index * shardBytes_;
-        status = stream.HostToDeviceAsync(host, shard.addrs.data(), tensorSizes_);
-    }
-    // A failed submission must still drain earlier DMA before slots can be reused.
-    auto synced = stream.Synchronize();
-    if (synced.Failure()) { status = synced; }
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (status.Success()) {
-        const size_t payload = std::accumulate(tensorSizes_.begin(), tensorSizes_.end(), size_t(0));
-        stats_["h2d_bytes"] += payload * task.size();
-        for (const auto& shard : task) {
-            ++stats_[admitted.count(shard.owner) ? "backend_h2d_shards" : "memory_load_shards"];
+            ++it->second.references;
+            auto slot = it->second.memory;
+            lock.unlock();
+            PushRead(ReadItem{job, key, slot, std::move(requested)});
         }
     }
-    for (const auto& pair : held) {
-        if (reader_) {
-            metadata_.Release(pair.first);
-        } else {
-            --entries_.at(pair.first).references;
-        }
+    // Even a later preparation error must complete and release earlier reservations.
+    flush();
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_load_prepare_duration_ms"),
+                             Milliseconds(Clock::now() - job->prepareStarted));
+    if (reader_) {
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_load_mla_ready_wait_ms"), mlaWait);
     }
-    if (!reader_) {
-        stats_["memory_peak_blocks"] =
-            std::max(stats_["memory_peak_blocks"], uint64_t(memoryCount_ - memory_.FreeCount()));
-    }
-    return status;
+    if (job->batch) { metadata_.FailLoad(job->batch, status); }
+    ReadItem terminal;
+    terminal.job = job;
+    terminal.terminal = true;
+    terminal.status = status;
+    PushRead(std::move(terminal));
 }
-Status ContextStore::Transfer(CopyStream& stream, Detail::TaskDesc& task, bool dump)
+Status ContextStore::DumpTask(CopyStream& stream, Detail::TaskDesc& task)
 {
-    if (!dump) { return LoadTask(stream, task); }
     struct Held {
         Key key;
         size_t slot;

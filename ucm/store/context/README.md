@@ -52,7 +52,7 @@ ucm_connectors:
 | `context_max_eviction_blocks` | 一次策略选择最多淘汰的 block 数，默认 64 |
 | `cache_stream_number` | 传输 stream 数，默认 4，范围 1–32 |
 | `waiting_queue_depth` | 每个传输等待队列深度，默认 8192 |
-| `timeout_ms` | Wait 超时阈值，默认 30000；返回前仍排空传输，保证地址生命周期；MLA reader 等待 rank 0 入驻也使用此阈值 |
+| `timeout_ms` | Wait 超时阈值，默认 30000；返回前仍排空传输，保证地址生命周期；MLA 批次从首次提交起也使用此截止时间，超时会通知参与者 |
 
 retention 只控制淘汰时的 Drop/Dump，不是驻留 TTL；没有后台到期删除或结束时刷写。SDMA direct 与 IO aggregation 互斥，二者不能与 GDR 同时启用，须使用相应设备运行时。
 
@@ -61,12 +61,13 @@ retention 只控制淘汰时的 Drop/Dump，不是驻留 TTL；没有后台到�
 支持单机 GQA/MLA TP，PP=CP=1，direct 或 layerwise。MLA 包括普通 DSA KV 的多个 tensor component 以及已注册的 MTP 层；不包含 sparse C8、CP 或 hybrid attention 适配。
 
 - GQA：各 rank 独立 Memory 和策略；策略使用原始逻辑 hash，后端 ID 区分 TP rank。scheduler 对每个 rank 的 `Memory 或 Fake` 可用性取交集。
-- MLA：rank 0 独占 Dump、淘汰和 Fake 回源入驻；其余 rank 等待共享 Memory 发布，再持有跨进程读引用执行 H2D。读引用释放前不能淘汰该 slot。
+- MLA：rank 0 独占 Dump、淘汰和 Fake 回源入驻；其余 rank 通过共享条件变量等待 READY 或失败，再持有跨进程读引用执行 H2D。rank 0 通过独立、有界的完成队列等待 reader，保留整个 Load 的本地引用；H2D 线程可继续提交后续层；晚到的 reader 不会错过已经发布的数据。
+- MLA 的一次 Load 必须由整个 TP 组共同提交，最多支持 64 ranks。相同 block/shard 描述的重复 Load 按各 rank 的提交顺序匹配，设备地址不参与匹配。直接调用时先在所有 rank 提交，再等待结果；不要在提交 reader 前同步等待 owner。批次表有界，容量复用 `waiting_queue_depth`。
 - 全部进程使用相同 DP 组 unique_id 和共享内存命名空间。connector 自动设置 `context_tp_size`、`context_tp_rank`、`share_buffer_enable`、设备和 KV 布局参数。
 
 配置 8 GiB Memory 时，TP=4 GQA 占 32 GiB payload，MLA 占 8 GiB payload；另有 Fake 和策略元数据。MLA 的 `/dev/shm` 必须容纳共享 Memory。Fake 只在共享内存中存元数据。
 
-与原有 Store 一样，Lookup 不是预留。Load 时容量不足、block 正在被其他任务占用或 MLA owner 未及时入驻，可能返回失败。单个任务需要同时持有的逻辑 block 不应超过 Memory 容量。
+与原有 Store 一样，Lookup 不是预留。Load 时容量不足、block 正在被其他任务占用或 MLA owner 未及时入驻，可能返回失败。单个 Load 任务的不同逻辑 block 数不能超过 Memory 容量；超过时在分配和淘汰前返回 NoSpace，并报告需要数和可容纳数。未实现跨容量的滑动窗口读取。
 
 ## 构建和启动
 
@@ -128,3 +129,32 @@ sum(increase(ucm:context_evict_blocks_total[5m]))
 ```
 
 多实验共用 Prometheus 时，加上实际的模型、engine 等标签过滤；按 rank 查看可用 `sum by (worker_rank) (...)`。原生采集接口返回区间增量，由现有 exporter 累加为 Prometheus Counter。
+
+
+### 读流水线与耗时
+
+Load 分为 prepare 和 H2D 两个线程，中间使用有界 block 队列。每准备好一个 block 就提交本次需要的 shard，不再等待整个任务完成入驻。全部 DMA 排空后才释放引用、完成任务；准备中途失败也会处理已经提交的拷贝。MLA owner 使用额外的完成线程等待 reader，不占用 H2D 线程，完成队列容量复用 `waiting_queue_depth`。
+
+首次 Memory miss 时批量 Lookup 剩余 block，每最多 32 个 block 合并一次后端 Load/Wait，并预留 shard 描述容量；全 Memory 命中不做额外预扫描或后端 Lookup，直接进入传输队列。只有整个 block 就绪才发布 READY，失败保留原有 shard 并释放新分配槽位。
+
+节点、驻留项与引用计数使用哈希查询，淘汰顺序仍由原有有序索引决定。传输条目数不超过 Memory slot 数时直接通过容量上限检查；只有可能超容量时才构造唯一 block 集合，避免逐层重复去重。策略索引合并入驻/淘汰产生的祖先增量，在选择 victim 或删除拓扑节点前刷新；ObserveRequest 保留逐 block 的访问顺序和时间，但同一 segment 的冷排序索引只刷新一次。
+
+共享元数据删除时修复哈希探测链，不保留 tombstone。MLA READY、失败和退出会通知等待者；首次 reader 映射、注册共享 Memory 仍有冷启动开销。
+
+以下 Histogram 默认导出为 `ucm:<名称>`，单位毫秒。使用自定义 metrics 配置时需同步添加定义：
+
+| 名称 | 口径 |
+| --- | --- |
+| `context_observe_duration_ms` | 实际更新状态的 ObserveRequest 耗时，含主锁等待；去重回调不记录 |
+| `context_load_prepare_queue_wait_ms` | 提交到 prepare 开始 |
+| `context_load_prepare_duration_ms` | prepare 开始到全部 block 交给传输队列；包含查找、淘汰、入驻、MLA READY 等待及队列反压 |
+| `context_load_mla_ready_wait_ms` | reader 一个 Load 内等待 READY 的累计时间 |
+| `context_load_mla_completion_wait_ms` | rank 0 本地 H2D 同步到完成线程确认 reader 结束的时间，含完成队列等待 |
+| `context_load_first_h2d_ms` | 提交到首次 H2D 成功提交；没有提交 H2D 的失败任务不产生此样本 |
+| `context_load_h2d_sync_ms` | 最终 stream 同步等待，不等于完整 DMA 用时 |
+
+各阶段可重叠，不能将它们直接相加作为端到端时间。CPU-simu 用例验证流水线重叠和引用生命周期，实际 NPU 吞吐仍需实测。
+
+评估 TTFT 时，应按 connector 的实际顺序统计：ObserveRequest → 提交首层 → 等待本层 → 提交下一层 → 计算本层。关注同步提交耗时及未被计算掩盖的等待；首个 H2D 或单层 Load 加速比不等于 TTFT 加速比。单请求通常只有一层预取，MLA 完成队列主要解除已排队的其他任务被 reader 等待阻塞的问题。
+
+升级后需重新构建并重启所有 TP 进程，不能混用旧版共享元数据映射。

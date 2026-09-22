@@ -661,17 +661,20 @@ def test_dsa_shared_three_components_and_mtp_shard_native_readback():
                 )
                 owner.Wait(task)
             assert owner.ContextStats()["backend_dump_bytes"] == 168
-        for worker in (owner, reader):
-            for layer in range(3):
+        for layer in range(3):
+            loads = []
+            for worker in (owner, reader):
                 tensors = [np.zeros(size, dtype=np.uint8) for size in sizes]
                 task = worker.Load(
                     ids(1),
                     np.array([layer], dtype=np.uint64),
                     np.array([[a.ctypes.data for a in tensors]], dtype=np.uint64),
                 )
+                loads.append((worker, task, tensors))
+            for worker, task, tensors in loads:
                 worker.Wait(task)
-                for i, tensor in enumerate(tensors):
-                    if not evict:
+                if not evict:
+                    for i, tensor in enumerate(tensors):
                         assert np.all(tensor == layer * 3 + i)
     assert reader.ContextStats().get("d2h_bytes", 0) == 0
     assert reader.ContextStats().get("backend_dump_bytes", 0) == 0
@@ -820,15 +823,14 @@ def test_mla_shared_payload_across_processes_and_owner_exit():
             )
             owner.Wait(task)
             parent.send("load")
-            if key == 2:
-                # Reader may arrive before rank 0 performs backend admission.
-                target = np.zeros_like(source)
-                task = owner.Load(
-                    ids(1),
-                    np.array([0], dtype=np.uint64),
-                    np.array([[target.ctypes.data]], dtype=np.uint64),
-                )
-                owner.Wait(task)
+            # Both ranks participate, including on a resident Memory hit.
+            target = np.zeros_like(source)
+            task = owner.Load(
+                ids(1),
+                np.array([0], dtype=np.uint64),
+                np.array([[target.ctypes.data]], dtype=np.uint64),
+            )
+            owner.Wait(task)
             assert parent.poll(30)
             data, stats = parent.recv()
             assert data == source.tobytes()
@@ -906,3 +908,65 @@ def test_registered_context_fake_builder_and_readmission():
         assert stats["d2h_bytes"] == 128
         assert stats["h2d_bytes"] == 64 * (attempt + 1)
         assert not any("ssd" in key for key in stats)
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_mla_late_reader_protection_and_owner_failure(partial):
+    import time
+
+    module, library = native()
+    config = {
+        "unique_id": "late_" + uuid.uuid4().hex,
+        "share_buffer_enable": True,
+        "context_tp_size": 2,
+        "block_size": 128,
+        "shard_size": 64,
+        "tensor_size": 64,
+        "context_memory_capacity_bytes": 128,
+        "timeout_ms": 3000,
+        "waiting_queue_depth": 2,
+    }
+    owner, reader = module.PipelineStore(), module.PipelineStore()
+    owner.Stack("Context", str(library), dict(config, device_id=0, context_tp_rank=0))
+    reader.Stack("Context", str(library), dict(config, device_id=1, context_tp_rank=1))
+    source = np.full(64, 7, dtype=np.uint8)
+    address = np.array([[source.ctypes.data]], dtype=np.uint64)
+    index = np.array([0], dtype=np.uint64)
+    for key in (1, 2):
+        owner.ObserveRequest(str(key), key, key, ids(key))
+        for layer in range(1 if partial and key == 2 else 2):
+            owner.Wait(
+                owner.Dump(ids(key), np.array([layer], dtype=np.uint64), address, 0)
+            )
+    out_owner, out_reader = np.zeros_like(source), np.zeros_like(source)
+    owner_task = owner.Load(
+        ids(1), index, np.array([[out_owner.ctypes.data]], dtype=np.uint64)
+    )
+    if partial:
+        with pytest.raises(RuntimeError, match="-50009"):
+            owner.Wait(owner_task)
+        # The reader joins after the failed prepare and sees its error immediately.
+        start = time.monotonic()
+        reader_task = reader.Load(
+            ids(1), index, np.array([[out_reader.ctypes.data]], dtype=np.uint64)
+        )
+        with pytest.raises(RuntimeError, match="-50009"):
+            reader.Wait(reader_task)
+        assert time.monotonic() - start < 1.5
+    else:
+        deadline = time.monotonic() + 2
+        while not owner.ContextStats().get("backend_load_blocks", 0):
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        assert not owner.Check(owner_task)
+        owner.ObserveRequest("3", 3, 3, ids(3))
+        with pytest.raises(RuntimeError, match="-50009"):
+            owner.Wait(owner.Dump(ids(3), index, address, 0))
+        reader_task = reader.Load(
+            ids(1), index, np.array([[out_reader.ctypes.data]], dtype=np.uint64)
+        )
+        reader.Wait(reader_task)
+        owner.Wait(owner_task)
+        np.testing.assert_array_equal(out_owner, out_reader)
+        owner.Wait(owner.Dump(ids(3), index, address, 0))
+        assert owner.ContextStats()["memory_blocks"] == 1

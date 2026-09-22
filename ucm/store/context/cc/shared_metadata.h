@@ -36,9 +36,8 @@ public:
     Status Setup(const std::string& name, bool owner, size_t capacity = 0, uint64_t layout = 0);
     struct Location {
         size_t slot;
-        bool memory;
     };
-    Status Publish(const Key& key, uint8_t copies, size_t memory = 0, size_t ssd = 0);
+    Status Publish(const Key& key, uint8_t copies, size_t memory = 0);
     Expected<Location> Acquire(const Key& key, uint64_t layout);
     void Release(const Key& key);
     bool Evictable(const Key& key);

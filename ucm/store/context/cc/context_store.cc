@@ -25,7 +25,6 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
-#include <cstring>
 #include <deque>
 #include <future>
 #include <limits>
@@ -42,7 +41,7 @@ namespace UC::Context {
 class ContextStore final : public StoreV1 {
     static constexpr size_t none = std::numeric_limits<size_t>::max();
     struct Entry {
-        size_t memory = none, ssd = none, references = 0;
+        size_t memory = none, references = 0;
         std::vector<bool> shards;
         bool ready = false, busy = false;
     };
@@ -68,7 +67,9 @@ class ContextStore final : public StoreV1 {
     };
     std::map<std::string, Observation> observed_;
     std::map<Key, size_t> contextReferences_;
-    BufferPool memory_, ssd_;
+    BufferPool memory_;
+    StoreV1* backend_ = nullptr;
+    size_t tpRank_ = 0;
     SharedMetadata metadata_;
     std::vector<std::unique_ptr<SharedMetadata>> rankMetadata_;
     Queue load_, dump_;
@@ -76,7 +77,7 @@ class ContextStore final : public StoreV1 {
     std::map<size_t, std::shared_future<Status>> tasks_;
     size_t nextTask_ = 0;
     int deviceId_ = -1;
-    size_t blockBytes_ = 0, shardBytes_ = 0, shardCount_ = 0, memoryCount_ = 0, ssdCount_ = 0;
+    size_t blockBytes_ = 0, shardBytes_ = 0, shardCount_ = 0, memoryCount_ = 0;
     size_t streams_ = 4, queueDepth_ = 8192, limit_ = 64, timeoutMs_ = 30000;
     std::vector<size_t> tensorSizes_;
     double alpha_ = .01;
@@ -100,10 +101,10 @@ public:
     Status Setup(const Detail::Dictionary& config) override;
     Expected<std::vector<uint8_t>> Lookup(const Key* keys, size_t n) override
     {
-        if (rankMetadata_.empty()) { return metadata_.Lookup(keys, n); }
+        if (rankMetadata_.empty()) { return LookupRank(metadata_, keys, n, tpRank_); }
         std::vector<uint8_t> result(n, 1);
-        for (auto& rank : rankMetadata_) {
-            auto found = rank->Lookup(keys, n);
+        for (size_t r = 0; r < rankMetadata_.size(); ++r) {
+            auto found = LookupRank(*rankMetadata_[r], keys, n, r);
             if (!found) { return found.Error(); }
             for (size_t i = 0; i < n; ++i) { result[i] &= found.Value()[i]; }
         }
@@ -191,10 +192,7 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto result = stats_;
-        if (!reader_) {
-            result["memory_blocks"] = memoryCount_ - memory_.FreeCount();
-            result["ssd_blocks"] = ssdCount_ - ssd_.FreeCount();
-        }
+        if (!reader_) { result["memory_blocks"] = memoryCount_ - memory_.FreeCount(); }
         result["topology_nodes"] = index_.Size();
         return result;
     }
@@ -212,13 +210,42 @@ private:
     }
     Expected<size_t> Submit(Queue& queue, Detail::TaskDesc task);
     Status Transfer(CopyStream& stream, Detail::TaskDesc& task, bool dump);
-    Status LoadShared(CopyStream& stream, Detail::TaskDesc& task);
+    Status LoadTask(CopyStream& stream, Detail::TaskDesc& task);
     Status Evict(std::unique_lock<std::mutex>& lock, const std::set<Key>& protectedKeys);
     Status Publish(const Key& id, const Entry& entry)
+    { return metadata_.Publish(id, entry.ready ? 1 : 0, entry.memory); }
+    Key BackendKey(Key key, size_t rank) const
     {
-        return metadata_.Publish(id,
-                                 uint8_t(entry.ready ? 1 : 0) | uint8_t(entry.ssd != none ? 2 : 0),
-                                 entry.memory, entry.ssd);
+        // Keep the canonical prefix hash in the policy; namespace only backend I/O.
+        // MLA has a single writer and one backend identity for the whole TP group.
+        if (!sharedMla_) {
+            for (size_t i = 0; i < sizeof(uint64_t); ++i) {
+                key[8 + i] ^= std::byte((uint64_t(rank) >> (8 * i)) & 255);
+            }
+        }
+        return key;
+    }
+    Expected<std::vector<uint8_t>> LookupRank(SharedMetadata& metadata, const Key* keys, size_t n,
+                                              size_t rank)
+    {
+        auto found = metadata.Lookup(keys, n);
+        if (!found) { return found.Error(); }
+        std::vector<Key> missing;
+        std::vector<size_t> offsets;
+        for (size_t i = 0; i < n; ++i) {
+            if (!found.Value()[i]) {
+                missing.push_back(BackendKey(keys[i], rank));
+                offsets.push_back(i);
+            }
+        }
+        if (!missing.empty()) {
+            auto stored = backend_->Lookup(missing.data(), missing.size());
+            if (!stored) { return stored.Error(); }
+            for (size_t i = 0; i < offsets.size(); ++i) {
+                found.Value()[offsets[i]] = stored.Value()[i];
+            }
+        }
+        return found;
     }
     void ReleaseContext(const Key& key)
     {
@@ -234,6 +261,8 @@ private:
 
 Status ContextStore::Setup(const Detail::Dictionary& c)
 {
+    c.Get("store_backend", backend_);
+    if (!backend_) { return Status::InvalidParam("ContextStore requires a backend"); }
     std::string name;
     c.Get("unique_id", name);
     if (name.empty() || name.find_first_not_of(
@@ -251,6 +280,7 @@ Status ContextStore::Setup(const Detail::Dictionary& c)
     if (!tpSize || tpRank >= tpSize) {
         return Status::InvalidParam("invalid context TP rank/size");
     }
+    tpRank_ = tpRank;
     reader_ = sharedMla_ && tpRank != 0 && deviceId_ >= 0;
     if (sharedMla_) { name += "_mla"; }
     if (deviceId_ == -1) {
@@ -288,7 +318,6 @@ Status ContextStore::Setup(const Detail::Dictionary& c)
         return bytes ? size_t(bytes) : size_t(gb) << 30;
     };
     memoryCount_ = capacity("context_memory") / blockBytes_;
-    ssdCount_ = capacity("context_simulated_ssd") / blockBytes_;
     c.Get("context_alpha", alpha_);
     c.GetNumber("context_retention_ns", retention_);
     c.GetNumber("context_max_eviction_blocks", limit_);
@@ -298,8 +327,8 @@ Status ContextStore::Setup(const Detail::Dictionary& c)
     c.Get("use_gdr", useGdr_);
     c.Get("cache_io_aggregation", aggregation_);
     c.Get("cache_sdma_direct", sdma_);
-    if (!memoryCount_ || !ssdCount_ || !std::isfinite(alpha_) || alpha_ <= 0 || alpha_ > 1 ||
-        !limit_ || !streams_ || streams_ > 32 || !queueDepth_ || !timeoutMs_ || retention_ < -1 ||
+    if (!memoryCount_ || !std::isfinite(alpha_) || alpha_ <= 0 || alpha_ > 1 || !limit_ ||
+        !streams_ || streams_ > 32 || !queueDepth_ || !timeoutMs_ || retention_ < -1 ||
         (aggregation_ && sdma_) || (useGdr_ && (aggregation_ || sdma_))) {
         return Status::InvalidParam("invalid context capacity/policy/transfer configuration");
     }
@@ -316,23 +345,18 @@ Status ContextStore::Setup(const Detail::Dictionary& c)
     }
     // Store a layout signature so peers cannot interpret different tensor layouts
     // or capacity settings as the same shared block offsets.
-    for (size_t value : {blockBytes_, shardBytes_, memoryCount_, ssdCount_}) {
+    for (size_t value : {blockBytes_, shardBytes_, memoryCount_}) {
         layout_ = (layout_ ^ uint64_t(value)) * 1099511628211ULL;
     }
     for (auto value : tensorSizes_) { layout_ = (layout_ ^ uint64_t(value)) * 1099511628211ULL; }
     if (sharedMla_) {
         status = memory_.SetupShared(name + "_memory", deviceId_, memoryCount_, blockBytes_,
                                      !reader_, sdma_);
-        if (status.Failure()) { return status; }
-        status =
-            ssd_.SetupShared(name + "_ssd", deviceId_, ssdCount_, blockBytes_, !reader_, sdma_);
     } else {
         status = memory_.Setup(deviceId_, memoryCount_, blockBytes_, sdma_);
-        if (status.Failure()) { return status; }
-        status = ssd_.Setup(deviceId_, ssdCount_, blockBytes_, sdma_);
     }
     if (status.Failure()) { return status; }
-    status = metadata_.Setup(name, !reader_, 2 * (memoryCount_ + ssdCount_) + 1, layout_);
+    status = metadata_.Setup(name, !reader_, 2 * memoryCount_ + 1, layout_);
     if (status.Failure()) { return status; }
     status = Start(load_, false);
     if (status.Failure()) { return status; }
@@ -434,14 +458,6 @@ Status ContextStore::Evict(std::unique_lock<std::mutex>& lock, const std::set<Ke
         return Status::NoSpace();
     }
     bool drop = retention_ >= 0 && now_ - victim.lastAccess > uint64_t(retention_);
-    size_t writes = 0;
-    for (const auto& k : victim.blocks) {
-        if (!drop && entries_.at(k).ssd == none) { ++writes; }
-    }
-    if (writes > ssd_.FreeCount()) {
-        ++stats_["no_space"];
-        return Status::NoSpace();
-    }
     if (sharedMla_ && !metadata_.ReserveEviction(victim.blocks)) {
         ++stats_["no_space"];
         return Status::NoSpace();
@@ -449,20 +465,42 @@ Status ContextStore::Evict(std::unique_lock<std::mutex>& lock, const std::set<Ke
     for (const auto& k : victim.blocks) { entries_.at(k).busy = true; }
     for (const auto& k : victim.blocks) {
         auto& e = entries_.at(k);
-        if (!drop && e.ssd == none) {
-            auto target = ssd_.Allocate();
-            auto* source = memory_.Data(e.memory);
-            auto* destination = ssd_.Data(target);
+        if (!drop) {
+            auto backendKey = BackendKey(k, tpRank_);
             lock.unlock();
-            std::memcpy(destination, source, blockBytes_);
+            auto exists = backend_->Lookup(&backendKey, 1);
+            auto status = exists ? Status::OK() : exists.Error();
+            bool written = false;
+            if (exists && !exists.Value()[0]) {
+                Detail::TaskDesc desc;
+                for (size_t i = 0; i < shardCount_; ++i) {
+                    desc.push_back(Detail::Shard{
+                        backendKey,
+                        i,
+                        {static_cast<char*>(memory_.Data(e.memory)) + i * shardBytes_}});
+                }
+                auto task = backend_->Dump(std::move(desc));
+                status = task ? backend_->Wait(task.Value()) : task.Error();
+                written = status.Success();
+            }
             lock.lock();
-            e.ssd = target;
-            stats_["ssd_peak_blocks"] =
-                std::max(stats_["ssd_peak_blocks"], uint64_t(ssdCount_ - ssd_.FreeCount()));
-            ++stats_["ssd_write_blocks"];
-            stats_["ssd_write_bytes"] += blockBytes_;
-        } else if (!drop) {
-            ++stats_["ssd_write_skipped_blocks"];
+            if (status.Failure()) {
+                // Keep every remaining victim readable and release MLA reservations.
+                for (const auto& pending : victim.blocks) {
+                    auto it = entries_.find(pending);
+                    if (it != entries_.end() && it->second.busy) {
+                        it->second.busy = false;
+                        Publish(pending, it->second);
+                    }
+                }
+                return status;
+            }
+            if (written) {
+                ++stats_["backend_dump_blocks"];
+                stats_["backend_dump_bytes"] += blockBytes_;
+            } else {
+                ++stats_["backend_dump_skipped_blocks"];
+            }
         }
         e.ready = false;
         auto status = Publish(k, e);
@@ -474,57 +512,157 @@ Status ContextStore::Evict(std::unique_lock<std::mutex>& lock, const std::set<Ke
         index_.Remove(k);
         ++stats_[drop ? "drop_blocks" : "dump_blocks"];
         ++stats_["evicted_blocks"];
-        if (e.ssd == none) { entries_.erase(k); }
+        entries_.erase(k);
     }
     for (auto it = victim.blocks.rbegin(); it != victim.blocks.rend(); ++it) { Prune(*it); }
     return Status::OK();
 }
-Status ContextStore::LoadShared(CopyStream& stream, Detail::TaskDesc& task)
+Status ContextStore::LoadTask(CopyStream& stream, Detail::TaskDesc& task)
 {
-    std::map<Key, SharedMetadata::Location> held;
+    std::map<Key, size_t> held;
+    std::set<Key> protectedKeys, admitted;
+    for (const auto& shard : task) { protectedKeys.insert(shard.owner); }
     auto status = Status::OK();
-    for (auto& shard : task) {
-        if (held.count(shard.owner)) { continue; }
-        auto location = metadata_.Acquire(shard.owner, layout_);
-        if (!location) {
-            status = location.Error();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs_);
+    for (const auto& key : protectedKeys) {
+        if (reader_) {
+            // Rank 0 admits the whole backend block once. Readers wait for publication,
+            // then pin the shared slot until their own H2D has drained.
+            for (;;) {
+                auto location = metadata_.Acquire(key, layout_);
+                if (location) {
+                    held.emplace(key, location.Value().slot);
+                    break;
+                }
+                status = location.Error();
+                if (status != Status::NotFound()) { break; }
+                auto backendKey = BackendKey(key, tpRank_);
+                auto found = backend_->Lookup(&backendKey, 1);
+                if (!found) {
+                    status = found.Error();
+                    break;
+                }
+                if (!found.Value()[0]) { break; }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    status = Status::Timeout();
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            if (!held.count(key)) { break; }
+            status = Status::OK();
+            continue;
+        }
+        std::unique_lock<std::mutex> lock(mutex_);
+        auto it = entries_.find(key);
+        if (it == entries_.end() || !it->second.ready) {
+            const bool allocate = it == entries_.end();
+            if (!allocate && (it->second.busy || it->second.references)) {
+                status = Status::NotFound();
+                break;
+            }
+            auto backendKey = BackendKey(key, tpRank_);
+            // Fake is metadata-only; the lookup is also needed because Fake.Load
+            // itself reports success even for missing blocks.
+            auto found = backend_->Lookup(&backendKey, 1);
+            if (!found) {
+                status = found.Error();
+                break;
+            }
+            if (!found.Value()[0]) {
+                status = Status::NotFound();
+                break;
+            }
+            if (allocate && memory_.Empty()) {
+                status = Evict(lock, protectedKeys);
+                if (status.Failure()) { break; }
+            }
+            auto& entry = entries_[key];
+            if (allocate) {
+                entry.memory = memory_.Allocate();
+                entry.shards.assign(shardCount_, false);
+                index_.Insert(key);
+            }
+            entry.busy = true;
+            const auto savedShards = entry.shards;
+            Detail::TaskDesc desc;
+            for (size_t i = 0; i < shardCount_; ++i) {
+                if (entry.shards[i]) { continue; }
+                desc.push_back(Detail::Shard{
+                    backendKey,
+                    i,
+                    {static_cast<char*>(memory_.Data(entry.memory)) + i * shardBytes_}});
+            }
+            const auto fetchedShards = desc.size();
+            lock.unlock();
+            auto pending = backend_->Load(std::move(desc));
+            status = pending ? backend_->Wait(pending.Value()) : pending.Error();
+            lock.lock();
+            entry.busy = false;
+            if (status.Success()) {
+                entry.shards.assign(shardCount_, true);
+                entry.ready = true;
+                status = Publish(key, entry);
+            }
+            if (status.Failure()) {
+                entry.ready = false;
+                entry.shards = savedShards;
+                if (allocate) {
+                    memory_.Release(entry.memory);
+                    index_.Remove(key);
+                    entries_.erase(key);
+                }
+                break;
+            }
+            ++stats_["backend_load_blocks"];
+            stats_["backend_load_shards"] += fetchedShards;
+            admitted.insert(key);
+            it = entries_.find(key);
+        }
+        if (!it->second.ready || it->second.busy) {
+            status = Status::NotFound();
             break;
         }
-        held.emplace(shard.owner, location.Value());
+        ++it->second.references;
+        held.emplace(key, it->second.memory);
     }
-    if (status.Success()) { status = memory_.MapShared(); }
-    if (status.Success()) { status = ssd_.MapShared(); }
+    if (status.Success() && reader_ && !held.empty()) { status = memory_.MapShared(); }
     for (auto& shard : task) {
         if (status.Failure()) { break; }
-        const auto& location = held.at(shard.owner);
-        auto& pool = location.memory ? memory_ : ssd_;
-        auto* host =
-            static_cast<char*>(pool.CopyAddress(location.slot)) + shard.index * shardBytes_;
+        auto* host = static_cast<char*>(memory_.CopyAddress(held.at(shard.owner))) +
+                     shard.index * shardBytes_;
         status = stream.HostToDeviceAsync(host, shard.addrs.data(), tensorSizes_);
     }
-    // Keep every cross-process lease until all submitted DMA has drained.
+    // A failed submission must still drain earlier DMA before slots can be reused.
     auto synced = stream.Synchronize();
     if (synced.Failure()) { status = synced; }
+    std::lock_guard<std::mutex> lock(mutex_);
     if (status.Success()) {
         const size_t payload = std::accumulate(tensorSizes_.begin(), tensorSizes_.end(), size_t(0));
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& shard : task) {
-            bool memory = held.at(shard.owner).memory;
-            stats_["h2d_bytes"] += payload;
-            ++stats_[memory ? "memory_load_shards" : "ssd_load_shards"];
-            if (!memory) { stats_["ssd_read_bytes"] += payload; }
+        stats_["h2d_bytes"] += payload * task.size();
+        for (const auto& shard : task) {
+            ++stats_[admitted.count(shard.owner) ? "backend_h2d_shards" : "memory_load_shards"];
         }
     }
-    for (const auto& pair : held) { metadata_.Release(pair.first); }
+    for (const auto& pair : held) {
+        if (reader_) {
+            metadata_.Release(pair.first);
+        } else {
+            --entries_.at(pair.first).references;
+        }
+    }
+    if (!reader_) {
+        stats_["memory_peak_blocks"] =
+            std::max(stats_["memory_peak_blocks"], uint64_t(memoryCount_ - memory_.FreeCount()));
+    }
     return status;
 }
 Status ContextStore::Transfer(CopyStream& stream, Detail::TaskDesc& task, bool dump)
 {
-    if (reader_) { return LoadShared(stream, task); }
+    if (!dump) { return LoadTask(stream, task); }
     struct Held {
         Key key;
         size_t slot;
-        bool memory;
     };
     std::map<Key, Held> held;
     std::vector<size_t> copied;
@@ -541,7 +679,7 @@ Status ContextStore::Transfer(CopyStream& stream, Detail::TaskDesc& task, bool d
     for (const auto& shard : task) {
         if (held.count(shard.owner)) { continue; }
         auto it = entries_.find(shard.owner);
-        if (dump && (it == entries_.end() || it->second.memory == none)) {
+        if (it == entries_.end()) {
             if (memory_.Empty()) {
                 status = Evict(lock, protectedKeys);
                 if (status.Failure()) { break; }
@@ -554,35 +692,30 @@ Status ContextStore::Transfer(CopyStream& stream, Detail::TaskDesc& task, bool d
             index_.Insert(shard.owner);
             it = entries_.find(shard.owner);
         }
-        if (it == entries_.end() || it->second.busy ||
-            (!dump && !it->second.ready && it->second.ssd == none)) {
+        if (it == entries_.end() || it->second.busy) {
             status = Status::NotFound();
             break;
         }
         auto& e = it->second;
-        bool fromMemory = dump || e.ready;
         ++e.references;
-        held.emplace(shard.owner, Held{shard.owner, fromMemory ? e.memory : e.ssd, fromMemory});
+        held.emplace(shard.owner, Held{shard.owner, e.memory});
     }
     if (status.Success()) {
         lock.unlock();
-        if (dump && task.prerequisiteHandle) {
+        if (task.prerequisiteHandle) {
             status = stream.WaitEvent(Trans::Event{task.prerequisiteHandle});
         }
         std::set<std::pair<Key, size_t>> submitted;
         for (size_t i = 0; status.Success() && i < task.size(); ++i) {
             auto& shard = task[i];
-            if (dump) {
-                lock.lock();
-                bool ready = entries_.at(shard.owner).shards[shard.index];
-                lock.unlock();
-                if (ready || !submitted.insert({shard.owner, shard.index}).second) { continue; }
-            }
+            lock.lock();
+            bool ready = entries_.at(shard.owner).shards[shard.index];
+            lock.unlock();
+            if (ready || !submitted.insert({shard.owner, shard.index}).second) { continue; }
             const auto& h = held.at(shard.owner);
-            auto& pool = h.memory ? memory_ : ssd_;
-            auto* host = static_cast<char*>(pool.CopyAddress(h.slot)) + shard.index * shardBytes_;
-            status = dump ? stream.DeviceToHostAsync(shard.addrs.data(), host, tensorSizes_)
-                          : stream.HostToDeviceAsync(host, shard.addrs.data(), tensorSizes_);
+            auto* host =
+                static_cast<char*>(memory_.CopyAddress(h.slot)) + shard.index * shardBytes_;
+            status = stream.DeviceToHostAsync(shard.addrs.data(), host, tensorSizes_);
             if (status.Success()) { copied.push_back(i); }
         }
         // Drain even on a submission error before releasing any addresses.
@@ -594,36 +727,29 @@ Status ContextStore::Transfer(CopyStream& stream, Detail::TaskDesc& task, bool d
     if (status.Success()) {
         for (auto i : copied) {
             const auto& shard = task[i];
-            if (dump) { entries_.at(shard.owner).shards[shard.index] = true; }
-            stats_[dump ? "d2h_bytes" : "h2d_bytes"] += payload;
-            if (!dump) {
-                bool memory = held.at(shard.owner).memory;
-                ++stats_[memory ? "memory_load_shards" : "ssd_load_shards"];
-                if (!memory) { stats_["ssd_read_bytes"] += payload; }
-            }
+            entries_.at(shard.owner).shards[shard.index] = true;
+            stats_["d2h_bytes"] += payload;
         }
     }
     for (const auto& pair : held) {
         const auto& key = pair.first;
         auto& e = entries_.at(key);
         --e.references;
-        if (dump && status.Success()) {
+        if (status.Success()) {
             e.ready = std::all_of(e.shards.begin(), e.shards.end(), [](bool b) { return b; });
             auto published = Publish(key, e);
             if (published.Failure()) { status = published; }
         }
-        if (dump && status.Failure() && !e.ready) {
+        if (status.Failure() && !e.ready) {
             memory_.Release(e.memory);
             e.memory = none;
             e.shards.clear();
             index_.Remove(key);
-            if (e.ssd == none) { entries_.erase(key); }
+            entries_.erase(key);
         }
     }
     stats_["memory_peak_blocks"] =
         std::max(stats_["memory_peak_blocks"], uint64_t(memoryCount_ - memory_.FreeCount()));
-    stats_["ssd_peak_blocks"] =
-        std::max(stats_["ssd_peak_blocks"], uint64_t(ssdCount_ - ssd_.FreeCount()));
     return status;
 }
 }  // namespace UC::Context

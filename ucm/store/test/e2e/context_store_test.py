@@ -29,7 +29,24 @@ def native():
     spec = importlib.util.spec_from_file_location("ucmpipelinestore", extension)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module, build / "ucm/store/context/libcontextstore.so"
+
+    class Pipeline:
+        def __init__(self):
+            self.store = module.PipelineStore()
+
+        def Stack(self, name, library, config):
+            fake_config = dict(config, share_buffer_enable=True, buffer_number=4096)
+            self.store.Stack(
+                "Fake", str(build / "ucm/store/fake/libfakestore.so"), fake_config
+            )
+            self.store.Stack(name, library, config)
+
+        def __getattr__(self, name):
+            return getattr(self.store, name)
+
+    return SimpleNamespace(
+        PipelineStore=Pipeline
+    ), build / "ucm/store/context/libcontextstore.so"
 
 
 def ids(*numbers):
@@ -47,7 +64,6 @@ def test_native_pipeline_on_evict_and_watcher():
         "shard_size": 64,
         "tensor_size": 64,
         "context_memory_capacity_bytes": 64,
-        "context_simulated_ssd_capacity_bytes": 128,
         "context_max_eviction_blocks": 1,
         "cache_stream_number": 2,
     }
@@ -64,17 +80,19 @@ def test_native_pipeline_on_evict_and_watcher():
         task = worker.Dump(ids(n), index, address, 0)
         worker.Wait(task)
         assert watcher.Lookup(ids(n)) == b"\1"
-        assert worker.ContextStats().get("ssd_write_blocks", 0) == n - 1
+        assert worker.ContextStats().get("backend_dump_blocks", 0) == n - 1
     target = np.zeros_like(source)
     task = worker.Load(ids(1), index, np.array([[target.ctypes.data]], dtype=np.uint64))
     worker.Wait(task)
+    # Fake.Load is a no-op: the reused slot still contains the second block.
     np.testing.assert_array_equal(source, target)
-    assert worker.ContextStats()["ssd_read_bytes"] == 64
+    assert worker.ContextStats()["backend_load_blocks"] == 1
+    assert worker.ContextStats()["memory_blocks"] == 1
     # Retiring a context does not remove its stored payload.
     worker.ObserveRequest("1", 0, 0, ids())
     assert watcher.LookupOnPrefix(ids(1, 2, 3)) == 1
     del worker
-    assert watcher.Lookup(ids(1, 2)) == b"\0\0"
+    assert watcher.Lookup(ids(1, 2)) == b"\1\1"
 
 
 def connector_functions():
@@ -154,7 +172,7 @@ def test_connector_transmits_full_prefix_even_for_suffix_io():
     assert meta.context_block_ids == blocks
     calls = []
     connector.connector_configs = [
-        {"ucm_connector_config": {"store_pipeline": "ContextStore"}}
+        {"ucm_connector_config": {"store_pipeline": "ContextStore|Fake"}}
     ]
     connector.store = SimpleNamespace(observe_request=lambda *args: calls.append(args))
     connector._observe_context_requests(SimpleNamespace(request_meta={"req": meta}))
@@ -233,7 +251,6 @@ def test_tp_processes_intersect_readiness_and_independent_evictions():
                         "shard_size": 64,
                         "tensor_size": 64,
                         "context_memory_capacity_bytes": 128,
-                        "context_simulated_ssd_capacity_bytes": 1024,
                         "context_max_eviction_blocks": 1,
                         "context_retention_ns": -1 if rank == 0 else 0,
                     },
@@ -254,14 +271,14 @@ def test_tp_processes_intersect_readiness_and_independent_evictions():
         assert watcher.Lookup(ids(1)) == b"\1"
         call(0, "dump", 2, 0)
         stats = call(0, "dump", 2, 1)
-        assert stats["ssd_write_blocks"] == 1
+        assert stats["backend_dump_blocks"] == 1
         assert watcher.LookupOnPrefix(ids(1, 2)) == 0
-        # Rank 0 reads SSD, rank 1 reads Memory, each with distinct actual bytes.
-        assert call(0, "load") == bytes([1]) * 64
+        # Rank 0 readmits via Fake (old slot bytes); rank 1 reads actual resident KV.
+        assert call(0, "load") == bytes([2]) * 64
         assert call(1, "load") == bytes([31]) * 64
         call(1, "dump", 2, 0)
         stats = call(1, "dump", 2, 1)
-        assert stats.get("ssd_write_blocks", 0) == 0
+        assert stats.get("backend_dump_blocks", 0) == 0
         assert watcher.Lookup(ids(1, 2)) == b"\0\1"
         assert watcher.LookupOnPrefix(ids(1, 2)) == -1
         assert watcher.LookupOnReverse(ids(1, 2)) == 1
@@ -316,7 +333,7 @@ def test_connector_supplies_tp_config_and_rejects_unsupported_modes(role):
     connector.connector_configs = [
         {
             "ucm_connector_name": "UcmPipelineStore",
-            "ucm_connector_config": {"store_pipeline": "ContextStore"},
+            "ucm_connector_config": {"store_pipeline": "ContextStore|Fake"},
         }
     ]
     parallel = SimpleNamespace(pipeline_parallel_size=1)
@@ -392,7 +409,7 @@ def test_scheduler_constructor_context_store_initialization(layerwise, cp_size, 
         "ucm_connectors": [
             {
                 "ucm_connector_name": "UcmPipelineStore",
-                "ucm_connector_config": {"store_pipeline": "ContextStore"},
+                "ucm_connector_config": {"store_pipeline": "ContextStore|Fake"},
             }
         ]
     }
@@ -592,7 +609,6 @@ def test_dsa_shared_three_components_and_mtp_shard_native_readback():
         "shard_size": 56,
         "tensor_size_list": sizes,
         "context_memory_capacity_bytes": 168,
-        "context_simulated_ssd_capacity_bytes": 168 * 4,
         "context_max_eviction_blocks": 1,
     }
     watcher = module.PipelineStore()
@@ -625,7 +641,7 @@ def test_dsa_shared_three_components_and_mtp_shard_native_readback():
             np.array([[a.ctypes.data for a in tensors]], dtype=np.uint64),
             0,
         )
-    # Read the single host copy on both ranks, first from Memory then SSD.
+    # Read shared Memory, then verify Fake readmission on rank 0.
     for evict in (False, True):
         if evict:
             owner.ObserveRequest("new", 2, 2, ids(2))
@@ -636,7 +652,15 @@ def test_dsa_shared_three_components_and_mtp_shard_native_readback():
                 0,
             )
             owner.Wait(task)
-            assert owner.ContextStats()["ssd_write_bytes"] == 168
+            for layer in (1, 2):
+                task = owner.Dump(
+                    ids(2),
+                    np.array([layer], dtype=np.uint64),
+                    np.array([[a.ctypes.data for a in tensors]], dtype=np.uint64),
+                    0,
+                )
+                owner.Wait(task)
+            assert owner.ContextStats()["backend_dump_bytes"] == 168
         for worker in (owner, reader):
             for layer in range(3):
                 tensors = [np.zeros(size, dtype=np.uint8) for size in sizes]
@@ -647,10 +671,11 @@ def test_dsa_shared_three_components_and_mtp_shard_native_readback():
                 )
                 worker.Wait(task)
                 for i, tensor in enumerate(tensors):
-                    assert np.all(tensor == layer * 3 + i)
+                    if not evict:
+                        assert np.all(tensor == layer * 3 + i)
     assert reader.ContextStats().get("d2h_bytes", 0) == 0
-    assert reader.ContextStats().get("ssd_write_bytes", 0) == 0
-    assert watcher.Lookup(ids(1, 2)) == b"\1\0"
+    assert reader.ContextStats().get("backend_dump_bytes", 0) == 0
+    assert watcher.Lookup(ids(1, 2)) == b"\1\1"
     del reader
     assert watcher.Lookup(ids(1)) == b"\1"
 
@@ -767,8 +792,8 @@ def test_mla_shared_payload_across_processes_and_owner_exit():
         "shard_size": 64,
         "tensor_size": 64,
         "context_memory_capacity_bytes": 64,
-        "context_simulated_ssd_capacity_bytes": 512,
         "context_max_eviction_blocks": 1,
+        "timeout_ms": 1000,
     }
     ctx = multiprocessing.get_context("spawn")
     parent, child = ctx.Pipe()
@@ -795,12 +820,21 @@ def test_mla_shared_payload_across_processes_and_owner_exit():
             )
             owner.Wait(task)
             parent.send("load")
+            if key == 2:
+                # Reader may arrive before rank 0 performs backend admission.
+                target = np.zeros_like(source)
+                task = owner.Load(
+                    ids(1),
+                    np.array([0], dtype=np.uint64),
+                    np.array([[target.ctypes.data]], dtype=np.uint64),
+                )
+                owner.Wait(task)
             assert parent.poll(30)
             data, stats = parent.recv()
             assert data == source.tobytes()
             assert stats.get("d2h_bytes", 0) == 0
-            assert stats.get("ssd_read_bytes", 0) == (64 if key == 2 else 0)
-        assert owner.ContextStats()["ssd_write_bytes"] == 64
+            assert stats.get("backend_load_blocks", 0) == 0
+        assert owner.ContextStats()["backend_dump_bytes"] == 128
         del owner
         parent.send("load")
         assert parent.poll(30) and parent.recv() == "missing"
@@ -813,3 +847,62 @@ def test_mla_shared_payload_across_processes_and_owner_exit():
             process.join()
         parent.close()
     assert process.exitcode == 0
+
+
+def test_registered_context_fake_builder_and_readmission():
+    import copy
+
+    wrapped, library = native()
+    pipeline = wrapped.PipelineStore().store
+    tree = ast.parse((ROOT / "ucm/store/pipeline/connector.py").read_text())
+    functions = [
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef)
+        and n.name in {"_context_pipeline_builder", "_fake_pipeline_builder"}
+    ]
+    ns = {
+        "copy": copy,
+        "Path": Path,
+        "Dict": dict,
+        "ucmpipelinestore": SimpleNamespace(PipelineStore=type(pipeline)),
+        "__file__": str(library.parent.parent / "pipeline/connector.py"),
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "builder", "exec"), ns)  # noqa: S102
+    config = {
+        "unique_id": "builder_" + uuid.uuid4().hex,
+        "device_id": 0,
+        "block_size": 64,
+        "shard_size": 64,
+        "tensor_size": 64,
+        "context_memory_capacity_bytes": 64,
+        "buffer_number": 4096,
+        "context_retention_ns": None,
+        "store_pipeline": "ContextStore|Fake",
+    }
+    ns["_context_pipeline_builder"](config, pipeline)
+    assert config["context_retention_ns"] is None
+    index = np.array([0], dtype=np.uint64)
+    for key in (1, 2):
+        data = np.full(64, key, dtype=np.uint8)
+        pipeline.ObserveRequest(str(key), key, key, ids(key))
+        task = pipeline.Dump(
+            ids(key), index, np.array([[data.ctypes.data]], dtype=np.uint64), 0
+        )
+        pipeline.Wait(task)
+    assert pipeline.ContextStats()["backend_dump_blocks"] == 1
+    assert pipeline.ContextStats()["d2h_bytes"] == 128
+    for attempt in range(2):
+        out = np.zeros(64, dtype=np.uint8)
+        task = pipeline.Load(
+            ids(1), index, np.array([[out.ctypes.data]], dtype=np.uint64)
+        )
+        pipeline.Wait(task)
+        # Fake did not recover block 1. H2D really copied block 2's residual bytes.
+        assert np.all(out == 2)
+        stats = pipeline.ContextStats()
+        assert stats["backend_load_blocks"] == 1
+        assert stats["memory_blocks"] == 1
+        assert stats["d2h_bytes"] == 128
+        assert stats["h2d_bytes"] == 64 * (attempt + 1)
+        assert not any("ssd" in key for key in stats)

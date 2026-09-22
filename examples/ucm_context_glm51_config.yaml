@@ -3,7 +3,7 @@
 # MTP/model/TP settings belong to the vLLM command, not this YAML.
 # MLA: rank 0 saves/evicts, all TP ranks load the same shared host copy.
 # Capacities below apply to the whole TP group, not each rank.
-# /dev/shm must hold both pools plus metadata.
+# /dev/shm must hold shared Memory plus metadata.
 # CPU fixtures validated; actual model/device run still requires validation.
 # ContextStore: GQA uses per-rank pools; MLA uses one shared pool owned by rank 0.
 # Single-host GQA/MLA TP, PP=CP=1, direct or layerwise attention.
@@ -13,13 +13,12 @@ enable_event_sync: true
 ucm_connectors:
   - ucm_connector_name: UcmPipelineStore
     ucm_connector_config:
-      store_pipeline: ContextStore
+      store_pipeline: ContextStore|Fake
       # GiB: GQA per rank; MLA per TP group (one shared copy).
-      # TP=4 GQA: 32 + 128 GiB total; MLA: 8 + 32 GiB total.
-      # Both pools use host memory; size the simulated SSD to avoid filling it.
       # context_tp_size/context_tp_rank are supplied by the connector.
       context_memory_capacity_gb: 8
-      context_simulated_ssd_capacity_gb: 32
+      # Fake metadata slots, shared by this DP group; GQA counts each TP rank.
+      buffer_number: 1048576
       context_alpha: 0.01
       # null/-1: always write back on eviction; otherwise idle > retention drops.
       context_retention_ns: 60000000000

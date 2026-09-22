@@ -43,10 +43,10 @@ struct SharedMetadata::Header {
 struct SharedMetadata::Entry {
     Key key{};
     uint8_t state = 0, copies = 0;
-    size_t memory = 0, ssd = 0, readers = 0;
+    size_t memory = 0, readers = 0;
     bool busy = false;
 };
-static constexpr uint64_t magic = 0x43545853544f0002ULL;
+static constexpr uint64_t magic = 0x43545853544f0003ULL;
 static_assert(std::atomic<uint64_t>::is_always_lock_free);
 SharedMetadata::~SharedMetadata() { Close(); }
 Status SharedMetadata::Setup(const std::string& name, bool owner, size_t capacity, uint64_t layout)
@@ -129,7 +129,7 @@ static bool Lock(pthread_mutex_t* lock, bool& alive)
     }
     return rc == 0;
 }
-Status SharedMetadata::Publish(const Key& key, uint8_t copies, size_t memory, size_t ssd)
+Status SharedMetadata::Publish(const Key& key, uint8_t copies, size_t memory)
 {
     if (!owner_ || !header_ || !Lock(&header_->lock, header_->alive)) {
         return Status::Error("metadata owner unavailable");
@@ -142,7 +142,6 @@ Status SharedMetadata::Publish(const Key& key, uint8_t copies, size_t memory, si
         if (entry.state == 1 && entry.key == key) {
             entry.copies = copies;
             entry.memory = memory;
-            entry.ssd = ssd;
             entry.busy = false;
             if (!copies) { entry.state = 2; }
             pthread_mutex_unlock(&header_->lock);
@@ -152,7 +151,7 @@ Status SharedMetadata::Publish(const Key& key, uint8_t copies, size_t memory, si
         if (entry.state == 0) { break; }
     }
     if (copies && firstFree != header_->capacity) {
-        entries_[firstFree] = Entry{key, 1, copies, memory, ssd, 0, false};
+        entries_[firstFree] = Entry{key, 1, copies, memory, 0, false};
     }
     pthread_mutex_unlock(&header_->lock);
     return copies && firstFree == header_->capacity ? Status::NoSpace() : Status::OK();
@@ -183,8 +182,7 @@ Expected<SharedMetadata::Location> SharedMetadata::Acquire(const Key& key, uint6
         return Status::NotFound();
     }
     ++entry->readers;
-    bool memory = entry->copies & 1;
-    Location location{memory ? entry->memory : entry->ssd, memory};
+    Location location{entry->memory};
     pthread_mutex_unlock(&header_->lock);
     return location;
 }

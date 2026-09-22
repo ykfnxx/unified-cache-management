@@ -1448,7 +1448,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         assert len(self.connector_configs) > 0, "no storage connector name in config."
         self._context_store_enabled = (
             self.connector_configs[0].get("ucm_connector_config", {}).get("store_pipeline")
-            == "ContextStore"
+            == "ContextStore|Fake"
         )
         share_buffer_enable = (
             self.connector_configs[0]
@@ -1609,7 +1609,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
         name = self.connector_configs[0]["ucm_connector_name"]
         module_path = self.connector_configs[0].get("ucm_connector_module_path", None)
         config = copy.deepcopy(self.connector_configs[0]["ucm_connector_config"])
-        if config.get("store_pipeline") == "ContextStore":
+        if config.get("store_pipeline") == "ContextStore|Fake":
             parallel = self._vllm_config.parallel_config
             if (
                 parallel.pipeline_parallel_size != 1
@@ -1623,13 +1623,13 @@ class UCMDirectConnector(KVConnectorBase_V1):
             )
             config["share_buffer_enable"] = self.is_mla
         config.setdefault("share_buffer_enable", self.is_mla)
-        if config.get("store_pipeline") != "ContextStore":
+        if config.get("store_pipeline") != "ContextStore|Fake":
             self._set_default_shm_buffer_capacity(config)
         if "storage_backends" in config:
             backends = [path for path in config["storage_backends"].split(":")]
             config["storage_backends"] = backends
         config["unique_id"] = f"{self.unique_id}"
-        if config.get("store_pipeline") == "ContextStore":
+        if config.get("store_pipeline") == "ContextStore|Fake":
             config["unique_id"] += f"_dp{self._dp_rank}"
         config["tensor_layout"] = "mla" if self.is_mla else "gqa"
         if self._role == KVConnectorRole.WORKER:
@@ -3254,7 +3254,7 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
         )
 
         context_store = any(
-            item.get("ucm_connector_config", {}).get("store_pipeline") == "ContextStore"
+            item.get("ucm_connector_config", {}).get("store_pipeline") == "ContextStore|Fake"
             for item in (self.launch_config or {}).get("ucm_connectors", [])
         )
         if context_store and use_lite:

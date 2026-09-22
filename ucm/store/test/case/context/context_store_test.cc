@@ -22,7 +22,9 @@
  * SOFTWARE.
  * */
 #include <array>
+#include <cstring>
 #include <gtest/gtest.h>
+#include <mutex>
 #include <random>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -39,18 +41,61 @@ Key Id(unsigned n)
     k[0] = std::byte(n);
     return k;
 }
+// A byte-preserving test backend validates addresses, admission and failure handling.
+// Production Fake is exercised separately by the native pipeline tests.
+class TestBackend : public StoreV1 {
+public:
+    std::mutex mutex;
+    std::map<std::pair<Key, size_t>, std::array<unsigned char, 64>> data;
+    bool failDump = false, failLoad = false;
+    Status Setup(const Detail::Dictionary&) override { return Status::OK(); }
+    std::string Readme() const override { return "TestBackend"; }
+    Expected<std::vector<uint8_t>> Lookup(const Key* keys, size_t n) override
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::vector<uint8_t> result;
+        for (size_t i = 0; i < n; ++i) { result.push_back(data.count({keys[i], 0})); }
+        return result;
+    }
+    Expected<ssize_t> LookupOnPrefix(const Key*, size_t) override { return -1; }
+    Expected<ssize_t> LookupOnReverse(const Key*, size_t) override { return -1; }
+    Expected<size_t> Dump(Detail::TaskDesc desc) override
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (failDump) { return Status::Error("injected dump failure"); }
+        for (const auto& shard : desc) {
+            std::memcpy(data[{shard.owner, shard.index}].data(), shard.addrs[0], 64);
+        }
+        return size_t(1);
+    }
+    Expected<size_t> Load(Detail::TaskDesc desc) override
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (failLoad) { return Status::Error("injected load failure"); }
+        for (const auto& shard : desc) {
+            auto it = data.find({shard.owner, shard.index});
+            if (it == data.end()) { return Status::NotFound(); }
+            std::memcpy(shard.addrs[0], it->second.data(), 64);
+        }
+        return size_t(1);
+    }
+    void Prefetch(const Key*, size_t) override {}
+    Expected<bool> Check(size_t) override { return true; }
+    Status Wait(size_t) override { return Status::OK(); }
+};
 class ContextStoreTest : public ::testing::Test {
 protected:
+    TestBackend backend;
     std::unique_ptr<StoreV1> store, watcher;
     std::string name;
     uint64_t clock = 0;
-    void Open(size_t memory = 2, size_t ssd = 8, int64_t retention = -1, size_t shards = 1,
-              bool shared = false)
+    void Open(size_t memory = 2, int64_t retention = -1, size_t shards = 1, bool shared = false)
     {
         static unsigned next = 0;
         name = "test_" + std::to_string(getpid()) + "_" + std::to_string(++next);
         Detail::Dictionary config;
         config.Set("unique_id", name);
+        config.Set<StoreV1*>("store_backend", &backend);
         config.Set("share_buffer_enable", shared);
         watcher.reset(MakeContextStore());
         ASSERT_TRUE(watcher->Setup(config).Success());
@@ -59,7 +104,6 @@ protected:
         config.SetNumber("shard_size", 64);
         config.SetNumber("tensor_size", 64);
         config.SetNumber("context_memory_capacity_bytes", memory * 64 * shards);
-        config.SetNumber("context_simulated_ssd_capacity_bytes", ssd * 64 * shards);
         config.SetNumber("context_retention_ns", retention);
         config.SetNumber("context_max_eviction_blocks", 1);
         config.SetNumber("cache_stream_number", 2);
@@ -107,29 +151,25 @@ protected:
 };
 TEST_F(ContextStoreTest, SharedMlaLeasePreventsEviction)
 {
-    Open(1, 8, -1, 1, true);
+    Open(1, -1, 1, true);
     Observe({1});
     ASSERT_TRUE(Dump(1).Success());
     Context::SharedMetadata peer;
     ASSERT_TRUE(peer.Setup(name + "_mla", false).Success());
     uint64_t layout = 1469598103934665603ULL;
-    for (size_t value : {64, 64, 1, 8, 64}) {
-        layout = (layout ^ uint64_t(value)) * 1099511628211ULL;
-    }
+    for (size_t value : {64, 64, 1, 64}) { layout = (layout ^ uint64_t(value)) * 1099511628211ULL; }
     EXPECT_FALSE(bool(peer.Acquire(Id(1), layout + 1)));
     auto lease = peer.Acquire(Id(1), layout);
     ASSERT_TRUE(bool(lease));
-    EXPECT_TRUE(lease.Value().memory);
+    EXPECT_EQ(lease.Value().slot, 0);
     Observe({2});
     EXPECT_EQ(Dump(2), Status::NoSpace());
     EXPECT_TRUE(Found(1));
     peer.Release(Id(1));
     ASSERT_TRUE(Dump(2).Success());
     lease = peer.Acquire(Id(1), layout);
-    ASSERT_TRUE(bool(lease));
-    EXPECT_FALSE(lease.Value().memory);
-    peer.Release(Id(1));
-    EXPECT_EQ(store->ContextStats()["ssd_write_bytes"], 64);
+    EXPECT_FALSE(bool(lease));
+    EXPECT_EQ(store->ContextStats()["backend_dump_bytes"], 64);
     ASSERT_TRUE(Load(1).Success());
 }
 
@@ -139,8 +179,8 @@ TEST_F(ContextStoreTest, SharedMlaEvictionReservationExcludesReaders)
     std::string id = "lease_" + std::to_string(getpid());
     ASSERT_TRUE(owner.Setup(id, true, 8, 123).Success());
     ASSERT_TRUE(peer.Setup(id, false).Success());
-    ASSERT_TRUE(owner.Publish(Id(1), 1, 4, 0).Success());
-    ASSERT_TRUE(owner.Publish(Id(2), 1, 5, 0).Success());
+    ASSERT_TRUE(owner.Publish(Id(1), 1, 4).Success());
+    ASSERT_TRUE(owner.Publish(Id(2), 1, 5).Success());
     ASSERT_TRUE(bool(peer.Acquire(Id(2), 123)));
     EXPECT_FALSE(owner.ReserveEviction({Id(1), Id(2)}));
     // Failed reservation is atomic: it must not leave the first entry busy.
@@ -149,60 +189,74 @@ TEST_F(ContextStoreTest, SharedMlaEvictionReservationExcludesReaders)
     peer.Release(Id(2));
     ASSERT_TRUE(owner.ReserveEviction({Id(1), Id(2)}));
     EXPECT_FALSE(bool(peer.Acquire(Id(1), 123)));
-    ASSERT_TRUE(owner.Publish(Id(1), 2, 0, 6).Success());
+    ASSERT_TRUE(owner.Publish(Id(1), 1, 6).Success());
     auto lease = peer.Acquire(Id(1), 123);
     ASSERT_TRUE(bool(lease));
-    EXPECT_FALSE(lease.Value().memory);
     EXPECT_EQ(lease.Value().slot, 6);
     peer.Release(Id(1));
     owner.Deactivate();
     EXPECT_FALSE(bool(peer.Acquire(Id(1), 123)));
 }
 
-TEST_F(ContextStoreTest, WritesOnlyOnEvictionAndLoadsSsdBytes)
+TEST_F(ContextStoreTest, WritesOnlyOnEvictionAndReadmitsBackendBytes)
 {
     Open();
     Observe({1});
     ASSERT_TRUE(Dump(1).Success());
     Observe({2});
     ASSERT_TRUE(Dump(2).Success());
-    EXPECT_EQ(store->ContextStats()["ssd_write_blocks"], 0);
+    EXPECT_EQ(store->ContextStats()["backend_dump_blocks"], 0);
     EXPECT_TRUE(Found(1));
     Observe({3});
     ASSERT_TRUE(Dump(3).Success());
     auto stats = store->ContextStats();
-    EXPECT_EQ(stats["ssd_write_blocks"], 1);
+    EXPECT_EQ(stats["backend_dump_blocks"], 1);
     EXPECT_EQ(stats["memory_blocks"], 2);
     ASSERT_TRUE(Load(1).Success());
-    EXPECT_EQ(store->ContextStats()["ssd_read_bytes"], 64);
+    EXPECT_EQ(store->ContextStats()["backend_load_blocks"], 1);
     EXPECT_EQ(store->ContextStats()["memory_blocks"], 2);
-    // Saving an SSD-resident key admits memory, but cannot duplicate its SSD write.
-    Observe({1});
-    ASSERT_TRUE(Dump(1).Success());
-    auto before = store->ContextStats()["ssd_write_blocks"];
+    // A repeated load hits admitted Memory and does not call the backend again.
+    ASSERT_TRUE(Load(1).Success());
+    EXPECT_EQ(store->ContextStats()["backend_load_blocks"], 1);
     Observe({4});
     ASSERT_TRUE(Dump(4).Success());
     Observe({5});
     ASSERT_TRUE(Dump(5).Success());
-    EXPECT_EQ(store->ContextStats()["ssd_write_skipped_blocks"], 1);
-    EXPECT_EQ(store->ContextStats()["ssd_write_blocks"], before + 1);
+    EXPECT_EQ(store->ContextStats()["backend_dump_skipped_blocks"], 1);
 }
 TEST_F(ContextStoreTest, DropDoesNotWriteAndMissingLoadFails)
 {
-    Open(1, 2, 5);
+    Open(1, 5);
     Observe({1}, 1);
     ASSERT_TRUE(Dump(1).Success());
     Observe({2}, 10);
     ASSERT_TRUE(Dump(2).Success());
     EXPECT_FALSE(Found(1));
     EXPECT_TRUE(Found(2));
-    EXPECT_EQ(store->ContextStats()["ssd_write_blocks"], 0);
+    EXPECT_EQ(store->ContextStats()["backend_dump_blocks"], 0);
     EXPECT_EQ(store->ContextStats()["drop_blocks"], 1);
     EXPECT_TRUE(Load(1).Failure());
 }
+TEST_F(ContextStoreTest, DropAfterReadmissionKeepsExistingBackendRecord)
+{
+    Open(1, 5);
+    Observe({1}, 1);
+    ASSERT_TRUE(Dump(1).Success());
+    Observe({2}, 2);
+    ASSERT_TRUE(Dump(2).Success());
+    ASSERT_TRUE(Load(1).Success());
+    EXPECT_EQ(store->ContextStats()["backend_dump_blocks"], 2);
+    Observe({3}, 20);
+    ASSERT_TRUE(Dump(3).Success());
+    EXPECT_EQ(store->ContextStats()["drop_blocks"], 1);
+    EXPECT_EQ(store->ContextStats()["backend_dump_blocks"], 2);
+    EXPECT_TRUE(Found(1));
+    EXPECT_TRUE(Found(2));
+    EXPECT_TRUE(Found(3));
+}
 TEST_F(ContextStoreTest, WholeBlockReadinessAndNoSpace)
 {
-    Open(1, 2, -1, 2);
+    Open(1, -1, 2);
     Observe({1});
     ASSERT_TRUE(Dump(1, 0).Success());
     EXPECT_FALSE(Found(1));
@@ -214,23 +268,44 @@ TEST_F(ContextStoreTest, WholeBlockReadinessAndNoSpace)
     ASSERT_TRUE(Load(1, 0).Success());
     ASSERT_TRUE(Load(1, 1, 83).Success());
     ASSERT_TRUE(Dump(2).Success());
-    EXPECT_EQ(store->ContextStats()["ssd_write_bytes"], 128);
+    EXPECT_EQ(store->ContextStats()["backend_dump_bytes"], 128);
+    ASSERT_TRUE(Dump(2, 1).Success());
     ASSERT_TRUE(Load(1, 1, 83).Success());
 }
-TEST_F(ContextStoreTest, FullSsdPreservesVictim)
+TEST_F(ContextStoreTest, BackendReadmissionPreservesAlreadySavedLayers)
 {
-    Open(1, 1);
+    Open(1, -1, 2);
+    Observe({1});
+    ASSERT_TRUE(Dump(1, 0).Success());
+    ASSERT_TRUE(Dump(1, 1, 83).Success());
+    Observe({2});
+    ASSERT_TRUE(Dump(2, 0).Success());
+    ASSERT_TRUE(Dump(2, 1).Success());
+    // Partial device save of a key that also exists in the backend.
+    Observe({1});
+    ASSERT_TRUE(Dump(1, 0, 99).Success());
+    ASSERT_TRUE(Load(1, 1, 83).Success());
+    ASSERT_TRUE(Load(1, 0, 99).Success());
+    EXPECT_EQ(store->ContextStats()["backend_load_shards"], 1);
+}
+TEST_F(ContextStoreTest, BackendFailurePreservesVictimAndReadmissionRetries)
+{
+    Open(1, -1, 1, true);
     Observe({1});
     ASSERT_TRUE(Dump(1).Success());
     Observe({2});
-    ASSERT_TRUE(Dump(2).Success());
-    Observe({3});
-    EXPECT_EQ(Dump(3), Status::NoSpace());
+    backend.failDump = true;
+    EXPECT_TRUE(Dump(2).Failure());
     EXPECT_TRUE(Found(1));
-    EXPECT_TRUE(Found(2));
-    EXPECT_FALSE(Found(3));
     ASSERT_TRUE(Load(1).Success());
-    ASSERT_TRUE(Load(2).Success());
+    backend.failDump = false;
+    ASSERT_TRUE(Dump(2).Success());
+    backend.failLoad = true;
+    EXPECT_TRUE(Load(1).Failure());
+    EXPECT_EQ(store->ContextStats()["memory_blocks"], 0);
+    backend.failLoad = false;
+    ASSERT_TRUE(Load(1).Success());
+    EXPECT_EQ(store->ContextStats()["memory_blocks"], 1);
 }
 TEST_F(ContextStoreTest, WatcherWorksInAnotherProcessAndOwnerCloses)
 {
@@ -242,6 +317,7 @@ TEST_F(ContextStoreTest, WatcherWorksInAnotherProcessAndOwnerCloses)
     if (child == 0) {
         Detail::Dictionary config;
         config.Set("unique_id", name);
+        config.Set<StoreV1*>("store_backend", &backend);
         std::unique_ptr<StoreV1> peer(MakeContextStore());
         auto setup = peer->Setup(config);
         auto key = Id(1);
@@ -282,7 +358,7 @@ TEST(ContextIndexTest, CandidateDepthBudgetAndBranchMerge)
 namespace {
 TEST_F(ContextStoreTest, MissingContextAndPartialFailureNeverPublishData)
 {
-    Open(1, 2, -1, 2);
+    Open(1, -1, 2);
     EXPECT_TRUE(Dump(1).Failure());
     Observe({1});
     std::array<unsigned char, 64> input{};
@@ -314,13 +390,14 @@ TEST_F(ContextStoreTest, RetiringRequestDoesNotInvalidateQueuedTransfer)
 }
 TEST_F(ContextStoreTest, WatcherExitDoesNotRemoveOwnerAndLookupDoesNotPin)
 {
-    Open(1, 2, 0);
+    Open(1, 0);
     Observe({1}, 1);
     ASSERT_TRUE(Dump(1).Success());
     EXPECT_TRUE(Found(1));
     watcher.reset();
     Detail::Dictionary config;
     config.Set("unique_id", name);
+    config.Set<StoreV1*>("store_backend", &backend);
     watcher.reset(MakeContextStore());
     ASSERT_TRUE(watcher->Setup(config).Success());
     EXPECT_TRUE(Found(1));

@@ -422,7 +422,8 @@ def _context_pipeline_builder(config, pipeline):
     if config.get("context_retention_ns") is None:
         config.pop("context_retention_ns", None)
     store_dir = Path(__file__).resolve().parent.parent
+    _fake_pipeline_builder(config, pipeline)
     pipeline.Stack("Context", str(store_dir / "context/libcontextstore.so"), config)
 
 
-UcmPipelineStoreBuilder.register("ContextStore", _context_pipeline_builder)
+UcmPipelineStoreBuilder.register("ContextStore|Fake", _context_pipeline_builder)

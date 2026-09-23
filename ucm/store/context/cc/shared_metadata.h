@@ -41,9 +41,13 @@ public:
     Status Publish(const Key& key, uint8_t copies, size_t memory = 0);
     Expected<Location> Acquire(const Key& key, uint64_t layout);
     void Release(const Key& key);
+    void Release(const Key* keys, size_t count);
     // Batch membership follows FIFO order for identical descriptors on each TP rank.
     Expected<uint64_t> BeginLoad(const Key& signature, size_t rank, uint64_t timeoutMs);
     Expected<Location> WaitAcquire(const Key& key, uint64_t layout, uint64_t batch);
+    // Wait only for the first key, then acquire the contiguous ready prefix.
+    Expected<size_t> WaitAcquire(const Key* keys, size_t count, Location* locations,
+                                 uint64_t layout, uint64_t batch);
     void FailLoad(uint64_t batch, const Status& status);
     // With wait=false, Retry means readers are pending before the batch deadline.
     Status WaitReaders(uint64_t batch, bool wait = true);

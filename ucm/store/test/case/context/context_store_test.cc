@@ -56,6 +56,7 @@ public:
     bool failDump = false, failLoad = false;
     size_t lookups = 0, loads = 0;
     std::function<void()> beforeLoad;
+    std::function<void(const Detail::TaskDesc&)> beforeDump;
     Status Setup(const Detail::Dictionary&) override { return Status::OK(); }
     std::string Readme() const override { return "TestBackend"; }
     Expected<std::vector<uint8_t>> Lookup(const Key* keys, size_t n) override
@@ -72,6 +73,7 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex);
         if (failDump) { return Status::Error("injected dump failure"); }
+        if (beforeDump) { beforeDump(desc); }
         for (const auto& shard : desc) {
             std::memcpy(data[{shard.owner, shard.index}].data(), shard.addrs[0], 64);
         }
@@ -421,6 +423,82 @@ TEST_F(ContextStoreTest, MlaReaderRegistersBeforeFirstLoad)
     EXPECT_TRUE(store->Wait(ownerTask.Value()).Success());
     EXPECT_EQ(ownerOut, readerOut);
 }
+TEST_F(ContextStoreTest, MlaReadReleasesRepeatedBlockShardsAcrossBatches)
+{
+    Detail::Dictionary config;
+    auto id = "repeated_shards_" + std::to_string(getpid());
+    config.Set("unique_id", id);
+    config.Set<StoreV1*>("store_backend", &backend);
+    config.Set("share_buffer_enable", true);
+    config.SetNumber("context_tp_size", 2);
+    config.SetNumber("block_size", 128);
+    config.SetNumber("shard_size", 64);
+    config.SetNumber("tensor_size", 64);
+    config.SetNumber("context_memory_capacity_bytes", 128);
+    config.SetNumber("timeout_ms", 2000);
+    config.SetNumber("device_id", 0);
+    store.reset(MakeContextStore());
+    ASSERT_TRUE(store->Setup(config).Success());
+    config.SetNumber("device_id", 1);
+    config.SetNumber("context_tp_rank", 1);
+    std::unique_ptr<StoreV1> reader(MakeContextStore());
+    ASSERT_TRUE(reader->Setup(config).Success());
+    Observe({1});
+    ASSERT_TRUE(Dump(1, 0, 11).Success());
+    ASSERT_TRUE(Dump(1, 1, 22).Success());
+    std::array<std::array<unsigned char, 64>, 40> ownerOut{}, readerOut{};
+    Detail::TaskDesc ownerDesc, readerDesc;
+    for (size_t i = 0; i < ownerOut.size(); ++i) {
+        ownerDesc.push_back({Id(1), i % 2, {ownerOut[i].data()}});
+        readerDesc.push_back({Id(1), i % 2, {readerOut[i].data()}});
+    }
+    auto ownerTask = store->Load(std::move(ownerDesc));
+    auto readerTask = reader->Load(std::move(readerDesc));
+    ASSERT_TRUE(ownerTask);
+    ASSERT_TRUE(readerTask);
+    ASSERT_TRUE(reader->Wait(readerTask.Value()).Success());
+    ASSERT_TRUE(store->Wait(ownerTask.Value()).Success());
+    for (size_t i = 0; i < ownerOut.size(); ++i) {
+        EXPECT_EQ(readerOut[i], ownerOut[i]);
+        EXPECT_TRUE(std::all_of(readerOut[i].begin(), readerOut[i].end(),
+                                [i](auto b) { return b == (i % 2 ? 22 : 11); }));
+    }
+    Context::SharedMetadata leases;
+    ASSERT_TRUE(leases.Setup(id + "_mla", false).Success());
+    auto available = leases.Lookup(nullptr, 0);  // Establish the watcher mapping.
+    ASSERT_TRUE(available);
+    EXPECT_TRUE(leases.Evictable(Id(1)));
+}
+TEST_F(ContextStoreTest, RepeatedObservationRefreshesRecencyAndRetiresReferences)
+{
+    Open(2, 10);
+    ASSERT_TRUE(store->ObserveRequest("a", 1, 1, {Id(1)}).Success());
+    ASSERT_TRUE(Dump(1).Success());
+    ASSERT_TRUE(store->ObserveRequest("b", 1, 2, {Id(2)}).Success());
+    ASSERT_TRUE(Dump(2).Success());
+    ASSERT_TRUE(store->ObserveRequest("a", 2, 100, {Id(1)}).Success());
+    ASSERT_TRUE(store->ObserveRequest("c", 1, 101, {Id(3)}).Success());
+    ASSERT_TRUE(Dump(3).Success());
+    EXPECT_TRUE(Found(1));
+    EXPECT_FALSE(Found(2));
+    EXPECT_EQ(store->ContextStats()["drop_blocks"], 1);
+    ASSERT_TRUE(store->ObserveRequest("ghost", 1, 102, {Id(9), Id(10)}).Success());
+    auto nodes = store->ContextStats()["topology_nodes"];
+    for (size_t i = 2; i < 10; ++i) {
+        ASSERT_TRUE(store->ObserveRequest("ghost", i, 102 + i, {Id(9), Id(10)}).Success());
+    }
+    ASSERT_TRUE(store->ObserveRequest("ghost", 0, 0, {}).Success());
+    EXPECT_EQ(store->ContextStats()["topology_nodes"], nodes - 2);
+}
+TEST(ContextIndexTest, RejectsRepeatedExistingAndNewNodes)
+{
+    Context::ContextIndex tree;
+    ASSERT_TRUE(tree.Observe({Id(1), Id(2)}, 1).Success());
+    EXPECT_TRUE(tree.Observe({Id(1), Id(2), Id(1)}, 2).Failure());
+    EXPECT_TRUE(tree.Observe({Id(3), Id(4), Id(3)}, 2).Failure());
+    EXPECT_EQ(tree.Size(), 2);
+    EXPECT_TRUE(tree.Observe({Id(1), Id(2)}, 3).Success());
+}
 TEST(ContextBufferTest, RanksCanInitializeSharedPayloadConcurrently)
 {
     std::array<Context::BufferPool, 4> pools;
@@ -579,7 +657,7 @@ TEST_F(ContextStoreTest, SharedMlaLeasePreventsEviction)
     ASSERT_TRUE(Dump(1).Success());
     Context::SharedMetadata peer;
     ASSERT_TRUE(peer.Setup(name + "_mla", false).Success());
-    uint64_t layout = 1469598103934665603ULL;
+    uint64_t layout = 1469598103934665603ULL ^ 1;
     for (size_t value : {64, 64, 1, 64}) { layout = (layout ^ uint64_t(value)) * 1099511628211ULL; }
     EXPECT_FALSE(bool(peer.Acquire(Id(1), layout + 1)));
     auto lease = peer.Acquire(Id(1), layout);
@@ -1093,4 +1171,88 @@ TEST(ContextMetadataTest, NotificationsFailuresAndBatchReuse)
     owner.FailLoad(writer.Value(), Status::Timeout());
     owner.EndLoad(writer.Value(), 0);
 }
+TEST(ContextMetadataTest, ReadyPrefixDoesNotWaitForLaterKeys)
+{
+    Context::SharedMetadata owner, peer;
+    auto name = "ready_prefix_" + std::to_string(getpid());
+    ASSERT_TRUE(owner.Setup(name, true, 17, 123, 2, 2).Success());
+    ASSERT_TRUE(peer.Setup(name, false).Success());
+    auto batch = owner.BeginLoad(Id(9), 0, 1000);
+    auto reader = peer.BeginLoad(Id(9), 1, 1000);
+    ASSERT_TRUE(batch);
+    ASSERT_TRUE(reader);
+    Context::Key keys[] = {Id(1), Id(2), Id(3)};
+    Context::SharedMetadata::Location locations[3];
+    ASSERT_TRUE(owner.Publish(keys[0], 1, 4).Success());
+    ASSERT_TRUE(owner.Publish(keys[2], 1, 6).Success());
+    // Key 2 is missing: acquire key 1 without waiting, and do not pin key 3.
+    auto prefix = peer.WaitAcquire(keys, 3, locations, 123, reader.Value());
+    ASSERT_TRUE(prefix);
+    ASSERT_EQ(prefix.Value(), 1);
+    EXPECT_EQ(locations[0].slot, 4);
+    EXPECT_FALSE(owner.Evictable(keys[0]));
+    EXPECT_TRUE(owner.Evictable(keys[2]));
+    peer.Release(keys, 1);
+    EXPECT_TRUE(owner.Evictable(keys[0]));
+    ASSERT_TRUE(owner.Publish(keys[1], 1, 5).Success());
+    ASSERT_TRUE(owner.ReserveEviction({keys[1]}));
+    prefix = peer.WaitAcquire(keys, 3, locations, 123, reader.Value());
+    ASSERT_TRUE(prefix);
+    ASSERT_EQ(prefix.Value(), 1);
+    peer.Release(keys, 1);
+    auto waiting = std::async(std::launch::async, [&] {
+        return peer.WaitAcquire(keys + 1, 2, locations, 123, reader.Value());
+    });
+    EXPECT_EQ(waiting.wait_for(std::chrono::milliseconds(10)), std::future_status::timeout);
+    ASSERT_TRUE(owner.Publish(keys[1], 1, 5).Success());
+    auto ready = waiting.get();
+    ASSERT_TRUE(ready);
+    ASSERT_EQ(ready.Value(), 2);
+    EXPECT_EQ(locations[0].slot, 5);
+    EXPECT_EQ(locations[1].slot, 6);
+    EXPECT_FALSE(owner.ReserveEviction({keys[1], keys[2]}));
+    peer.Release(keys + 1, 2);
+    EXPECT_TRUE(owner.ReserveEviction({keys[1], keys[2]}));
+    owner.FailLoad(batch.Value(), Status::NoSpace());
+    auto failed = peer.WaitAcquire(keys, 3, locations, 123, reader.Value());
+    ASSERT_FALSE(failed);
+    EXPECT_EQ(failed.Error(), Status::NoSpace());
+    EXPECT_TRUE(owner.Evictable(keys[0]));
+    peer.EndLoad(reader.Value(), 1);
+    owner.EndLoad(batch.Value(), 0);
+}
 }  // namespace
+
+TEST_F(ContextStoreTest, LayerMajorLayoutSurvivesEvictionAndReadmission)
+{
+    Open(3, -1, 3);
+    Observe({1, 2, 3});
+    for (unsigned key = 1; key <= 3; ++key) {
+        for (size_t layer = 0; layer < 3; ++layer) {
+            ASSERT_TRUE(Dump(key, layer, key * 10 + layer).Success());
+        }
+    }
+    std::map<std::pair<Key, size_t>, uintptr_t> addresses;
+    backend.beforeDump = [&](const Detail::TaskDesc& desc) {
+        for (const auto& shard : desc) {
+            addresses[{shard.owner, shard.index}] = reinterpret_cast<uintptr_t>(shard.addrs[0]);
+        }
+    };
+    for (unsigned key : {4, 5}) {
+        Observe({key});
+        for (size_t layer = 0; layer < 3; ++layer) {
+            ASSERT_TRUE(Dump(key, layer, key * 10 + layer).Success());
+        }
+    }
+    ASSERT_EQ(addresses.size(), 6);
+    for (unsigned key : {2, 3}) {
+        ASSERT_TRUE(addresses.count({Id(key), 0}));
+        EXPECT_EQ((addresses.at({Id(key), 1}) - addresses.at({Id(key), 0})), 3 * 64);
+        EXPECT_EQ((addresses.at({Id(key), 2}) - addresses.at({Id(key), 1})), 3 * 64);
+    }
+    EXPECT_EQ((addresses.at({Id(3), 0}) - addresses.at({Id(2), 0})), 64);
+    for (size_t layer = 0; layer < 3; ++layer) {
+        ASSERT_TRUE(Load(3, layer, 30 + layer).Success());
+    }
+    backend.beforeDump = {};
+}

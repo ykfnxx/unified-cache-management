@@ -238,12 +238,15 @@ Expected<SharedMetadata::Location> SharedMetadata::Acquire(const Key& key, uint6
     pthread_mutex_unlock(&header_->lock);
     return location;
 }
-void SharedMetadata::Release(const Key& key)
+void SharedMetadata::Release(const Key& key) { Release(&key, 1); }
+void SharedMetadata::Release(const Key* keys, size_t count)
 {
     std::lock_guard<std::mutex> guard(mutex_);
     if (!header_ || !Lock(&header_->lock, header_->alive)) { return; }
-    auto* entry = Find(key);
-    if (entry && entry->readers) { --entry->readers; }
+    for (size_t i = 0; i < count; ++i) {
+        auto* entry = Find(keys[i]);
+        if (entry && entry->readers) { --entry->readers; }
+    }
     pthread_mutex_unlock(&header_->lock);
 }
 bool SharedMetadata::Evictable(const Key& key)
@@ -369,11 +372,19 @@ Status SharedMetadata::WaitChange(const Batch& batch)
 Expected<SharedMetadata::Location> SharedMetadata::WaitAcquire(const Key& key, uint64_t layout,
                                                                uint64_t batch)
 {
+    Location location{};
+    auto result = WaitAcquire(&key, 1, &location, layout, batch);
+    return result ? Expected<Location>(Location{location}) : Expected<Location>(result.Error());
+}
+Expected<size_t> SharedMetadata::WaitAcquire(const Key* keys, size_t count, Location* locations,
+                                             uint64_t layout, uint64_t batch)
+{
+    if (!count) { return size_t(0); }
     // Mapping is established by BeginLoad, and remains live until consumers join.
     if (!Lock(&header_->lock, header_->alive)) { return Status::Error("metadata writer failed"); }
     auto* b = FindBatch(batch);
     Status status = Status::OK();
-    Location location{};
+    size_t acquired = 0;
     for (;;) {
         if (!b || header_->layout != layout) {
             status = Status::InvalidParam("context load layout/batch mismatch");
@@ -387,10 +398,14 @@ Expected<SharedMetadata::Location> SharedMetadata::WaitAcquire(const Key& key, u
             status = Status{b->failure, "context peer load failed"};
             break;
         }
-        auto* entry = Find(key);
+        auto* entry = Find(keys[0]);
         if (entry && entry->copies && !entry->busy) {
-            ++entry->readers;
-            location.slot = entry->memory;
+            do {
+                ++entry->readers;
+                locations[acquired++].slot = entry->memory;
+                if (acquired == count) { break; }
+                entry = Find(keys[acquired]);
+            } while (entry && entry->copies && !entry->busy);
             break;
         }
         status = WaitChange(*b);
@@ -403,7 +418,7 @@ Expected<SharedMetadata::Location> SharedMetadata::WaitAcquire(const Key& key, u
                                batch, b->joined, b->done)};
     }
     pthread_mutex_unlock(&header_->lock);
-    return status.Success() ? Expected<Location>(Location{location}) : Expected<Location>(status);
+    return status.Success() ? Expected<size_t>(size_t(acquired)) : Expected<size_t>(status);
 }
 void SharedMetadata::FailLoad(uint64_t batch, const Status& status)
 {

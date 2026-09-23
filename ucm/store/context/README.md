@@ -62,6 +62,10 @@ retention 只控制淘汰时的 Drop/Dump，不是驻留 TTL；没有后台到�
 
 ## TP、MLA 和 layerwise
 
+Memory 按 shard 分区：layerwise 下同一层各 block 的 slot 连续排列，地址为 `(layer * slot_count + slot) * shard_size`。策略仍按整个 block 管理引用与淘汰，后端写回和回填使用相同布局，不增加配置项。所有 TP rank 需使用同一版本的 native 库。
+
+H2D 按 CacheStore 的 rank 顺序和多 stream 方式逐 shard 提交；成功时最后一个 shard 直接触发 stream 同步与任务完成，准备失败时通过单独结束标记排空此前的传输。
+
 支持单机 GQA/MLA TP，PP=CP=1，direct 或 layerwise。MLA 包括普通 DSA KV 的多个 tensor component 以及已注册的 MTP 层；不包含 sparse C8、CP 或 hybrid attention 适配。
 
 - GQA：各 rank 独立 Memory 和策略；策略使用原始逻辑 hash，后端 ID 区分 TP rank。scheduler 对每个 rank 的 `Memory 或 Fake` 可用性取交集。

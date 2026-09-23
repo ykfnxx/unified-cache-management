@@ -81,10 +81,15 @@ Status ContextIndex::Observe(const std::vector<Key>& path, uint64_t timestamp)
     std::optional<Key> parent;
     std::set<Key> seen;
     for (const auto& id : path) {
-        if (!seen.insert(id).second) { return Status::InvalidParam("repeated block in prefix"); }
         auto found = nodes_.find(id);
-        if (found != nodes_.end() && found->second.parent != parent) {
-            return Status::InvalidParam("block prefix changed");
+        if (found != nodes_.end()) {
+            // Existing nodes have one immutable parent in an acyclic tree;
+            // a repeated node necessarily violates this parent relationship.
+            if (found->second.parent != parent) {
+                return Status::InvalidParam("block prefix changed");
+            }
+        } else if (!seen.insert(id).second) {
+            return Status::InvalidParam("repeated block in prefix");
         }
         parent = id;
     }

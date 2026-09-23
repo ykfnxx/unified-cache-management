@@ -158,6 +158,7 @@ def test_connector_transmits_full_prefix_even_for_suffix_io():
     connector._context_store_enabled = True
     connector.cp_world_size = 1
     connector.block_size = 16
+    connector.is_mla = False
     blocks = [bytes([n]) * 16 for n in range(4)]
     request = ns["RequestMeta"](
         ucm_block_ids=blocks,
@@ -318,7 +319,11 @@ def test_context_keys_match_io_on_every_rank(rank, is_mla):
             }
         )
     )
-    assert connector._store_block_ids(blocks) == calls[0][3] == blocks
+    assert connector._store_block_ids(blocks) == blocks
+    if is_mla and rank != 0:
+        assert calls == []
+    else:
+        assert calls[0][3] == blocks
     # Existing stores retain their nonzero-rank hashing rule.
     connector._context_store_enabled = False
     expected = (

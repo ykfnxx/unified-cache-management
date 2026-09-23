@@ -2137,6 +2137,9 @@ class UCMDirectConnector(KVConnectorBase_V1):
     def _observe_context_requests(self, metadata) -> None:
         if not self._context_store_enabled:
             return
+        # Shared MLA policy lives on the owner; avoid packing IDs on readers.
+        if self.is_mla and self.tp_rank % self.tp_size != 0:
+            return
         timestamp = time.monotonic_ns()
         for request_id, request in metadata.request_meta.items():
             self.store.observe_request(
@@ -2534,7 +2537,9 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self,
         finished_req_ids: set[str],
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
-        if self._context_store_enabled:
+        if self._context_store_enabled and (
+            not self.is_mla or self.tp_rank % self.tp_size == 0
+        ):
             for request_id in finished_req_ids:
                 self.store.observe_request(request_id, 0, 0, [])
         finished_recving = self._poll_pending_load_tasks()

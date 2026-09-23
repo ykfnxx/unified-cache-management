@@ -186,6 +186,56 @@ def test_connector_transmits_full_prefix_even_for_suffix_io():
     assert len(calls) == 1
 
 
+def test_decode_does_not_rebroadcast_or_retire_context():
+    ns = connector_functions()
+    connector = ns["Connector"]()
+    connector._context_store_enabled = True
+    connector.cp_world_size = 1
+    connector.block_size = 16
+    connector.is_mla = False
+    blocks = [bytes([n]) * 16 for n in range(4)]
+    request = ns["RequestMeta"](
+        ucm_block_ids=blocks, num_token_ids=64, token_processed=64
+    )
+    calls = []
+    connector.store = SimpleNamespace(observe_request=lambda *args: calls.append(args))
+    # A new all-HBM-hit request still supplies topology despite having no I/O.
+    first = connector._generate_dispatch_meta(request, 1, [10, 11, 12, 13])
+    connector._observe_context_requests(SimpleNamespace(request_meta={"req": first}))
+    assert first.context_block_ids == blocks
+    assert len(calls) == 1
+    for _ in range(5):
+        step = connector._generate_dispatch_meta(request, 1, [], need_load=False)
+        assert step.context_block_ids == []
+        assert step.context_observation == 0
+        connector._observe_context_requests(SimpleNamespace(request_meta={"req": step}))
+    # An empty dispatch must not become ObserveRequest(..., []), which retires it.
+    assert len(calls) == 1
+    resumed = connector._generate_dispatch_meta(request, 1, [20, 21, 22, 23])
+    connector._observe_context_requests(SimpleNamespace(request_meta={"req": resumed}))
+    assert len(calls) == 2
+    assert resumed.context_observation > first.context_observation
+
+
+def test_chunked_prefill_still_refreshes_context_when_saving():
+    ns = connector_functions()
+    connector = ns["Connector"]()
+    connector._context_store_enabled = True
+    connector.cp_world_size = 1
+    connector.block_size = 16
+    blocks = [bytes([n]) * 16 for n in range(4)]
+    request = ns["RequestMeta"](
+        ucm_block_ids=blocks,
+        num_token_ids=64,
+        token_processed=32,
+        vllm_block_ids=[10, 11],
+    )
+    step = connector._generate_dispatch_meta(request, 32, [12, 13], need_load=False)
+    assert step.dump_block_ids == (blocks[2:], [12, 13])
+    assert step.context_block_ids == blocks
+    assert step.context_observation > 0
+
+
 def rank_process(connection, config):
     module, library = native()
     worker = module.PipelineStore()
@@ -942,6 +992,11 @@ def test_mla_late_reader_refills_independently_and_capacity_failure(partial):
             owner.Wait(
                 owner.Dump(ids(key), np.array([layer], dtype=np.uint64), address, 0)
             )
+    if partial:
+        # One partial block uses only one of the two shard slots. Fill the other
+        # with another incomplete device block before testing true exhaustion.
+        owner.ObserveRequest("3", 3, 3, ids(3))
+        owner.Wait(owner.Dump(ids(3), index, address, 0))
     out_owner, out_reader = np.zeros_like(source), np.zeros_like(source)
     owner_task = owner.Load(
         ids(1), index, np.array([[out_owner.ctypes.data]], dtype=np.uint64)
@@ -966,7 +1021,9 @@ def test_mla_late_reader_refills_independently_and_capacity_failure(partial):
         owner.ObserveRequest("3", 3, 3, ids(3))
         # Completed local H2D releases its handles; no cross-rank batch pins remain.
         for layer in range(2):
-            owner.Wait(owner.Dump(ids(3), np.array([layer], dtype=np.uint64), address, 0))
+            owner.Wait(
+                owner.Dump(ids(3), np.array([layer], dtype=np.uint64), address, 0)
+            )
         # A late reader can refill from Fake itself, without another owner Load.
         reader_task = reader.Load(
             ids(1), index, np.array([[out_reader.ctypes.data]], dtype=np.uint64)

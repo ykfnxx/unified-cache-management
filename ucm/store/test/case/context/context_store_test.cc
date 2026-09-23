@@ -34,6 +34,7 @@
 #include <unistd.h>
 #include "context_index.h"
 #include "metrics_api.h"
+#include "trans_buffer.h"
 #include "ucmstore_v1.h"
 extern "C" UC::StoreV1* MakeContextStore();
 namespace {
@@ -287,23 +288,224 @@ TEST_F(ContextStoreTest, DropAfterReadmissionKeepsExistingBackendRecord)
     EXPECT_TRUE(Found(2));
     EXPECT_TRUE(Found(3));
 }
-TEST_F(ContextStoreTest, WholeBlockReadinessAndNoSpace)
+TEST_F(ContextStoreTest, WholeBlockReadinessAndWriteback)
 {
     Open(1, -1, 2);
     Observe({1});
     ASSERT_TRUE(Dump(1, 0).Success());
     EXPECT_FALSE(Found(1));
     ASSERT_TRUE(Load(1).Success());
-    Observe({2});
-    EXPECT_EQ(Dump(2), Status::NoSpace());
     ASSERT_TRUE(Dump(1, 1, 83).Success());
     EXPECT_TRUE(Found(1));
     ASSERT_TRUE(Load(1, 0).Success());
     ASSERT_TRUE(Load(1, 1, 83).Success());
+    Observe({2});
     ASSERT_TRUE(Dump(2).Success());
     EXPECT_EQ(store->ContextStats()["backend_dump_bytes"], 128);
     ASSERT_TRUE(Dump(2, 1).Success());
     ASSERT_TRUE(Load(1, 1, 83).Success());
+}
+TEST_F(ContextStoreTest, PartialDeviceBlocksOnlyConsumeSavedShards)
+{
+    Open(1, -1, 2);
+    Observe({1});
+    Observe({2});
+    Observe({3});
+    ASSERT_TRUE(Dump(1, 0).Success());
+    ASSERT_TRUE(Dump(2, 0).Success());
+    auto stats = store->ContextStats();
+    EXPECT_EQ(stats["memory_blocks"], 2);
+    EXPECT_EQ(stats["memory_shards"], 2);
+    EXPECT_EQ(stats["memory_bytes"], 128);
+    EXPECT_FALSE(Found(1));
+    EXPECT_FALSE(Found(2));
+    // Both slots hold incomplete device data with no backend copy to restore.
+    EXPECT_EQ(Dump(3, 0), Status::NoSpace());
+    EXPECT_EQ(store->ContextStats()["backend_dump_blocks"], 0);
+}
+TEST_F(ContextStoreTest, LayerwiseAllocatesRequestedAndNextLayerOnly)
+{
+    Open(1, -1, 32);
+    for (unsigned key = 1; key <= 16; ++key) {
+        Observe({key});
+        backend.data[{Id(key), 0}].fill(71);
+        backend.data[{Id(key), 1}].fill(83);
+        ASSERT_TRUE(Load(key, 0).Success());
+    }
+    auto stats = store->ContextStats();
+    EXPECT_EQ(stats["memory_blocks"], 16);
+    EXPECT_GE(stats["memory_shards"], 16);
+    EXPECT_LE(stats["memory_shards"], 32);
+    EXPECT_EQ(stats["backend_load_shards"], 16);
+    EXPECT_EQ(stats["evicted_blocks"], 0);
+    for (unsigned key = 1; key <= 16; ++key) { ASSERT_TRUE(Load(key, 1, 83).Success()); }
+    stats = store->ContextStats();
+    EXPECT_EQ(stats["memory_shards"], 32);
+    EXPECT_EQ(stats["backend_load_shards"], 32);
+    EXPECT_EQ(stats["evicted_blocks"], 0);
+}
+TEST_F(ContextStoreTest, WholeBlockEvictionWritesNoncontiguousShards)
+{
+    Open(2, -1, 2);
+    Observe({1});
+    Observe({2});
+    ASSERT_TRUE(Dump(1, 0, 11).Success());
+    ASSERT_TRUE(Dump(2, 0, 21).Success());
+    ASSERT_TRUE(Dump(1, 1, 12).Success());
+    ASSERT_TRUE(Dump(2, 1, 22).Success());
+    Observe({3});
+    ASSERT_TRUE(Dump(3, 0, 31).Success());
+    EXPECT_EQ(backend.data.at(std::make_pair(Id(1), size_t(0))).front(), 11);
+    EXPECT_EQ(backend.data.at(std::make_pair(Id(1), size_t(1))).front(), 12);
+    EXPECT_EQ(store->ContextStats()["memory_shards"], 3);
+    EXPECT_EQ(store->ContextStats()["backend_dump_bytes"], 128);
+    ASSERT_TRUE(Load(1, 1, 12).Success());
+    ASSERT_TRUE(Load(1, 0, 11).Success());
+}
+TEST_F(ContextStoreTest, PinnedShardWaitsForTransferInsteadOfFailingAllocation)
+{
+    Open(1, -1, 1, true);
+    Observe({1});
+    Observe({2});
+    backend.data[{Id(1), 0}].fill(71);
+    backend.data[{Id(2), 0}].fill(83);
+    Detail::Dictionary cfg;
+    cfg.Set("unique_id", name);
+    cfg.Set<StoreV1*>("store_backend", &backend);
+    cfg.Set("share_buffer_enable", true);
+    cfg.SetNumber("device_id", 1);
+    cfg.SetNumber("context_tp_size", 2);
+    cfg.SetNumber("context_tp_rank", 1);
+    cfg.SetNumber("block_size", 64);
+    cfg.SetNumber("shard_size", 64);
+    cfg.SetNumber("tensor_size", 64);
+    cfg.SetNumber("context_memory_capacity_bytes", 64);
+    std::unique_ptr<StoreV1> reader(MakeContextStore());
+    ASSERT_TRUE(reader->Setup(cfg).Success());
+    std::promise<void> entered, resume;
+    auto gate = resume.get_future().share();
+    std::atomic<size_t> calls{0};
+    backend.beforeLoad = [&] {
+        if (calls.fetch_add(1) == 0) {
+            entered.set_value();
+            gate.wait();
+        }
+    };
+    std::array<unsigned char, 64> a{}, b{};
+    auto first = store->Load({
+        {Id(1), 0, {a.data()}}
+    });
+    ASSERT_TRUE(bool(first));
+    entered.get_future().wait();
+    auto second = reader->Load({
+        {Id(2), 0, {b.data()}}
+    });
+    ASSERT_TRUE(bool(second));
+    auto done = std::async(std::launch::async, [&] { return reader->Wait(second.Value()); });
+    EXPECT_EQ(done.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    resume.set_value();
+    EXPECT_TRUE(store->Wait(first.Value()).Success());
+    EXPECT_TRUE(done.get().Success());
+    EXPECT_EQ(a.front(), 71);
+    EXPECT_EQ(b.front(), 83);
+}
+TEST_F(ContextStoreTest, AllocationProceedsBeforePressureBatchFinishes)
+{
+    Open(80);
+    for (unsigned key = 1; key <= 80; ++key) {
+        Observe({key});
+        ASSERT_TRUE(Dump(key).Success());
+    }
+    Observe({81});
+    std::promise<void> entered, resume;
+    auto enteredFuture = entered.get_future();
+    auto gate = resume.get_future().share();
+    size_t writes = 0;
+    backend.beforeDump = [&](const auto&) {
+        if (++writes == 2) {
+            entered.set_value();
+            gate.wait();
+        }
+    };
+    std::array<unsigned char, 64> data{};
+    auto task = store->Dump({
+        {Id(81), 0, {data.data()}}
+    });
+    ASSERT_TRUE(bool(task));
+    auto done = std::async(std::launch::async, [&] { return store->Wait(task.Value()); });
+    EXPECT_EQ(enteredFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    // The first victim's free slot is usable while the second writeback waits.
+    EXPECT_EQ(done.wait_for(std::chrono::milliseconds(100)), std::future_status::ready);
+    resume.set_value();
+    EXPECT_TRUE(done.get().Success());
+    // Join maintenance before destroying the callback's captured promises.
+    store.reset();
+}
+TEST_F(ContextStoreTest, ObserveDoesNotWaitForBackendWriteback)
+{
+    Open(1);
+    Observe({1});
+    ASSERT_TRUE(Dump(1).Success());
+    Observe({2});
+    std::promise<void> entered, resume;
+    auto enteredFuture = entered.get_future();
+    auto gate = resume.get_future().share();
+    backend.beforeDump = [&](const auto&) {
+        entered.set_value();
+        gate.wait();
+    };
+    std::array<unsigned char, 64> data{};
+    auto task = store->Dump({
+        {Id(2), 0, {data.data()}}
+    });
+    ASSERT_TRUE(task);
+    EXPECT_EQ(enteredFuture.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    auto observation = std::async(std::launch::async,
+                                  [&] { return store->ObserveRequest("next", 1, 3, {Id(3)}); });
+    const auto ready = observation.wait_for(std::chrono::milliseconds(100));
+    resume.set_value();
+    EXPECT_EQ(ready, std::future_status::ready);
+    EXPECT_TRUE(observation.get().Success());
+    EXPECT_TRUE(store->Wait(task.Value()).Success());
+    store.reset();
+}
+TEST_F(ContextStoreTest, PreallocationDoesNotClaimFillAndLaterShardPinsWholeVictim)
+{
+    Context::Config c;
+    c.uniqueId = "pins_" + std::to_string(getpid());
+    c.storeBackend = &backend;
+    c.deviceId = 0;
+    c.blockSize = c.bufferCapacity = 128;
+    c.shardSize = 64;
+    c.tensorSizes = {64};
+    c.timeoutMs = 2000;
+    Context::TransBuffer buffer;
+    ASSERT_TRUE(buffer.Setup(c).Success());
+    ASSERT_TRUE(buffer.Observe("a", 1, 1, {Id(1)}).Success());
+    ASSERT_TRUE(buffer.Observe("b", 1, 2, {Id(2)}).Success());
+    backend.data[{Id(1), 0}].fill(71);
+    {
+        auto first = buffer.Get(Id(1), 0);
+        ASSERT_TRUE(first);
+        first.Value().MarkReady(true);
+    }
+    buffer.Prealloc(Id(1), 1);
+    auto second = buffer.Get(Id(1), 1);
+    ASSERT_TRUE(second);
+    EXPECT_TRUE(second.Value().Owner());
+    EXPECT_FALSE(second.Value().Ready());
+    second.Value().MarkReady(true);
+    auto retained = second.Value();
+    second.Value() = {};
+    auto pending = std::async(std::launch::async, [&] { return buffer.Get(Id(2), 0); });
+    EXPECT_EQ(pending.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    // Copying a Handle does not add another active shard. The copied handle
+    // still protects the entire block after the original handle is released.
+    retained = {};
+    auto admitted = pending.get();
+    ASSERT_TRUE(admitted);
+    EXPECT_TRUE(admitted.Value().Owner());
+    EXPECT_EQ(buffer.Stats()["evicted_blocks"], 1);
 }
 TEST_F(ContextStoreTest, BackendReadmissionPreservesAlreadySavedLayers)
 {

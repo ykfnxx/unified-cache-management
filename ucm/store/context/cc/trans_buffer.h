@@ -109,6 +109,7 @@ public:
     ~TransBuffer();
     Status Setup(const Config& config);
     Expected<Handle> Get(const Detail::BlockId& blockId, size_t shardIdx);
+    void Prealloc(const Detail::BlockId& blockId, size_t shardIdx);
     Detail::BlockId BackendKey(const Detail::BlockId& key) const;
     Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* keys, size_t n);
     bool Exist(const Detail::BlockId& blockId);
@@ -120,6 +121,9 @@ public:
     std::map<std::string, uint64_t> Stats();
 
 private:
+    Expected<Handle> Alloc(const Detail::BlockId& key, size_t layer, bool prealloc);
+    bool ExistAt(size_t bucket, const Detail::BlockId& key, size_t layer);
+    size_t FindAt(size_t bucket, const Detail::BlockId& key, size_t layer, bool& owner);
     struct Impl;
     std::unique_ptr<Impl> impl_;
     void* DataAt(Index pos);

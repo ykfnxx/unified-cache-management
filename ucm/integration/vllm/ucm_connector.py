@@ -2035,11 +2035,16 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 )
                 dump_vllm_block_ids = dump_vllm_block_ids[: len(dump_ucm_block_ids)]
 
+        # Decode does not access the stored prompt. Keep its context until
+        # get_finished retires it, without broadcasting or refreshing each token.
+        observe_context = self._context_store_enabled and (
+            need_load or bool(dump_ucm_block_ids)
+        )
         return RequestDispatchMeta(
             (load_ucm_block_ids, load_vllm_block_ids),
             (dump_ucm_block_ids, dump_vllm_block_ids),
-            context_block_ids=(list(ucm_block_ids) if self._context_store_enabled else []),
-            context_observation=(time.monotonic_ns() if self._context_store_enabled else 0),
+            context_block_ids=(list(ucm_block_ids) if observe_context else []),
+            context_observation=(time.monotonic_ns() if observe_context else 0),
         )
 
     def build_connector_meta(
@@ -2142,6 +2147,8 @@ class UCMDirectConnector(KVConnectorBase_V1):
             return
         timestamp = time.monotonic_ns()
         for request_id, request in metadata.request_meta.items():
+            if not request.context_block_ids:
+                continue
             self.store.observe_request(
                 request_id, request.context_observation, timestamp, request.context_block_ids
             )

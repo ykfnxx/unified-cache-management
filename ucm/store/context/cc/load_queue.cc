@@ -51,6 +51,7 @@ Status LoadQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     cacheSdmaDirect_ = config.cacheSdmaDirect;
     cpuAffinityCores_ = config.cpuAffinityCores;
     localRankSize_ = config.localRankSize;
+    nShardPerBlock_ = config.blockSize / config.shardSize;
     waiting_.Setup(config.waitingQueueDepth);
     running_.Setup(config.runningQueueDepth);
     holder_.reserve(1024);
@@ -110,6 +111,10 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
     }
     auto& task = pair.first;
     auto& waiter = pair.second;
+    if (failureSet_->Contains(task->id)) {
+        waiter->Done();
+        return;
+    }
     const auto nShard = task->desc.size();
     const auto indexes = RearrangeIndex(nShard, deviceId_, localRankSize_);
     size_t misses = 0, backendCount = 0;
@@ -120,7 +125,6 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
         auto& shard = task->desc[indexes[i]];
         ShardTask item;
         item.task = task;
-        item.shard = shard;
         auto handle = buffer_->Get(shard.owner, shard.index);
         if (!handle) {
             UC_ERROR("Context Load allocation failed: device={}, task={}, shard={}, status={}",
@@ -161,6 +165,7 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
             item.backendTaskHandle = res.Value();
             ++backendCount;
         }
+        item.shard = std::move(shard);
         item.waiter = i + 1 == nShard ? waiter : nullptr;
         running_.Push(std::move(item));
     }
@@ -169,6 +174,10 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
                          backendCount);
     Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_load_backend_submit_duration_ms"),
                          (NowTime::Now() - started) * 1e3);
+    for (const auto i : indexes) {
+        const auto& shard = task->desc[i];
+        if (shard.index + 1 < nShardPerBlock_) { buffer_->Prealloc(shard.owner, shard.index + 1); }
+    }
 }
 
 void LoadQueue::TransferStage(std::promise<Status>& started)
@@ -216,9 +225,11 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& item)
             task->Fail(s);
             failureSet_->Insert(task->id);
         }
-        holder_.push_back(std::move(item));
     }
-    if (!waiter) { return; }
+    if (!waiter) {
+        holder_.push_back(std::move(item));
+        return;
+    }
     auto start = NowTime::Now();
     auto s = stream.Synchronize();
     RecordH2dSyncMetrics((NowTime::Now() - start) * 1e3);
@@ -226,8 +237,11 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& item)
         task->Fail(s);
         failureSet_->Insert(task->id);
     }
-    RecordShardResults(holder_, !failureSet_->Contains(task->id));
-    if (!failureSet_->Contains(task->id)) { buffer_->RecordRead(holder_.size()); }
+    const auto* extra = item.bufferHandle ? &item : nullptr;
+    RecordShardResults(holder_, extra, !failureSet_->Contains(task->id));
+    if (!failureSet_->Contains(task->id)) {
+        buffer_->RecordRead(holder_.size() + (extra != nullptr));
+    }
     holder_.clear();
     waiter->Done();
 }
@@ -262,25 +276,33 @@ Status LoadQueue::WaitBackendTaskReady(ShardTask& task)
 Status LoadQueue::HostToDeviceAsync(CopyStream& stream, void* host, void** device)
 { return stream.HostToDeviceAsync(host, device, tensorSizes_); }
 
-void LoadQueue::RecordShardResults(const std::vector<ShardTask>& tasks, bool success) const
+void LoadQueue::RecordShardResults(const std::vector<ShardTask>& tasks, const ShardTask* extra,
+                                   bool success) const
 {
     size_t cache = 0;
-    size_t waited = 0;
+    size_t posix = 0;
     for (const auto& task : tasks) {
         if (task.wasNotReady) {
-            ++waited;
+            ++posix;
+        } else {
+            ++cache;
+        }
+    }
+    if (extra != nullptr) {
+        if (extra->wasNotReady) {
+            ++posix;
         } else {
             ++cache;
         }
     }
     if (!success) {
-        RecordFailedShards(cache + waited);
+        RecordFailedShards(cache + posix);
         return;
     }
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_load_success_shards_total"),
                              static_cast<double>(cache));
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_wait_load_success_shards_total"),
-                             static_cast<double>(waited));
+                             static_cast<double>(posix));
 }
 
 void LoadQueue::RecordFailedShards(size_t count) const

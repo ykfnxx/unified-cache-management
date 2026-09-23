@@ -161,7 +161,10 @@ def _get_store_gc_block_size(
 _SHM_DIR = "/dev/shm"
 
 
-def _check_shm_capacity(cache_buffer_capacity_gb: int) -> None:
+def _check_shm_capacity(
+    cache_buffer_capacity_gb: int | float,
+    capacity_field: str = "cache_buffer_capacity_gb",
+) -> None:
     """Early-validate that /dev/shm can hold the shared-buffer store.
 
     With ``share_buffer_enable=True`` the cache buffer is backed by ``shm_open``
@@ -183,7 +186,7 @@ def _check_shm_capacity(cache_buffer_capacity_gb: int) -> None:
             f"Shared-buffer cache requires {cache_buffer_capacity_gb}GB in {_SHM_DIR}, "
             f"but {_SHM_DIR} has only {shm_total >> 30}GB. "
             f"Either increase the size of {_SHM_DIR} (e.g. remount tmpfs with a "
-            f"larger size= option) or decrease cache_buffer_capacity_gb."
+            f"larger size= option) or decrease {capacity_field}."
         )
 
 
@@ -1576,6 +1579,18 @@ class UCMDirectConnector(KVConnectorBase_V1):
 
     def _set_default_shm_buffer_capacity(self, config: dict[str, Any]) -> None:
         if not bool(config.get("share_buffer_enable", False)):
+            return
+        if config.get("store_pipeline") == "ContextStore|Fake":
+            if config.get("context_memory_capacity_bytes"):
+                _check_shm_capacity(
+                    int(config["context_memory_capacity_bytes"]) / (1 << 30),
+                    "context_memory_capacity_bytes",
+                )
+            elif config.get("context_memory_capacity_gb"):
+                _check_shm_capacity(
+                    int(config["context_memory_capacity_gb"]),
+                    "context_memory_capacity_gb",
+                )
             return
         if config.get("cache_buffer_capacity_gb") is None:
             config["cache_buffer_capacity_gb"] = 128

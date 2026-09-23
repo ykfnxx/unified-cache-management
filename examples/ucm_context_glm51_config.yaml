@@ -8,7 +8,7 @@ ucm_connectors:
   - ucm_connector_name: UcmPipelineStore
     ucm_connector_config:
       store_pipeline: ContextStore|Fake
-      cache_buffer_capacity_gb: 64
+      context_memory_capacity_gb: 64
       buffer_number: 1048576
       # null/-1: always Dump. Otherwise idle > retention means Drop.
       context_retention_ns: 60000000000

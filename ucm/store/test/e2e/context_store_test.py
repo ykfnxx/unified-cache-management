@@ -78,6 +78,7 @@ def connector_functions():
                     "_store_block_ids",
                     "_consistency_manager_enabled",
                     "_create_store",
+                    "_set_default_shm_buffer_capacity",
                 }
             ]
             selected.append(
@@ -312,7 +313,7 @@ def test_native_context_fake_shared_layerwise():
         "unique_id": "clock_" + uuid.uuid4().hex,
         "share_buffer_enable": True,
         "device_id": 0,
-        "cache_buffer_capacity_gb": 1,
+        "context_memory_capacity_gb": 1,
         "cache_load_exclusive_buffer_number": 0,
         "shard_size": 1 << 20,
         "block_size": 3 << 20,
@@ -364,3 +365,35 @@ def test_default_metrics_match_yaml_and_include_shard_counters():
         "context_drop_shards_total",
     } <= counters
     assert "context_evict_blocks_total" not in counters
+
+
+@pytest.mark.parametrize(
+    "field,value,gb",
+    [
+        ("context_memory_capacity_gb", 64, 64),
+        ("context_memory_capacity_bytes", 65536, 65536 / (1 << 30)),
+    ],
+)
+def test_context_capacity_keeps_original_names_without_cache_default(field, value, gb):
+    ns = connector_functions()
+    checks = []
+    ns["_check_shm_capacity"] = lambda *args: checks.append(args)
+    config = {
+        "store_pipeline": "ContextStore|Fake",
+        "share_buffer_enable": True,
+        field: value,
+    }
+    original = dict(config)
+    ns["Connector"]()._set_default_shm_buffer_capacity(config)
+    assert config == original
+    assert checks == [(gb, field)]
+
+
+def test_cache_capacity_default_is_unchanged():
+    ns = connector_functions()
+    checks = []
+    ns["_check_shm_capacity"] = lambda *args: checks.append(args)
+    config = {"store_pipeline": "Cache|Fake", "share_buffer_enable": True}
+    ns["Connector"]()._set_default_shm_buffer_capacity(config)
+    assert config["cache_buffer_capacity_gb"] == 128
+    assert checks == [(128,)]

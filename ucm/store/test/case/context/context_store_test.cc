@@ -321,7 +321,7 @@ TEST(ContextStoreTest, QueuedSaveAndLayerLoadsPreserveThreeComponents)
     cfg.SetNumber("device_id", 0);
     cfg.Set("share_buffer_enable", false);
     cfg.Set("io_direct", false);
-    cfg.SetNumber("cache_buffer_capacity_gb", 1);
+    cfg.SetNumber("context_memory_capacity_gb", 1);
     cfg.SetNumber("cache_load_exclusive_buffer_number", 0);
     cfg.SetNumber("shard_size", 1 << 20);
     cfg.SetNumber("block_size", 3 << 20);
@@ -344,5 +344,39 @@ TEST(ContextStoreTest, QueuedSaveAndLayerLoadsPreserveThreeComponents)
         EXPECT_EQ(output, input);
     }
     EXPECT_EQ(backend.writes, 0);
+}
+TEST(ContextStoreTest, OriginalBytesCapacityControlsEviction)
+{
+    Backend backend;
+    Detail::Dictionary cfg;
+    cfg.Set("unique_id", "clock_bytes_" + std::to_string(getpid()));
+    cfg.Set<StoreV1*>("store_backend", &backend);
+    cfg.SetNumber("device_id", 0);
+    cfg.Set("share_buffer_enable", false);
+    cfg.Set("io_direct", false);
+    cfg.SetNumber("context_memory_capacity_bytes", 1024 * 64);
+    cfg.SetNumber("cache_load_exclusive_buffer_number", 0);
+    cfg.SetNumber("shard_size", 64);
+    cfg.SetNumber("block_size", 64);
+    cfg.SetNumber("tensor_size", 64);
+    cfg.SetNumber("waiting_queue_depth", 8);
+    cfg.SetNumber("running_queue_depth", 8);
+    std::unique_ptr<StoreV1> store(MakeContextStore());
+    ASSERT_TRUE(store->Setup(cfg).Success());
+    std::array<char, 64> input{};
+    for (size_t i = 0; i < 1024; ++i) {
+        auto task = store->Dump({
+            {Id(i), 0, {input.data()}}
+        });
+        ASSERT_TRUE(task);
+        ASSERT_TRUE(store->Wait(task.Value()).Success());
+    }
+    EXPECT_EQ(backend.writes, 0);
+    auto task = store->Dump({
+        {Id(1024), 0, {input.data()}}
+    });
+    ASSERT_TRUE(task);
+    ASSERT_TRUE(store->Wait(task.Value()).Success());
+    EXPECT_EQ(backend.writes, 1);
 }
 }  // namespace

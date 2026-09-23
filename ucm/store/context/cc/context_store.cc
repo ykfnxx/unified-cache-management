@@ -23,6 +23,7 @@
  * */
 #include <algorithm>
 #include <memory>
+#include <limits>
 #include <numeric>
 #include "buffer_manager.h"
 #include "logger/logger.h"
@@ -49,6 +50,14 @@ public:
     Status Setup(const Detail::Dictionary& inConfig) override
     {
         auto config = ParseConfig(inConfig);
+        ssize_t capacityBytes = 0, capacityGb = 0;
+        inConfig.GetNumber("context_memory_capacity_bytes", capacityBytes);
+        inConfig.GetNumber("context_memory_capacity_gb", capacityGb);
+        if (capacityBytes < 0 || capacityGb < 0 || (capacityBytes && capacityGb) ||
+            uint64_t(capacityGb) > (std::numeric_limits<size_t>::max() >> 30)) {
+            return Status::InvalidParam("invalid context memory capacity; use bytes or gb");
+        }
+        config.bufferCapacity = capacityBytes ? size_t(capacityBytes) : size_t(capacityGb) << 30;
         auto s = CheckConfig(config);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed to check config params: {}.", s);
@@ -155,9 +164,6 @@ private:
         config.Get("share_buffer_enable", param.shareBufferEnable);
         if (!param.shareBufferEnable) { param.bufferCapacity /= 8; }
         config.Get("io_direct", param.ioDirect);
-        size_t bufferCapacityGb = 0;
-        config.GetNumber("cache_buffer_capacity_gb", bufferCapacityGb);
-        if (bufferCapacityGb != 0) { param.bufferCapacity = bufferCapacityGb << 30; }
         config.GetNumber("waiting_queue_depth", param.waitingQueueDepth);
         config.GetNumber("running_queue_depth", param.runningQueueDepth);
         config.GetNumber("timeout_ms", param.timeoutMs);
@@ -216,7 +222,7 @@ private:
             const size_t minBufferCapacityGb =
                 (minBufferNumber * config.shardSize + (size_t(1) << 30) - 1) >> 30;
             return Status::InvalidParam(
-                "too small buffer({}) on shard({}), please set cache_buffer_capacity_gb >= {}GB",
+                "too small buffer({}) on shard({}), please set context_memory_capacity_gb >= {}GB",
                 config.bufferCapacity, config.shardSize, minBufferCapacityGb);
         }
         if (config.waitingQueueDepth <= 1 || config.runningQueueDepth <= 1) {

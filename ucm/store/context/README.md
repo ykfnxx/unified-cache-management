@@ -16,7 +16,7 @@ Fake 只保存命中元数据，不保存或恢复 KV payload；Fake.Load 不填
 
 ## 配置
 
-除时间阈值外，使用 Cache 的参数与默认值：
+容量和时间阈值沿用 ContextStore 原有字段名，其余传输参数与 Cache 一致：
 
 ```yaml
 use_layerwise: true
@@ -26,7 +26,7 @@ ucm_connectors:
   - ucm_connector_name: UcmPipelineStore
     ucm_connector_config:
       store_pipeline: ContextStore|Fake
-      cache_buffer_capacity_gb: 64
+      context_memory_capacity_gb: 64
       buffer_number: 1048576
       context_retention_ns: 60000000000  # 60 秒
       cache_stream_number: 4
@@ -39,9 +39,11 @@ ucm_connectors:
       cache_io_aggregation: false
 ```
 
-`cache_buffer_capacity_gb` 单位为 GiB；MLA 为 TP 组共享容量，非共享模式为每 rank 容量。`local_rank_size` 由 vLLM connector 提供。多 stream、SDMA direct、IO aggregation 的配置与 Cache 相同；SDMA direct 有效时使用一个 stream。
+`context_memory_capacity_gb` 单位为 GiB；MLA 为 TP 组共享容量，非共享模式为每 rank 容量。`local_rank_size` 由 vLLM connector 提供。多 stream、SDMA direct、IO aggregation 的配置与 Cache 相同；SDMA direct 有效时使用一个 stream。
 
-迁移配置时将 `context_memory_capacity_gb` 改为 `cache_buffer_capacity_gb`；删除 `context_alpha`、`context_max_eviction_blocks`、`context_tp_size`、`context_tp_rank`。不再提供 bytes 容量、模拟 SSD、radix、Observe 或 ContextStats 接口。
+容量字段保持原名：`context_memory_capacity_gb`（GiB）与 `context_memory_capacity_bytes`（bytes）二选一，仍受 Cache 的最少 shard 槽位限制。无需改写成 Cache 的容量字段。
+
+`context_retention_ns` 保持不变；`context_alpha`、`context_max_eviction_blocks`、`context_tp_size`、`context_tp_rank` 已随旧 radix/block 管理移除，不再生效。没有模拟 SSD、radix、Observe 或 ContextStats 接口。
 
 完整示例：[通用配置](../../../examples/ucm_context_config.yaml)、[GLM-5.1 配置](../../../examples/ucm_context_glm51_config.yaml)。
 

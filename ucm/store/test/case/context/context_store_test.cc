@@ -32,6 +32,7 @@
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include "dump_queue.h"
 #include "load_queue.h"
 #include "metrics_api.h"
 #include "trans_buffer.h"
@@ -106,9 +107,9 @@ protected:
     void Save(size_t key, size_t layer = 0, bool persisted = false)
     {
         auto h = buffer.Get(Id(key), layer);
-        ASSERT_TRUE(h) << h.Error().ToString();
-        std::memset(h.Value().Data(), int(key), 64);
-        h.Value().MarkReady(persisted);
+        ASSERT_TRUE(h);
+        std::memset(h.Data(), int(key), 64);
+        h.MarkReady(persisted);
     }
 };
 TEST_F(ContextBufferTest, OnlyEvictionWritesAndUsesVictimPayload)
@@ -150,7 +151,7 @@ TEST_F(ContextBufferTest, ReadRefreshesRetention)
     {
         auto h = buffer.Get(Id(1), 0);
         ASSERT_TRUE(h);
-        EXPECT_TRUE(h.Value().Ready());
+        EXPECT_TRUE(h.Ready());
     }
     Save(2);
     EXPECT_EQ(backend.writes, 1);
@@ -172,7 +173,7 @@ TEST_F(ContextBufferTest, HeldShardCannotBeReused)
     Save(3);
     EXPECT_TRUE(buffer.Exist(Id(1), 0));
     EXPECT_FALSE(buffer.Exist(Id(2), 0));
-    EXPECT_EQ(*static_cast<char*>(pinned.Value().Data()), 1);
+    EXPECT_EQ(*static_cast<char*>(pinned.Data()), 1);
 }
 TEST_F(ContextBufferTest, WriteFailurePreservesMappingAndPayload)
 {
@@ -185,8 +186,8 @@ TEST_F(ContextBufferTest, WriteFailurePreservesMappingAndPayload)
     {
         auto h = buffer.Get(Id(1), 0);
         ASSERT_TRUE(h);
-        EXPECT_TRUE(h.Value().Ready());
-        EXPECT_EQ(*static_cast<char*>(h.Value().Data()), 1);
+        EXPECT_TRUE(h.Ready());
+        EXPECT_EQ(*static_cast<char*>(h.Data()), 1);
     }
     backend.fail = false;
     Save(2);
@@ -199,14 +200,14 @@ TEST_F(ContextBufferTest, FailedAndPreallocatedSlotsAreNotWritten)
     {
         auto h = buffer.Get(Id(1), 0);
         ASSERT_TRUE(h);
-        h.Value().MarkFailed(Status::Error());
+        h.MarkFailed(Status::Error());
     }
     Save(2);
     EXPECT_EQ(backend.writes, 0);
 }
 TEST_F(ContextBufferTest, SharedReadersSeeOnePayload)
 {
-    Open(4, -1, true);
+    Open(1, 60000000000, true);
     Save(1);
     std::vector<std::unique_ptr<Context::TransBuffer>> readers;
     for (int rank = 1; rank < 16; ++rank) {
@@ -222,7 +223,7 @@ TEST_F(ContextBufferTest, SharedReadersSeeOnePayload)
         threads.emplace_back([&, ptr] {
             for (int i = 0; i < 1000; ++i) {
                 auto h = ptr->Get(Id(1), 0);
-                if (!h || !h.Value().Ready() || *static_cast<char*>(h.Value().Data()) != 1) {
+                if (!h || !h.Ready() || *static_cast<char*>(h.Data()) != 1) {
                     ++errors;
                 }
             }
@@ -231,10 +232,12 @@ TEST_F(ContextBufferTest, SharedReadersSeeOnePayload)
     for (auto& t : threads) { t.join(); }
     EXPECT_EQ(errors, 0);
     EXPECT_EQ(backend.writes, 0);
+    Save(2);
+    EXPECT_EQ(backend.writes, 1);
 }
 TEST_F(ContextBufferTest, SharedShardReadableFromAnotherProcess)
 {
-    Open(4, -1, true);
+    Open(4, 60000000000, true);
     Save(7, 1);
     auto child = fork();
     ASSERT_GE(child, 0);
@@ -243,7 +246,7 @@ TEST_F(ContextBufferTest, SharedShardReadableFromAnotherProcess)
         cfg.deviceId = 1;
         if (reader.Setup(cfg).Failure()) { _exit(2); }
         auto h = reader.Get(Id(7), 1);
-        _exit(h && h.Value().Ready() && *static_cast<char*>(h.Value().Data()) == 7 ? 0 : 3);
+        _exit(h && h.Ready() && *static_cast<char*>(h.Data()) == 7 ? 0 : 3);
     }
     int status;
     ASSERT_EQ(waitpid(child, &status, 0), child);
@@ -310,6 +313,32 @@ TEST_F(ContextBufferTest, QueuedWritebackFailureDrainsEarlierCopies)
     for (char byte : first) { EXPECT_EQ(byte, 1); }
     backend.fail = false;
     Save(4);  // The completed task must no longer pin its copied shard.
+}
+
+TEST_F(ContextBufferTest, QueuedSaveReleasesHandlesAndPreservesCleanShard)
+{
+    Open(1);
+    Save(1, 0, true);
+    cfg.waitingQueueDepth = 8;
+    cfg.runningQueueDepth = 2;
+    HashSet<Detail::TaskHandle> failures;
+    Context::DumpQueue queue;
+    ASSERT_TRUE(queue.Setup(cfg, &failures, &buffer).Success());
+    std::array<char, 64> input{};
+    for (size_t key = 1; key <= 32; ++key) {
+        input.fill(char(key));
+        auto task = std::make_shared<Context::TransTask>(
+            Context::TransTask::Type::DUMP,
+            Detail::TaskDesc{{Id(key), 0, {input.data()}}});
+        auto waiter = std::make_shared<Latch>();
+        queue.Submit(task, waiter);
+        ASSERT_TRUE(waiter->WaitFor(5000));
+        ASSERT_FALSE(failures.Contains(task->id));
+        auto handle = buffer.Get(Id(key), 0);
+        EXPECT_TRUE(handle.Ready());
+        EXPECT_EQ(*static_cast<char*>(handle.Data()), char(key));
+        EXPECT_EQ(backend.writes, key > 1 ? key - 2 : 0);
+    }
 }
 
 TEST(ContextStoreTest, QueuedSaveAndLayerLoadsPreserveThreeComponents)

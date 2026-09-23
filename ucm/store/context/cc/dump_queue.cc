@@ -35,6 +35,8 @@ DumpQueue::~DumpQueue()
 {
     stop_.store(true);
     if (dispatcher_.joinable()) { dispatcher_.join(); }
+    releaseStop_.store(true);
+    if (releaser_.joinable()) { releaser_.join(); }
 }
 
 Status DumpQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer* buffer)
@@ -49,6 +51,8 @@ Status DumpQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     cacheSdmaDirect_ = config.cacheSdmaDirect;
     cpuAffinityCores_ = config.cpuAffinityCores;
     waiting_.Setup(config.waitingQueueDepth);
+    dumping_.Setup(config.runningQueueDepth);
+    releaser_ = std::thread{&DumpQueue::ReleaseStage, this};
     std::promise<Status> started;
     auto fut = started.get_future();
     dispatcher_ = std::thread{&DumpQueue::DispatchStage, this, std::ref(started)};
@@ -121,15 +125,14 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
         if (callback.Failure()) { eventReadyTp.reset(); }
     }
     size_t copiedShards = 0;
-    std::vector<TransBuffer::Handle> handles;
+    BufferHandles handles;
     auto status = Status::OK();
     for (auto& shard : task->desc) {
-        auto got = buffer_->Get(shard.owner, shard.index);
-        if (!got) {
-            status = got.Error();
+        auto handle = buffer_->Get(shard.owner, shard.index);
+        if (!handle) {
+            status = Status::Error("failed to allocate Context buffer");
             break;
         }
-        auto handle = std::move(got.Value());
         if (!handle.Owner()) { continue; }
         if (!handle.Ready()) {
             auto* host = cacheSdmaDirect_ ? handle.DeviceData() : handle.Data();
@@ -139,13 +142,20 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
         handles.push_back(std::move(handle));
         if (status.Failure()) { break; }
     }
-    auto syncStart = NowTime::Now();
-    Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_dump_mkbuf_duration_ms"),
-                         (syncStart - start) * 1e3);
+    auto makeBufferEnd = NowTime::Now();
     if (handles.empty()) { return status; }
+    auto syncStart = NowTime::Now();
     auto sync = stream.Synchronize();
     if (sync.Failure()) { status = sync; }
     auto syncEnd = NowTime::Now();
+    if (status.Success()) {
+        for (auto& handle : handles) { handle.MarkReady(); }
+        dumping_.Push(std::move(handles));
+    } else {
+        for (auto& handle : handles) {
+            if (!handle.Ready()) { handle.MarkFailed(status); }
+        }
+    }
     if (eventReadyTp) {
         auto ready = eventReadyTp->load(std::memory_order_acquire);
         if (ready > 0.0) {
@@ -157,14 +167,8 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
         Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_d2h_duration_ms"),
                              (syncEnd - syncStart) * 1e3);
     }
-    for (auto& handle : handles) {
-        if (handle.Ready()) { continue; }
-        if (status.Success()) {
-            handle.MarkReady();
-        } else {
-            handle.MarkFailed(status);
-        }
-    }
+    Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_dump_mkbuf_duration_ms"),
+                         (makeBufferEnd - start) * 1e3);
     // Backend Dump belongs only to TransBuffer eviction.
     return status;
 }
@@ -172,6 +176,18 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
 Status DumpQueue::DeviceToHostAsync(CopyStream& stream, void** device, void* host)
 {
     return stream.DeviceToHostAsync(device, host, tensorSizes_);
+}
+
+void DumpQueue::ReleaseStage()
+{
+    auto nameStatus = CpuAffinity::SetCurrentThreadName("ucm_dump_back");
+    if (nameStatus.Failure()) { UC_WARN("Failed({}) to set UCM dump backend name.", nameStatus); }
+    if (!cpuAffinityCores_.empty()) {
+        auto s = CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
+        if (s.Failure()) { UC_WARN("Failed({}) to set affinity.", s); }
+    }
+    // Ordinary saves have no backend task; release handles on the Cache-style consumer.
+    dumping_.ConsumerLoop(releaseStop_, [](BufferHandles&&) {});
 }
 
 }  // namespace UC::Context

@@ -42,8 +42,10 @@ class DumpQueue {
     using WaiterPtr = std::shared_ptr<Latch>;
     using TaskPair = std::pair<TaskPtr, WaiterPtr>;
     using TaskIdSet = HashSet<Detail::TaskHandle>;
+    using BufferHandles = std::vector<TransBuffer::Handle>;
 private:
     alignas(64) std::atomic_bool stop_{false};
+    std::atomic_bool releaseStop_{false};
     TaskIdSet* failureSet_{nullptr};
     TransBuffer* buffer_{nullptr};
     int32_t deviceId_{-1};
@@ -54,7 +56,9 @@ private:
     bool cacheSdmaDirect_{false};
     std::vector<ssize_t> cpuAffinityCores_{};
     SpscRingQueue<TaskPair> waiting_;
+    SpscRingQueue<BufferHandles> dumping_;
     std::thread dispatcher_;
+    std::thread releaser_;
 
 public:
     ~DumpQueue();
@@ -66,6 +70,7 @@ private:
     void DispatchOneTask(CopyStream& stream, TaskPair&& pair);
     Status DumpOneTask(CopyStream& stream, TaskPtr task);
     Status DeviceToHostAsync(CopyStream& stream, void** device, void* host);
+    void ReleaseStage();
 };
 
 }  // namespace UC::Context

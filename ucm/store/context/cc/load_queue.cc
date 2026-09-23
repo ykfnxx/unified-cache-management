@@ -117,16 +117,15 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
         auto& shard = task->desc[indexes[i]];
         ShardTask shardTask;
         shardTask.backendTaskHandle = 0;
-        auto handle = buffer_->Get(shard.owner, shard.index, true, true);
-        if (!handle) {
-            task->Fail(handle.Error());
+        shardTask.bufferHandle = buffer_->Get(shard.owner, shard.index, true, true);
+        if (!shardTask.bufferHandle) {
+            task->Fail(Status::Error("failed to allocate Context buffer"));
             shardTask.task = task;
             shardTask.waiter = waiter;
             running_.Push(std::move(shardTask));
             RecordFailedShards(nShard - i);
             return;
         }
-        shardTask.bufferHandle = std::move(handle.Value());
         shardTask.fromPosix = !shardTask.bufferHandle.Ready();
         if (shardTask.fromPosix) { waitShardCount++; }
         if (shardTask.bufferHandle.Owner() && !shardTask.bufferHandle.Ready()) {

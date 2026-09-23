@@ -57,12 +57,12 @@ struct BufferMetaNode {
     size_t next;
     alignas(64) std::atomic<TransBuffer::State> state;
     std::atomic<int32_t> errorCode;
-    uint64_t lastAccessNs;
+    std::atomic<uint64_t> lastAccessNs;
     bool persisted;
     void Init()
     {
         reference = 0;
-        lastAccessNs = 0;
+        lastAccessNs.store(0, std::memory_order_relaxed);
         persisted = false;
         hash = invalidIndex;
         prev = invalidIndex;
@@ -73,6 +73,7 @@ struct BufferMetaNode {
 };
 static_assert(std::atomic<TransBuffer::State>::is_always_lock_free, "state must be lock-free");
 static_assert(std::atomic<int32_t>::is_always_lock_free, "errorCode must be lock-free");
+static_assert(std::atomic<uint64_t>::is_always_lock_free, "lastAccessNs must be lock-free");
 
 class BufferStrategy {
 protected:
@@ -578,7 +579,7 @@ Status TransBuffer::Setup(const Config& config)
     return strategy_->Setup();
 }
 
-Expected<TransBuffer::Handle> TransBuffer::Get(const Detail::BlockId& blockId, size_t shardIdx,
+TransBuffer::Handle TransBuffer::Get(const Detail::BlockId& blockId, size_t shardIdx,
                                      bool allowReserved, bool isLoad)
 {
     auto iBucket = Hash(blockId, shardIdx);
@@ -587,13 +588,24 @@ Expected<TransBuffer::Handle> TransBuffer::Get(const Detail::BlockId& blockId, s
     auto iNode = FindAt(iBucket, blockId, shardIdx, owner);
     if (iNode != invalidIndex) {
         if (bypassHitOnLoad_ && isLoad && owner && Ready(iNode)) { MarkNotReady(iNode); }
-        strategy_->BucketUnlock(iBucket);
-        return Handle{this, iNode, owner};
+    } else {
+        auto allocated = Alloc(blockId, shardIdx, iBucket, allowReserved);
+        if (!allocated) {
+            strategy_->BucketUnlock(iBucket);
+            UC_ERROR("Failed({}) to allocate Context buffer.", allocated.Error());
+            return {};
+        }
+        iNode = allocated.Value();
+        owner = true;
     }
-    auto allocated = Alloc(blockId, shardIdx, iBucket, allowReserved);
     strategy_->BucketUnlock(iBucket);
-    if (!allocated) { return allocated.Error(); }
-    return Handle(this, allocated.Value(), true);
+    if (retentionNs_ >= 0) {
+        // Get already holds a reference, so the slot cannot be reused during this update.
+        const uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        strategy_->MetaAt(iNode)->lastAccessNs.store(now, std::memory_order_relaxed);
+    }
+    return Handle{this, iNode, owner};
 }
 
 void TransBuffer::Prealloc(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved)
@@ -642,10 +654,6 @@ size_t TransBuffer::FindAt(size_t iBucket, const Detail::BlockId& blockId, size_
             }
             ++meta->reference;
             strategy_->MarkAccessed(iNode);
-            if (retentionNs_ >= 0) {
-                meta->lastAccessNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count();
-            }
             strategy_->NodeUnlock(iNode);
             break;
         }
@@ -687,10 +695,6 @@ Expected<size_t> TransBuffer::Alloc(const Detail::BlockId& blockId, size_t shard
         ++meta->reference;
         strategy_->MarkAccessed(iNode);
         meta->persisted = false;
-        if (retentionNs_ >= 0) {
-            meta->lastAccessNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-        }
         meta->block = blockId;
         meta->shard = shardIdx;
         meta->state.store(State::LOADING, std::memory_order_relaxed);
@@ -772,6 +776,11 @@ Status TransBuffer::FailureStatus(Index pos)
     return Status{errorCode, {}};
 }
 
+void TransBuffer::MarkReady(Index pos)
+{
+    strategy_->MetaAt(pos)->state.store(State::READY, std::memory_order_release);
+}
+
 void TransBuffer::MarkReady(Index pos, bool persisted)
 {
     auto meta = strategy_->MetaAt(pos);
@@ -789,7 +798,8 @@ Status TransBuffer::Evict(Index pos)
     if (retentionNs_ >= 0) {
         auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
-        drop = uint64_t(now) - meta->lastAccessNs > uint64_t(retentionNs_);
+        drop = uint64_t(now) - meta->lastAccessNs.load(std::memory_order_relaxed) >
+               uint64_t(retentionNs_);
     }
     if (!drop && !meta->persisted) {
         auto task = backend_->Dump({{meta->block, meta->shard, {DataAt(pos)}}});

@@ -91,7 +91,8 @@ public:
         bool Ready() const { return buf_->Ready(pos_); };
         State GetState() const { return buf_->GetState(pos_); }
         Status FailureStatus() const { return buf_->FailureStatus(pos_); }
-        void MarkReady(bool persisted = false) { buf_->MarkReady(pos_, persisted); };
+        void MarkReady() { buf_->MarkReady(pos_); };
+        void MarkReady(bool persisted) { buf_->MarkReady(pos_, persisted); };
         void MarkFailed(const Status& status) { buf_->MarkFailed(pos_, status); }
 
     private:
@@ -111,7 +112,7 @@ public:
 
 public:
     Status Setup(const Config& config);
-    Expected<Handle> Get(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false,
+    Handle Get(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false,
                bool isLoad = false);
     void Prealloc(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false);
     bool Exist(const Detail::BlockId& blockId, size_t shardIdx);
@@ -130,6 +131,7 @@ private:
     bool Ready(Index pos);
     State GetState(Index pos);
     Status FailureStatus(Index pos);
+    void MarkReady(Index pos);
     void MarkReady(Index pos, bool persisted);
     Status Evict(Index pos);
     void MarkFailed(Index pos, const Status& status);

@@ -30,10 +30,8 @@ namespace UC::Context {
 
 LoadQueue::~LoadQueue()
 {
-    if (dispatcher_.joinable()) {
-        waiting_.Push(TaskPair{});
-        dispatcher_.join();
-    }
+    stop_.store(true);
+    if (dispatcher_.joinable()) { dispatcher_.join(); }
     if (transfer_.joinable()) { transfer_.join(); }
 }
 
@@ -44,14 +42,13 @@ Status LoadQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     backend_ = config.storeBackend;
     deviceId_ = config.deviceId;
     tensorSizes_ = config.tensorSizes;
-    timeoutMs_ = config.timeoutMs;
+    nShardPerBlock_ = config.blockSize / config.shardSize;
     streamNumber_ = config.EffectiveStreamNumber();
     useGdr_ = config.useGdr;
     cacheIOAggregation_ = config.cacheIOAggregation;
     cacheSdmaDirect_ = config.cacheSdmaDirect;
     cpuAffinityCores_ = config.cpuAffinityCores;
     localRankSize_ = config.localRankSize;
-    nShardPerBlock_ = config.blockSize / config.shardSize;
     waiting_.Setup(config.waitingQueueDepth);
     running_.Setup(config.runningQueueDepth);
     holder_.reserve(1024);
@@ -104,80 +101,76 @@ static std::vector<size_t> RearrangeIndex(size_t n, size_t iProc, size_t nProc)
 
 void LoadQueue::DispatchOneTask(TaskPair&& pair)
 {
-    if (!pair.first) {
-        stop_.store(true);
-        running_.Push(ShardTask{});
-        return;
-    }
     auto& task = pair.first;
     auto& waiter = pair.second;
     if (failureSet_->Contains(task->id)) {
         waiter->Done();
         return;
     }
+    auto tp = waiter->startTp;
+    auto tpWait = NowTime::Now();
     const auto nShard = task->desc.size();
+    size_t backendSubmitCount = 0;
+    size_t waitShardCount = 0;
     const auto indexes = RearrangeIndex(nShard, deviceId_, localRankSize_);
-    size_t misses = 0, backendCount = 0;
-    auto started = NowTime::Now();
-    Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_load_queue_wait_duration_ms"),
-                         (started - waiter->startTp) * 1e3);
-    for (size_t i = 0; i < nShard; ++i) {
+    for (size_t i = 0; i < nShard; i++) {
         auto& shard = task->desc[indexes[i]];
-        ShardTask item;
-        item.task = task;
-        auto handle = buffer_->Get(shard.owner, shard.index);
+        ShardTask shardTask;
+        shardTask.backendTaskHandle = 0;
+        auto handle = buffer_->Get(shard.owner, shard.index, true, true);
         if (!handle) {
-            UC_ERROR("Context Load allocation failed: device={}, task={}, shard={}, status={}",
-                     deviceId_, task->id, shard.index, handle.Error());
-            RecordLoadSourceShards(i, misses);
-            RecordFailedShards(nShard - i);
-            Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_load_backend_shards_total"),
-                                 backendCount);
             task->Fail(handle.Error());
-            failureSet_->Insert(task->id);
-            item.waiter = waiter;
-            running_.Push(std::move(item));
+            shardTask.task = task;
+            shardTask.waiter = waiter;
+            running_.Push(std::move(shardTask));
+            RecordFailedShards(nShard - i);
             return;
         }
-        item.bufferHandle = std::move(handle.Value());
-        item.wasNotReady = !item.bufferHandle.Ready();
-        misses += item.wasNotReady;
-        if (item.bufferHandle.Owner() && item.wasNotReady) {
-            auto res = backend_->Load({
-                {buffer_->BackendKey(shard.owner), shard.index, {item.bufferHandle.Data()}}
-            });
-            if (!res) {
-                UC_ERROR(
-                    "Context backend Load submission failed: device={}, task={}, shard={}, "
-                    "status={}",
-                    deviceId_, task->id, shard.index, res.Error());
-                RecordLoadSourceShards(i + 1, misses);
-                RecordFailedShards(nShard - i - 1);
-                Metrics::UpdateStats(
-                    NAME_TO_METRIC_ID("context_transfer_load_backend_shards_total"), backendCount);
-                item.bufferHandle.MarkFailed(res.Error());
+        shardTask.bufferHandle = std::move(handle.Value());
+        shardTask.fromPosix = !shardTask.bufferHandle.Ready();
+        if (shardTask.fromPosix) { waitShardCount++; }
+        if (shardTask.bufferHandle.Owner() && !shardTask.bufferHandle.Ready()) {
+            Detail::TaskDesc backendTask{
+                Detail::Shard{shard.owner, shard.index, {shardTask.bufferHandle.Data()}}
+            };
+            backendTask.brief = "Backend2Cache";
+            auto res = backend_->Load(std::move(backendTask));
+            if (!res) [[unlikely]] {
+                UC_ERROR("Failed({}) to submit load task({}) to backend.", res.Error(), task->id);
+                UC::Metrics::UpdateStats(
+                    NAME_TO_METRIC_ID("context_transfer_backend_load_submit_errors_total"), 1.0);
+                RecordLoadSourceShards(i + 1, waitShardCount);
+                RecordFailedShards(nShard - i);
+                shardTask.bufferHandle.MarkFailed(res.Error());
                 task->Fail(res.Error());
                 failureSet_->Insert(task->id);
-                item.waiter = waiter;
-                running_.Push(std::move(item));
+                waiter->Done();
                 return;
             }
-            item.backendTaskHandle = res.Value();
-            ++backendCount;
+            shardTask.backendTaskHandle = res.Value();
+            backendSubmitCount++;
         }
-        item.shard = std::move(shard);
-        item.waiter = i + 1 == nShard ? waiter : nullptr;
-        running_.Push(std::move(item));
+        shardTask.task = task;
+        shardTask.shard = std::move(shard);
+        shardTask.waiter = (i + 1 < nShard) ? nullptr : waiter;
+        running_.Push(std::move(shardTask));
     }
-    RecordLoadSourceShards(nShard, misses);
-    Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_load_backend_shards_total"),
-                         backendCount);
-    Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_load_backend_submit_duration_ms"),
-                         (NowTime::Now() - started) * 1e3);
-    for (const auto i : indexes) {
-        const auto& shard = task->desc[i];
-        if (shard.index + 1 < nShardPerBlock_) { buffer_->Prealloc(shard.owner, shard.index + 1); }
+    auto tpDispatch = NowTime::Now();
+    for (size_t i = 0; i < nShard; i++) {
+        auto& shard = task->desc[indexes[i]];
+        if (shard.index + 1 != nShardPerBlock_) {
+            buffer_->Prealloc(shard.owner, shard.index + 1, true);
+        }
     }
+    UC_DEBUG("Cache task({}) dispatch shards({}), wait={:.3f}ms, cost={:.3f}ms.", task->id, nShard,
+             (tpWait - tp) * 1e3, (tpDispatch - tpWait) * 1e3);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_load_queue_wait_duration_ms"),
+                             (tpWait - tp) * 1e3);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_load_backend_submit_duration_ms"),
+                             (tpDispatch - tpWait) * 1e3);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_load_backend_shards_total"),
+                             static_cast<double>(backendSubmitCount));
+    RecordLoadSourceShards(nShard, waitShardCount);
 }
 
 void LoadQueue::TransferStage(std::promise<Status>& started)
@@ -199,51 +192,77 @@ void LoadQueue::TransferStage(std::promise<Status>& started)
         s = CpuAffinity::SetCpuAffinity4CurrentThread(cpuAffinityCores_);
         if (s.Failure()) { UC_WARN("Failed({}) to set affinity.", s); }
     }
-    running_.ConsumerLoop(transferStop_, &LoadQueue::TransferOneTask, this, stream);
+    running_.ConsumerLoop(stop_, &LoadQueue::TransferOneTask, this, stream);
 }
 
-void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& item)
+void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
 {
-    if (!item.task) {
-        transferStop_.store(true);
+    auto parentTask = task.task;
+    const auto taskHandle = parentTask->id;
+    if (!task.bufferHandle) {
+        // FIFO marker: all preceding copies must finish before their slots are released.
+        auto status = stream.Synchronize();
+        if (status.Failure()) { parentTask->Fail(status); }
+        failureSet_->Insert(taskHandle);
+        RecordShardResults(holder_, nullptr, false);
+        holder_.clear();
+        task.waiter->Done();
         return;
     }
-    // Even failed preparation drains backend writes and DMA before releasing handles.
-    auto task = item.task;
-    auto waiter = item.waiter;
-    if (item.bufferHandle) {
-        auto waitStart = NowTime::Now();
-        auto s = WaitBackendTaskReady(item);
-        Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_shard_backend_wait_ms"),
-                             (NowTime::Now() - waitStart) * 1e3);
-        if (s.Success() && !failureSet_->Contains(task->id)) {
-            auto* host =
-                cacheSdmaDirect_ ? item.bufferHandle.DeviceData() : item.bufferHandle.Data();
-            s = HostToDeviceAsync(stream, host, item.shard.addrs.data());
+    if (failureSet_->Contains(taskHandle)) {
+        RecordFailedShards(1);
+        if (task.waiter) {
+            holder_.clear();
+            task.waiter->Done();
         }
-        if (s.Failure()) {
-            task->Fail(s);
-            failureSet_->Insert(task->id);
-        }
-    }
-    if (!waiter) {
-        holder_.push_back(std::move(item));
         return;
     }
-    auto start = NowTime::Now();
-    auto s = stream.Synchronize();
-    RecordH2dSyncMetrics((NowTime::Now() - start) * 1e3);
-    if (s.Failure()) {
-        task->Fail(s);
-        failureSet_->Insert(task->id);
+
+    auto s = Status::OK();
+    auto waiter = task.waiter;
+    do {
+        auto tpBackendWait = NowTime::Now();
+        s = WaitBackendTaskReady(task);
+        if (s.Failure()) [[unlikely]] {
+            RecordShardResults(holder_, &task, false);
+            break;
+        }
+        auto tpBackendReady = NowTime::Now();
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_shard_backend_wait_ms"),
+                                 (tpBackendReady - tpBackendWait) * 1e3);
+
+        auto* host = cacheSdmaDirect_ ? task.bufferHandle.DeviceData() : task.bufferHandle.Data();
+        s = HostToDeviceAsync(stream, host, task.shard.addrs.data());
+        auto tpH2dSubmitted = NowTime::Now();
+        if (s.Failure()) [[unlikely]] {
+            UC_ERROR("Failed({}) to do H2D for task({}).", s, taskHandle);
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_h2d_errors_total"), 1.0);
+            RecordShardResults(holder_, &task, false);
+            break;
+        }
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_h2d_submit_ms"),
+                                 (tpH2dSubmitted - tpBackendReady) * 1e3);
+        if (!waiter) {
+            holder_.push_back(std::move(task));
+            return;
+        }
+        auto tpH2dSyncStart = NowTime::Now();
+        s = stream.Synchronize();
+        auto h2dSyncMs = (NowTime::Now() - tpH2dSyncStart) * 1e3;
+        RecordH2dSyncMetrics(h2dSyncMs);
+        RecordShardResults(holder_, &task, s.Success());
+        holder_.clear();
+        if (s.Failure()) [[unlikely]] {
+            UC_ERROR("Failed({}) to sync on stream for task({}).", s, taskHandle);
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_h2d_errors_total"), 1.0);
+            break;
+        }
+    } while (0);
+    if (s.Failure()) [[unlikely]] {
+        parentTask->Fail(s);
+        failureSet_->Insert(taskHandle);
     }
-    const auto* extra = item.bufferHandle ? &item : nullptr;
-    RecordShardResults(holder_, extra, !failureSet_->Contains(task->id));
-    if (!failureSet_->Contains(task->id)) {
-        buffer_->RecordRead(holder_.size() + (extra != nullptr));
-    }
-    holder_.clear();
-    waiter->Done();
+    if (waiter) { waiter->Done(); }
 }
 
 Status LoadQueue::WaitBackendTaskReady(ShardTask& task)
@@ -253,28 +272,27 @@ Status LoadQueue::WaitBackendTaskReady(ShardTask& task)
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to wait backend({}) for task({}).", s, task.backendTaskHandle,
                      task.task->id);
-            UC::Metrics::UpdateStats(
-                NAME_TO_METRIC_ID("context_transfer_backend_load_wait_errors_total"), 1.0);
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_backend_load_wait_errors_total"),
+                                     1.0);
             task.bufferHandle.MarkFailed(s);
             return s;
         }
         task.bufferHandle.MarkReady(true);
         return Status::OK();
     }
-    if (task.bufferHandle.Ready()) { return Status::OK(); }
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs_);
     for (;;) {
         auto state = task.bufferHandle.GetState();
         if (state == TransBuffer::State::READY) { return Status::OK(); }
         if (state == TransBuffer::State::FAILED) { return task.bufferHandle.FailureStatus(); }
         if (failureSet_->Contains(task.task->id)) { return task.task->FailureStatus(); }
-        if (std::chrono::steady_clock::now() >= deadline) { return Status::Timeout(); }
         std::this_thread::yield();
     }
 }
 
 Status LoadQueue::HostToDeviceAsync(CopyStream& stream, void* host, void** device)
-{ return stream.HostToDeviceAsync(host, device, tensorSizes_); }
+{
+    return stream.HostToDeviceAsync(host, device, tensorSizes_);
+}
 
 void LoadQueue::RecordShardResults(const std::vector<ShardTask>& tasks, const ShardTask* extra,
                                    bool success) const
@@ -282,14 +300,14 @@ void LoadQueue::RecordShardResults(const std::vector<ShardTask>& tasks, const Sh
     size_t cache = 0;
     size_t posix = 0;
     for (const auto& task : tasks) {
-        if (task.wasNotReady) {
+        if (task.fromPosix) {
             ++posix;
         } else {
             ++cache;
         }
     }
     if (extra != nullptr) {
-        if (extra->wasNotReady) {
+        if (extra->fromPosix) {
             ++posix;
         } else {
             ++cache;
@@ -301,7 +319,7 @@ void LoadQueue::RecordShardResults(const std::vector<ShardTask>& tasks, const Sh
     }
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_load_success_shards_total"),
                              static_cast<double>(cache));
-    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_wait_load_success_shards_total"),
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_posix_load_success_shards_total"),
                              static_cast<double>(posix));
 }
 
@@ -320,6 +338,8 @@ void LoadQueue::RecordLoadSourceShards(size_t total, size_t wait) const
 }
 
 void LoadQueue::RecordH2dSyncMetrics(double h2dSyncMs) const
-{ UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_h2d_sync_ms"), h2dSyncMs); }
+{
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_h2d_sync_ms"), h2dSyncMs);
+}
 
 }  // namespace UC::Context

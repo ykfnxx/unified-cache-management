@@ -21,870 +21,800 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
-// Cache-style shard buffer; radix policy controls which blocks may return slots.
-// Transfer handles hold only shard references and never access the tree.
 #include "trans_buffer.h"
-#include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstring>
-#include <fcntl.h>
-#include <mutex>
-#include <new>
-#include <numeric>
-#include <sys/file.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
+#include "metrics_api.h"
+#include <filesystem>
 #include <thread>
 #include <unistd.h>
-#include "context_index.h"
 #include "logger/logger.h"
-#include "metrics_api.h"
+#include "posix_shm.h"
 #include "trans/buffer.h"
 #include "trans/device.h"
 
 namespace UC::Context {
-namespace {
-constexpr size_t nil = std::numeric_limits<size_t>::max();
-constexpr uint64_t magic = 0x55434d4354580007ULL;
-constexpr size_t buckets = 16411;
-constexpr size_t evicting = size_t(1) << 63;
-struct Mutex {
-    pthread_mutex_t value;
+
+static constexpr size_t nHashTableBucket = 16411;
+static constexpr auto invalidIndex = std::numeric_limits<size_t>::max();
+
+static inline size_t Hash(const Detail::BlockId& blockId, size_t shard)
+{
+    static UC::Detail::BlockIdHasher blockIdHasher;
+    static std::hash<size_t> shardHasher;
+    constexpr auto goldenSection = 0x9e3779b97f4a7c15ULL;
+    size_t h1 = blockIdHasher(blockId);
+    size_t h2 = shardHasher(shard);
+    return (h1 ^ (h2 + goldenSection + (h1 << 6) + (h1 >> 2))) % nHashTableBucket;
+}
+
+struct BufferMetaNode {
+    Detail::BlockId block;
+    size_t shard;
+    size_t reference;
+    size_t hash;
+    size_t prev;
+    size_t next;
+    alignas(64) std::atomic<TransBuffer::State> state;
+    std::atomic<int32_t> errorCode;
+    uint64_t lastAccessNs;
+    bool persisted;
     void Init()
     {
-        pthread_mutexattr_t a;
-        pthread_mutexattr_init(&a);
-        pthread_mutexattr_setpshared(&a, PTHREAD_PROCESS_SHARED);
-        pthread_mutexattr_settype(&a, PTHREAD_MUTEX_ADAPTIVE_NP);
-        pthread_mutex_init(&value, &a);
-        pthread_mutexattr_destroy(&a);
+        reference = 0;
+        lastAccessNs = 0;
+        persisted = false;
+        hash = invalidIndex;
+        prev = invalidIndex;
+        next = invalidIndex;
+        state.store(TransBuffer::State::LOADING, std::memory_order_relaxed);
+        errorCode.store(Status::OK().Underlying(), std::memory_order_relaxed);
     }
-    void lock() { pthread_mutex_lock(&value); }
-    void unlock() { pthread_mutex_unlock(&value); }
 };
-// Same short per-node critical sections as CacheStore's shared node lock.
-struct SpinLock {
-    pthread_spinlock_t value;
-    void Init() { pthread_spin_init(&value, PTHREAD_PROCESS_SHARED); }
-    void lock() { pthread_spin_lock(&value); }
-    void unlock() { pthread_spin_unlock(&value); }
+static_assert(std::atomic<TransBuffer::State>::is_always_lock_free, "state must be lock-free");
+static_assert(std::atomic<int32_t>::is_always_lock_free, "errorCode must be lock-free");
+
+class BufferStrategy {
+protected:
+    struct BaseConfig {
+        int32_t deviceId{-1};
+        size_t nodeSize{0};
+        size_t totalSize{0};
+        size_t reservedNumber{0};
+    };
+    BaseConfig base_;
+
+public:
+    BufferStrategy(int32_t deviceId, size_t nodeSize, size_t totalSize, size_t reservedNumber)
+        : base_({deviceId, nodeSize, totalSize, reservedNumber})
+    {
+    }
+    virtual ~BufferStrategy() = default;
+    virtual Status Setup() = 0;
+    virtual void BucketLock(size_t iBucket) = 0;
+    virtual bool BucketTryLock(size_t iBucket) = 0;
+    virtual void BucketUnlock(size_t iBucket) = 0;
+    virtual void NodeLock(size_t iNode) = 0;
+    virtual void NodeUnlock(size_t iNode) = 0;
+    virtual size_t& FirstAt(size_t iBucket) = 0;
+    virtual size_t FetchNode(bool allowReserved) = 0;
+    virtual void* DataAt(size_t iNode) = 0;
+    virtual void* DeviceDataAt(size_t iNode) = 0;
+    virtual BufferMetaNode* MetaAt(size_t iNode) = 0;
+    virtual void MarkAccessed(size_t iNode) = 0;
 };
-size_t Align(size_t n, size_t a) { return (n + a - 1) / a * a; }
-size_t Hash(const Key& key) { return Detail::BlockIdHasher{}(key) % buckets; }
-size_t ShardHash(const Key& key, size_t layer)
-{
-    const auto h = Detail::BlockIdHasher{}(key);
-    return (h ^ (layer + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2))) % buckets;
-}
-}  // namespace
-struct TransBuffer::Impl {
-    struct alignas(64) Block {
-        Key key;
-        size_t next = nil, pending = nil, firstShard = nil;
-        std::atomic<size_t> ready{0}, failed{0};
-        std::atomic<size_t> activeShards{0};
-        std::atomic<bool> loaded{false};
-    };
-    struct alignas(64) Shard {
-        Key key;
-        SpinLock mutex;
-        size_t references = 0;
-        size_t block = nil, layer = 0, next = nil, nextBlock = nil;
-        alignas(64) std::atomic<State> state{State::LOADING};
-        std::atomic<int32_t> error{0};
-    };
-    struct Header {
-        uint64_t version, layout;
-        size_t count, layers, shardBytes, metadataBytes, totalBytes;
-        Mutex allocation, metadata, recycled;
-        size_t freeHead = nil;
-        alignas(64) std::atomic<size_t> cursor{0};
-        alignas(64) std::atomic<size_t> freeCount{0};
-        pthread_cond_t changed;
-        size_t freeBlock, blockCount = 0, pendingHead = nil;
-        size_t pressure = 0, completed = 0;
-        int32_t allocationError = 0;
-        size_t allocationEpoch = 0;
-        std::atomic<size_t> released{0};
-        std::atomic<bool> ownerAlive{false}, pressureActive{false};
-        std::atomic<size_t> tasks{0}, highWater{0}, failures{0};
 
-        size_t heads[buckets], shardHeads[buckets];
-        Mutex locks[buckets], shardLocks[buckets];
+class LocalBufferStrategy : public BufferStrategy {
+    struct BufferHeader {
+        size_t buckets[nHashTableBucket];
+        size_t nodeCursor;
+        size_t nodeSize;
+        size_t nNode;
     };
-    Config cfg;
-    std::atomic<uint64_t> h2d{0}, d2h{0}, backendBlocks{0}, backendShards{0};
-    std::string name;
-    void* mapping = nullptr;
-    size_t mappedBytes = 0;
-    Header* header = nullptr;
-    Block* blocks = nullptr;
-    Shard* shards = nullptr;
-    char* data = nullptr;
-    char* deviceData = nullptr;
-    bool registered = false, policyOwner = false, stop = false;
-    std::thread maintenance;
-    std::mutex policy;
-    ContextIndex index;
-    struct Observation {
-        uint64_t sequence;
-        std::vector<Key> path;
+    struct LocalMutex {
+        pthread_mutex_t mutex;
+        ~LocalMutex() { pthread_mutex_destroy(&mutex); }
+        void Init()
+        {
+            pthread_mutexattr_t attr;
+            pthread_mutexattr_init(&attr);
+            pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_PRIVATE);
+            pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
+            pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
+            pthread_mutex_init(&mutex, &attr);
+            pthread_mutexattr_destroy(&attr);
+        }
+        void Lock() { pthread_mutex_lock(&mutex); }
+        bool TryLock() { return pthread_mutex_trylock(&mutex) == 0; }
+        void Unlock() { pthread_mutex_unlock(&mutex); }
     };
-    std::map<std::string, Observation> observed;
-    std::unordered_map<Key, size_t, Detail::BlockIdHasher> retained;
-    std::unordered_map<Key, size_t, Detail::BlockIdHasher> resident;
-    std::vector<Key> retired, unobserved;
-    uint64_t now = 0;
-    std::map<std::string, uint64_t> stats;
+    struct LocalLock {
+        pthread_spinlock_t lock;
+        ~LocalLock() { pthread_spin_destroy(&lock); }
+        void Init() { pthread_spin_init(&lock, PTHREAD_PROCESS_PRIVATE); }
+        void Lock() { pthread_spin_lock(&lock); }
+        bool TryLock() { return pthread_spin_trylock(&lock) == 0; }
+        void Unlock() { pthread_spin_unlock(&lock); }
+    };
 
-    ~Impl()
+    bool ioDirect_{false};
+    bool mapHostToDevice_{false};
+    BufferHeader header_;
+    LocalMutex bucketLocks_[nHashTableBucket];
+    std::unique_ptr<LocalLock[]> nodeLocks_;
+    std::unique_ptr<BufferMetaNode[]> meta_;
+    std::unique_ptr<std::atomic<uint8_t>[]> accessed_;
+    std::shared_ptr<void> data_;
+    std::byte* dataOnDevice_{nullptr};
+    bool registeredMappedHost_{false};
+
+public:
+    LocalBufferStrategy(int32_t deviceId, size_t nodeSize, size_t totalSize, size_t reservedNumber,
+                        bool ioDirect, bool mapHostToDevice)
+        : BufferStrategy(deviceId, nodeSize, totalSize, reservedNumber),
+          ioDirect_(ioDirect),
+          mapHostToDevice_(mapHostToDevice)
     {
-        if (maintenance.joinable()) {
-            {
-                std::lock_guard<Mutex> l(header->allocation);
-                stop = true;
-                pthread_cond_broadcast(&header->changed);
-            }
-            maintenance.join();
-        }
-        if (policyOwner && header) {
-            header->ownerAlive.store(false);
-            pthread_cond_broadcast(&header->changed);
-            shm_unlink(name.c_str());
-        }
-        if (registered) { Trans::Buffer::UnregisterHostBuffer(data); }
-        if (mapping) { munmap(mapping, mappedBytes); }
     }
-    size_t BlockOffset() const { return Align(sizeof(Header), alignof(Block)); }
-    size_t ShardOffset(size_t n) const
-    { return Align(BlockOffset() + sizeof(Block) * n, alignof(Shard)); }
-    void Attach()
+    ~LocalBufferStrategy() override
     {
-        blocks = reinterpret_cast<Block*>(static_cast<char*>(mapping) + BlockOffset());
-        shards = reinterpret_cast<Shard*>(static_cast<char*>(mapping) + ShardOffset(header->count));
+        if (registeredMappedHost_ && data_) { Trans::Buffer::UnregisterHostBuffer(data_.get()); }
     }
-    Status Open(bool watcher)
+    Status Setup() override
     {
-        int fd = shm_open(name.c_str(), watcher ? O_RDWR : O_RDWR | O_CREAT, 0600);
-        if (fd < 0) {
-            return watcher && errno == ENOENT ? Status::NotFound()
-                                              : Status::Error("open context buffer");
-        }
-        flock(fd, LOCK_EX);
-        struct stat st{};
-        fstat(fd, &st);
-        if (watcher && st.st_size == 0) {
-            close(fd);
-            return Status::NotFound();
-        }
-        size_t count = watcher ? 0 : cfg.bufferCapacity / cfg.shardSize;
-        size_t layers = watcher ? 0 : cfg.blockSize / cfg.shardSize;
-        size_t meta =
-            watcher ? 0 : Align(ShardOffset(count) + sizeof(Shard) * count, sysconf(_SC_PAGESIZE));
-        size_t total = meta + count * cfg.shardSize;
-        uint64_t layout = 1469598103934665603ULL;
-        if (!watcher) {
-            for (size_t x : {count, cfg.blockSize, cfg.shardSize}) {
-                layout = (layout ^ x) * 1099511628211ULL;
+        const auto deviceId = base_.deviceId;
+        const auto totalSize = base_.totalSize;
+        const auto nodeSize = base_.nodeSize;
+        auto nNode = totalSize / nodeSize;
+        try {
+            nodeLocks_ = std::make_unique<LocalLock[]>(nNode);
+            meta_ = std::make_unique<BufferMetaNode[]>(nNode);
+            accessed_ = std::make_unique<std::atomic<uint8_t>[]>(nNode);
+            for (size_t i = 0; i < nHashTableBucket; i++) { bucketLocks_[i].Init(); }
+            for (size_t i = 0; i < nNode; i++) {
+                nodeLocks_[i].Init();
+                accessed_[i].store(0, std::memory_order_relaxed);
             }
-            for (auto x : cfg.tensorSizes) { layout = (layout ^ x) * 1099511628211ULL; }
+        } catch (const std::exception& e) {
+            UC_ERROR("Failed({}) to alloc buffer.", e.what());
+            return Status::Error(e.what());
         }
-        bool fresh = st.st_size == 0;
-        if (fresh && posix_fallocate(fd, 0, total) != 0) {
-            close(fd);
-            return Status::NoSpace();
-        }
-        Header* probe = static_cast<Header*>(
-            mmap(nullptr, sizeof(Header), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
-        if (probe == MAP_FAILED) {
-            close(fd);
-            return Status::OutOfMemory();
-        }
-        if (!fresh && (probe->version != magic || (!watcher && probe->layout != layout))) {
-            munmap(probe, sizeof(Header));
-            close(fd);
-            return Status::InvalidParam("context shared layout mismatch");
-        }
-        if (watcher) {
-            meta = probe->metadataBytes;
-            total = probe->totalBytes;
-        }
-        munmap(probe, sizeof(Header));
-        mappedBytes = watcher ? meta : total;
-        mapping =
-            mmap(nullptr, mappedBytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0);
-        if (mapping == MAP_FAILED) {
-            mapping = nullptr;
-            close(fd);
-            return Status::OutOfMemory();
-        }
-        header = static_cast<Header*>(mapping);
-        if (fresh) {
-            new (header) Header{};
-            header->count = count;
-            header->layers = layers;
-            header->shardBytes = cfg.shardSize;
-            header->metadataBytes = meta;
-            header->totalBytes = total;
-            header->layout = layout;
-            header->allocation.Init();
-            header->metadata.Init();
-            header->recycled.Init();
-            pthread_condattr_t a;
-            pthread_condattr_init(&a);
-            pthread_condattr_setpshared(&a, PTHREAD_PROCESS_SHARED);
-            pthread_condattr_setclock(&a, CLOCK_MONOTONIC);
-            pthread_cond_init(&header->changed, &a);
-            pthread_condattr_destroy(&a);
-            header->freeBlock = 0;
-            header->freeCount = count;
-            for (size_t i = 0; i < buckets; ++i) {
-                header->heads[i] = header->shardHeads[i] = nil;
-                header->locks[i].Init();
-                header->shardLocks[i].Init();
-            }
-            Attach();
-            for (size_t i = 0; i < count; ++i) {
-                new (&blocks[i]) Block{};
-                blocks[i].next = i + 1 == count ? nil : i + 1;
-            }
-            for (size_t i = 0; i < count; ++i) {
-                new (&shards[i]) Shard{};
-                shards[i].mutex.Init();
-            }
-            header->version = magic;
-        } else {
-            Attach();
-        }
-        flock(fd, LOCK_UN);
-        close(fd);
-        if (watcher) { return Status::OK(); }
-        data = static_cast<char*>(mapping) + meta;
         Trans::Device device;
-        auto s = device.Setup(cfg.deviceId);
-        if (s.Failure()) { return s; }
-        void* mapped = nullptr;
-        s = Trans::Buffer::RegisterHostBuffer(data, total - meta, &mapped);
-        if (s.Failure()) { return s; }
-        registered = true;
-        deviceData = static_cast<char*>(mapped);
-        if (policyOwner) {
-            header->ownerAlive.store(true);
-            maintenance = std::thread([this] { Maintain(); });
+        auto s = device.Setup(deviceId);
+        if (s.Failure()) [[unlikely]] {
+            UC_ERROR("Failed({}) to setup device({}).", s, deviceId);
+            return s;
+        }
+        auto buffer = device.MakeBuffer();
+        if (!buffer) [[unlikely]] {
+            UC_ERROR("Failed to make buffer on device({}).", deviceId);
+            return Status::Error();
+        }
+        data_ = ioDirect_ ? buffer->MakeHostBuffer4DirectIo(nodeSize * nNode)
+                          : buffer->MakeHostBuffer(nodeSize * nNode);
+        if (!data_) [[unlikely]] {
+            UC_ERROR("Failed to make pinned({}) for device({}).", nodeSize * nNode, deviceId);
+            return Status::OutOfMemory();
+        }
+        if (mapHostToDevice_) {
+            void* deviceData = nullptr;
+            auto s = Status::OK();
+            if (ioDirect_) {
+                s = Trans::Buffer::GetHostDevicePointer(data_.get(), &deviceData);
+            } else {
+                s = Trans::Buffer::RegisterHostBuffer(data_.get(), nodeSize * nNode, &deviceData);
+                registeredMappedHost_ = s.Success();
+            }
+            if (s.Failure()) [[unlikely]] {
+                UC_ERROR("Failed({}) to map pinned host buffer({}) to device({}).", s,
+                         nodeSize * nNode, deviceId);
+                return s;
+            }
+            dataOnDevice_ = static_cast<std::byte*>(deviceData);
+        }
+        for (size_t i = 0; i < nHashTableBucket; i++) { header_.buckets[i] = invalidIndex; }
+        for (size_t i = 0; i < nNode; i++) { meta_[i].Init(); }
+        header_.nodeCursor = 0;
+        header_.nodeSize = nodeSize;
+        header_.nNode = nNode;
+        return Status::OK();
+    }
+    void BucketLock(size_t iBucket) override { bucketLocks_[iBucket].Lock(); }
+    bool BucketTryLock(size_t iBucket) override { return bucketLocks_[iBucket].TryLock(); }
+    void BucketUnlock(size_t iBucket) override { bucketLocks_[iBucket].Unlock(); }
+    void NodeLock(size_t iNode) override { nodeLocks_[iNode].Lock(); }
+    void NodeUnlock(size_t iNode) override { nodeLocks_[iNode].Unlock(); }
+    size_t& FirstAt(size_t iBucket) override { return header_.buckets[iBucket]; }
+    size_t FetchNode(bool allowReserved) override
+    {
+        const auto total = header_.nNode - (allowReserved ? 0 : base_.reservedNumber);
+        for (size_t i = 0; i < 2 * total; ++i) {
+            auto cur = header_.nodeCursor++ % total;
+            uint8_t expected = 1;
+            if (accessed_[cur].compare_exchange_strong(expected, 0, std::memory_order_relaxed,
+                                                       std::memory_order_relaxed)) {
+                continue;
+            }
+            return cur;
+        }
+        return header_.nodeCursor++ % total;
+    }
+    void MarkAccessed(size_t iNode) override
+    {
+        accessed_[iNode].store(1, std::memory_order_relaxed);
+    }
+    void* DataAt(size_t iNode) override
+    {
+        return ((std::byte*)data_.get()) + header_.nodeSize * iNode;
+    }
+    void* DeviceDataAt(size_t iNode) override
+    {
+        if (dataOnDevice_ == nullptr) { return nullptr; }
+        return dataOnDevice_ + header_.nodeSize * iNode;
+    }
+    BufferMetaNode* MetaAt(size_t iNode) override { return meta_.get() + iNode; }
+};
+
+class SharedBufferStrategy : public BufferStrategy {
+protected:
+    struct ShareMutex {
+        pthread_mutex_t mutex;
+        ~ShareMutex() = delete;
+        void Init()
+        {
+            pthread_mutexattr_t attr;
+            pthread_mutexattr_init(&attr);
+            pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+            pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
+            pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
+            pthread_mutex_init(&mutex, &attr);
+            pthread_mutexattr_destroy(&attr);
+        }
+        void Lock() { pthread_mutex_lock(&mutex); }
+        bool TryLock() { return pthread_mutex_trylock(&mutex) == 0; }
+        void Unlock() { pthread_mutex_unlock(&mutex); }
+    };
+    struct ShareLock {
+        pthread_spinlock_t lock;
+        ~ShareLock() = delete;
+        void Init() { pthread_spin_init(&lock, PTHREAD_PROCESS_SHARED); }
+        void Lock() { pthread_spin_lock(&lock); }
+        bool TryLock() { return pthread_spin_trylock(&lock) == 0; }
+        void Unlock() { pthread_spin_unlock(&lock); }
+    };
+    static constexpr size_t sharedBufferMagic = (('C' << 16) | ('x' << 8) | 1);
+    struct BufferHeader {
+        std::atomic<size_t> magic;
+        size_t nNode;
+        alignas(64) std::atomic<size_t> nodeCursor;
+        char nodeCursorPad[64 - sizeof(std::atomic<size_t>)];
+        size_t buckets[nHashTableBucket];
+        ShareMutex bucketLocks[nHashTableBucket];
+        ShareLock nodeLocks[0];
+    };
+    static_assert(std::atomic<size_t>::is_always_lock_free, "nodeCursor must be lock-free");
+    static_assert(std::atomic<uint8_t>::is_always_lock_free, "accessed must be lock-free");
+
+    BufferHeader* header_{nullptr};
+    BufferMetaNode* meta_{nullptr};
+    std::atomic<uint8_t>* accessed_{nullptr};
+    std::byte* data_{nullptr};
+    std::byte* dataOnDevice_{nullptr};
+    const std::string& uuid_;
+    std::string shmName_;
+    size_t nodeSize_{0};
+    size_t nNode_{0};
+    void* addrress_{nullptr};
+    size_t totalSize_{0};
+
+    size_t AccessedOffset() const noexcept
+    {
+        constexpr auto align = 64;
+        auto off = sizeof(BufferHeader) + sizeof(ShareLock) * nNode_;
+        return (off + align - 1) & ~(align - 1);
+    }
+    size_t AccessedSize() const noexcept { return sizeof(std::atomic<uint8_t>) * nNode_; }
+    size_t MetaOffset() const noexcept
+    {
+        constexpr auto align = alignof(BufferMetaNode);
+        auto off = AccessedOffset() + AccessedSize();
+        return (off + align - 1) & ~(align - 1);
+    }
+    size_t DataOffset() const noexcept
+    {
+        static const auto pageSize = sysconf(_SC_PAGESIZE);
+        const auto size = MetaOffset() + sizeof(BufferMetaNode) * nNode_;
+        return (size + pageSize - 1) & ~(pageSize - 1);
+    }
+    size_t DataSize() const noexcept { return nodeSize_ * nNode_; }
+    static const std::string& ShmPrefix() noexcept
+    {
+        static std::string prefix{"uc_shm_context_clock_v1_"};
+        return prefix;
+    }
+    static void CleanUpShmFileExceptMe(const std::string& me)
+    {
+        namespace fs = std::filesystem;
+        std::string_view prefix = ShmPrefix();
+        fs::path shmDir = "/dev/shm";
+        if (!fs::exists(shmDir)) { return; }
+        const auto now = fs::file_time_type::clock::now();
+        const auto keepThreshold = std::chrono::minutes(10);
+        for (const auto& entry : fs::directory_iterator(shmDir)) {
+            const auto& path = entry.path();
+            const auto& name = path.filename().string();
+            if (!entry.is_regular_file() || name.compare(0, prefix.size(), prefix) != 0 ||
+                name == me) {
+                continue;
+            }
+            try {
+                const auto lwt = fs::last_write_time(path);
+                if (now - lwt <= keepThreshold) { continue; }
+                fs::remove(path);
+            } catch (...) {
+            }
+        }
+    }
+    static Status MmapShmFile(PosixShm& shmFile, const size_t size, void*& addr,
+                              bool needTrunc = true)
+    {
+        auto s = Status::OK();
+        if (needTrunc) {
+            s = shmFile.Truncate(size);
+            if (s.Failure()) [[unlikely]] {
+                UC_ERROR("Failed({}) to trunc file({}) with size({}).", s, shmFile.ShmName(), size);
+                return s;
+            }
+        }
+        s = shmFile.MMap(addr, size, true, true, true, true);
+        if (s.Failure()) [[unlikely]] {
+            UC_ERROR("Failed({}) to mmap file({}) with size({}).", s, shmFile.ShmName(), size);
+            return s;
         }
         return Status::OK();
     }
-    size_t Find(const Key& key)
+    static Status WaitShmHeaderReady(BufferHeader* header)
     {
-        for (auto i = header->heads[Hash(key)]; i != nil; i = blocks[i].next) {
-            if (blocks[i].key == key) { return i; }
-        }
-        return nil;
+        constexpr auto retryInterval = std::chrono::milliseconds(100);
+        constexpr auto maxTryTime = 100;
+        auto tryTime = 0;
+        do {
+            if (header->magic == sharedBufferMagic) { break; }
+            if (tryTime > maxTryTime) { return Status::Retry(); }
+            std::this_thread::sleep_for(retryInterval);
+            tryTime++;
+        } while (true);
+        return Status::OK();
     }
-    size_t FetchNode()
+    Status InitShmBuffer(PosixShm& shmFile)
     {
-        // Cache's cursor handles virgin slots. Its clock victim selection is
-        // replaced by slots already released by radix/on-evict write, not a
-        // scan over live shards that the policy has not permitted us to reuse.
-        auto pos = header->cursor.load(std::memory_order_relaxed);
-        while (pos < header->count) {
-            if (header->cursor.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-                header->freeCount.fetch_sub(1, std::memory_order_relaxed);
-                return pos;
-            }
+        auto s = MmapShmFile(shmFile, totalSize_, addrress_);
+        if (s.Failure()) [[unlikely]] { return s; }
+        header_ = static_cast<BufferHeader*>(addrress_);
+        meta_ = (BufferMetaNode*)(static_cast<std::byte*>(addrress_) + MetaOffset());
+        accessed_ = reinterpret_cast<std::atomic<uint8_t>*>(static_cast<std::byte*>(addrress_) +
+                                                            AccessedOffset());
+        header_->nNode = nNode_;
+        header_->nodeCursor.store(0, std::memory_order_relaxed);
+        for (size_t i = 0; i < nHashTableBucket; i++) {
+            header_->buckets[i] = invalidIndex;
+            header_->bucketLocks[i].Init();
         }
-        std::lock_guard<Mutex> pool(header->recycled);
-        pos = header->freeHead;
-        if (pos != nil) {
-            header->freeHead = shards[pos].next;
-            header->freeCount.fetch_sub(1, std::memory_order_relaxed);
+        for (size_t i = 0; i < nNode_; i++) {
+            header_->nodeLocks[i].Init();
+            meta_[i].Init();
+            accessed_[i].store(0, std::memory_order_relaxed);
         }
-        return pos;
+        header_->magic = sharedBufferMagic;
+        return Status::OK();
     }
-    void Drain()
-    {  // Only new logical blocks enter this policy admission queue.
-        size_t i;
-        {
-            std::lock_guard<Mutex> l(header->metadata);
-            i = header->pendingHead;
-            header->pendingHead = nil;
+    Status LoadShmBuffer(PosixShm& shmFile)
+    {
+        auto s = shmFile.ShmOpen(PosixShm::OpenFlag::READ_WRITE);
+        if (s.Failure()) {
+            UC_ERROR("Failed({}) to open file({}).", s, shmFile.ShmName());
+            return s;
         }
-        // Only the policy owner retires slots, so these detached entries remain
-        // stable while we register them without holding the metadata lock.
-        while (i != nil) {
-            auto next = blocks[i].pending;
-            resident.emplace(blocks[i].key, i);
-            unobserved.push_back(blocks[i].key);
-            i = next;
+        s = MmapShmFile(shmFile, totalSize_, addrress_, false);
+        if (s.Failure()) [[unlikely]] { return s; }
+        header_ = static_cast<BufferHeader*>(addrress_);
+        s = WaitShmHeaderReady(header_);
+        if (s.Failure()) [[unlikely]] {
+            UC_ERROR("Shm file({}) not ready.", shmFile.ShmName());
+            return s;
         }
-        size_t remaining = 0;
-        for (const auto& key : unobserved) {
-            if (index.Contains(key)) {
-                index.Insert(key);
-            } else {
-                unobserved[remaining++] = key;
-            }
+        meta_ = (BufferMetaNode*)(static_cast<std::byte*>(addrress_) + MetaOffset());
+        accessed_ = reinterpret_cast<std::atomic<uint8_t>*>(static_cast<std::byte*>(addrress_) +
+                                                            AccessedOffset());
+        return Status::OK();
+    }
+    Status RegisterBuffer(int32_t deviceId)
+    {
+        data_ = static_cast<std::byte*>(addrress_) + DataOffset();
+        Trans::Device device;
+        auto s = device.Setup(deviceId);
+        if (s.Failure()) [[unlikely]] {
+            UC_ERROR("Failed({}) to setup device({}).", s, deviceId);
+            return s;
         }
-        unobserved.resize(remaining);
+        const auto dataSize = DataSize();
+        s = Trans::Buffer::RegisterHostBuffer((void*)data_, dataSize, (void**)&dataOnDevice_);
+        if (s.Failure()) [[unlikely]] {
+            UC_ERROR("Failed({}) to register buffer({}) to device({}).", s, dataSize, deviceId);
+            return s;
+        }
+        return Status::OK();
     }
 
-    void Prune()
+public:
+    SharedBufferStrategy(const std::string& uuid, int32_t deviceId, size_t nodeSize,
+                         size_t totalSize, size_t reservedNumber)
+        : BufferStrategy(deviceId, nodeSize, totalSize, reservedNumber), uuid_(uuid)
     {
-        if (header->tasks.load() != 0) { return; }
-        for (auto it = retired.rbegin(); it != retired.rend(); ++it) {
-            index.Prune(*it,
-                        [this](const Key& k) { return retained.count(k) || resident.count(k); });
-        }
-        retired.clear();
     }
-    // Count occupied shard nodes, not Handle copies. Only 0->1 and 1->0
-    // transitions touch this policy state; victim selection stays O(1).
-    bool Available(size_t pos) { return blocks[pos].activeShards.load() == 0; }
-    bool Reserve(size_t pos)
+    ~SharedBufferStrategy() override
     {
-        auto& block = blocks[pos];
-        std::lock_guard<Mutex> bucket(header->locks[Hash(block.key)]);
-        size_t expected = 0;
-        return block.activeShards.compare_exchange_strong(expected, evicting);
+        if (data_) { Trans::Buffer::UnregisterHostBuffer(data_); }
+        if (addrress_) { PosixShm::MUnmap(addrress_, totalSize_); }
+        PosixShm{shmName_}.ShmUnlink();
     }
-    void Unreserve(size_t pos) { blocks[pos].activeShards.store(0); }
-    void Remove(size_t pos)
+    Status Setup() override
     {
-        auto& block = blocks[pos];
-        const auto key = block.key;
-        const auto failed = block.failed.load();
-        const auto first = block.firstShard;
-        size_t tail = nil, count = 0;
-        {
-            std::lock_guard<Mutex> b(header->locks[Hash(key)]);
-            for (auto i = block.firstShard; i != nil;) {
-                auto& shard = shards[i];
-                const auto next = shard.nextBlock;
-                std::lock_guard<Mutex> bucket(header->shardLocks[ShardHash(key, shard.layer)]);
-                auto* link = &header->shardHeads[ShardHash(key, shard.layer)];
-                while (*link != i) { link = &shards[*link].next; }
-                *link = shard.next;
-                // The block gate excludes every handle and new shard. Once
-                // unlinked under its bucket, this node needs no further lock.
-                shard.block = nil;
-                shard.next = next;
-                tail = i;
-                ++count;
-                i = next;
-            }
-            auto* link = &header->heads[Hash(key)];
-            while (*link != pos) { link = &blocks[*link].next; }
-            *link = block.next;
-            std::lock_guard<Mutex> m(header->metadata);
-            block.next = header->freeBlock;
-            header->freeBlock = pos;
-            --header->blockCount;
-        }
-        {
-            std::lock_guard<Mutex> pool(header->recycled);
-            shards[tail].next = header->freeHead;
-            header->freeHead = first;
-            header->freeCount.fetch_add(count, std::memory_order_relaxed);
-        }
-        {
-            std::lock_guard<Mutex> a(header->allocation);
-            pthread_cond_broadcast(&header->changed);
-        }
-        if (index.Contains(key)) {
-            index.Remove(key);
+        const auto& uuid = uuid_;
+        const auto deviceId = base_.deviceId;
+        const auto nodeSize = base_.nodeSize;
+        const auto totalSize = base_.totalSize;
+        shmName_ = ShmPrefix() + uuid;
+        nodeSize_ = nodeSize;
+        nNode_ = totalSize / nodeSize;
+        CleanUpShmFileExceptMe(shmName_);
+        PosixShm shmFile{shmName_};
+        const auto dataOffset = DataOffset();
+        totalSize_ = dataOffset + DataSize();
+        const auto flags =
+            PosixShm::OpenFlag::CREATE | PosixShm::OpenFlag::EXCL | PosixShm::OpenFlag::READ_WRITE;
+        auto s = shmFile.ShmOpen(flags);
+        if (s.Success()) {
+            s = InitShmBuffer(shmFile);
+        } else if (s == Status::DuplicateKey()) {
+            s = LoadShmBuffer(shmFile);
         } else {
-            unobserved.erase(std::remove(unobserved.begin(), unobserved.end(), key),
-                             unobserved.end());
+            UC_ERROR("Failed({}) to open file({}) with flags({}).", s, shmName_, flags);
+            return s;
         }
-        header->failures.fetch_sub(failed);
-        resident.erase(key);
-        retired.push_back(key);
+        return RegisterBuffer(deviceId);
     }
-    Status Evict(std::unique_lock<std::mutex>& policyLock)
+    void BucketLock(size_t iBucket) override { header_->bucketLocks[iBucket].Lock(); }
+    bool BucketTryLock(size_t iBucket) override { return header_->bucketLocks[iBucket].TryLock(); }
+    void BucketUnlock(size_t iBucket) override { header_->bucketLocks[iBucket].Unlock(); }
+    void NodeLock(size_t iNode) override { header_->nodeLocks[iNode].Lock(); }
+    void NodeUnlock(size_t iNode) override { header_->nodeLocks[iNode].Unlock(); }
+    size_t& FirstAt(size_t iBucket) override { return header_->buckets[iBucket]; }
+    size_t FetchNode(bool allowReserved) override
     {
-        // Failed empty fills are allocations to roll back, not policy evictions.
-        if (header->failures.load())
-            for (const auto& item : resident) {
-                auto& block = blocks[item.second];
-                if (block.ready.load() == 0 && block.failed.load() && Reserve(item.second)) {
-                    Remove(item.second);
-                    return Status::OK();
-                }
+        const auto total = header_->nNode - (allowReserved ? 0 : base_.reservedNumber);
+        for (size_t i = 0; i < 2 * total; ++i) {
+            auto cur = header_->nodeCursor.fetch_add(1, std::memory_order_relaxed) % total;
+            uint8_t expected = 1;
+            if (accessed_[cur].compare_exchange_strong(expected, 0, std::memory_order_relaxed,
+                                                       std::memory_order_relaxed)) {
+                continue;
             }
-        auto begin = std::chrono::steady_clock::now();
-        bool busy = false;
-        auto victim = index.Select(cfg.alpha * (header->count / header->layers), cfg.evictionLimit,
-                                   [this, &busy](const Key& key) {
-                                       auto pos = resident.at(key);
-                                       if (!Available(pos)) {
-                                           busy = true;
-                                           return false;
-                                       }
-                                       return blocks[pos].ready.load() == header->layers ||
-                                              blocks[pos].loaded.load();
-                                   });
-        stats["decision_ns"] += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                    std::chrono::steady_clock::now() - begin)
-                                    .count();
-        ++stats["eviction_decisions"];
-        if (victim.blocks.empty()) {
-            if (busy) { return Status::Retry(); }
-            ++stats["no_space"];
-            return Status::NoSpace();
+            return cur;
         }
-        bool drop = cfg.retention >= 0 && now - victim.lastAccess > uint64_t(cfg.retention);
-        size_t freed = 0;
-        for (const auto& key : victim.blocks) {
-            auto pos = resident.at(key);
-            auto& block = blocks[pos];
-            if (!Reserve(pos)) { continue; }
-            auto s = Status::OK();
-            if (!drop) {
-                const auto backendKey = cfg.BackendKey(key);
-                // Reserved shard nodes keep payload stable. Backend latency must
-                // not hold the radix mutex across the next request's Observe.
-                policyLock.unlock();
-                bool written = false;
-                auto found = cfg.storeBackend->Lookup(&backendKey, 1);
-                if (!found) {
-                    s = found.Error();
-                } else if (!found.Value()[0]) {
-                    if (block.ready.load() != header->layers) {
-                        s = Status::NotFound();
-                    } else {
-                        Detail::TaskDesc task;
-                        for (auto i = block.firstShard; i != nil; i = shards[i].nextBlock) {
-                            task.push_back(
-                                {backendKey, shards[i].layer, {data + i * header->shardBytes}});
-                        }
-                        std::sort(task.begin(), task.end(),
-                                  [](const auto& a, const auto& b) { return a.index < b.index; });
-                        auto t = cfg.storeBackend->Dump(std::move(task));
-                        s = t ? cfg.storeBackend->Wait(t.Value()) : t.Error();
-                        written = s.Success();
-                    }
-                }
-                policyLock.lock();
-                if (s.Success()) {
-                    ++stats[written ? "backend_dump_blocks" : "backend_dump_skipped_blocks"];
-                    if (written) { stats["backend_dump_bytes"] += cfg.blockSize; }
-                }
-            }
-            if (s.Failure()) {
-                Unreserve(pos);
-                return s;
-            }
-            Remove(pos);
-            ++freed;
-            ++stats["evicted_blocks"];
-            ++stats[drop ? "drop_blocks" : "dump_blocks"];
-            Metrics::UpdateStats(NAME_TO_METRIC_ID("context_evict_blocks_total"), 1);
-            Metrics::UpdateStats(drop ? NAME_TO_METRIC_ID("context_drop_blocks_total")
-                                      : NAME_TO_METRIC_ID("context_dump_blocks_total"),
-                                 1);
-        }
-        return freed ? Status::OK() : Status::Retry();
+        return header_->nodeCursor.fetch_add(1, std::memory_order_relaxed) % total;
     }
-    void Maintain()
+    void MarkAccessed(size_t iNode) override
     {
-        for (;;) {
-            size_t request, epoch;
-            {
-                std::unique_lock<Mutex> a(header->allocation);
-                while (!stop && header->pressure == header->completed) {
-                    pthread_cond_wait(&header->changed, &header->allocation.value);
-                }
-                if (stop) { return; }
-                request = header->pressure;
-                epoch = header->released.load();
-            }
-            // Reclaim a small reserve per pressure cycle; each Remove already
-            // wakes allocators, so they need not wait for the whole batch.
-            for (;;) {
-                auto s = Status::OK();
-                {
-                    std::unique_lock<std::mutex> p(policy);
-                    Drain();
-                    s = Evict(p);
-                    Prune();
-                }
-                std::lock_guard<Mutex> a(header->allocation);
-                header->allocationError = s.Underlying();
-                header->allocationEpoch = epoch;
-                if (s.Failure() || header->freeCount >= header->count / 20) {
-                    if (s.Success()) { header->pressureActive.store(false); }
-                    header->completed = request;
-                    pthread_cond_broadcast(&header->changed);
-                    break;
-                }
-                epoch = header->released.load();
-            }
-        }
+        accessed_[iNode].store(1, std::memory_order_relaxed);
     }
+    void* DataAt(size_t iNode) override { return data_ + nodeSize_ * iNode; }
+    void* DeviceDataAt(size_t iNode) override { return dataOnDevice_ + nodeSize_ * iNode; }
+    BufferMetaNode* MetaAt(size_t iNode) override { return meta_ + iNode; }
 };
 
-TransBuffer::TransBuffer() : impl_(std::make_unique<Impl>()) {}
-TransBuffer::~TransBuffer() = default;
-Status TransBuffer::Setup(const Config& c)
-{
-    auto& p = *impl_;
-    p.cfg = c;
-    p.policyOwner = c.deviceId >= 0 && (!c.shareBufferEnable || c.tpRank == 0);
-    p.name = "/ucm_context_v7_" + c.uniqueId +
-             (c.shareBufferEnable ? "_mla" : "_tp" + std::to_string(c.tpRank));
-    if (c.deviceId < 0) { return Status::OK(); }
-    return p.Open(false);
-}
-Expected<TransBuffer::Handle> TransBuffer::Get(const Key& key, size_t layer)
-{
-    auto& p = *impl_;
-    const auto bucket = ShardHash(key, layer);
-    if (!p.header->ownerAlive.load()) { return Status::NotFound(); }
+class SharedBufferWatcherStrategy : public SharedBufferStrategy {
+public:
+    explicit SharedBufferWatcherStrategy(const std::string& uuid)
+        : SharedBufferStrategy(uuid, -1, 0, 0, 0)
     {
-        std::lock_guard<Mutex> b(p.header->shardLocks[bucket]);
-        bool owner = false;
-        const auto pos = FindAt(bucket, key, layer, owner);
-        if (pos != nil) { return Handle(this, pos, owner); }
     }
-    return Alloc(key, layer, false);
-}
-void TransBuffer::Prealloc(const Key& key, size_t layer)
-{
-    auto& p = *impl_;
-    const auto bucket = ShardHash(key, layer);
+    Status Setup() override
     {
-        std::lock_guard<Mutex> b(p.header->shardLocks[bucket]);
-        if (ExistAt(bucket, key, layer)) { return; }
+        shmName_ = ShmPrefix() + uuid_;
+        CleanUpShmFileExceptMe(shmName_);
+        PosixShm shmFile{shmName_};
+        auto s = shmFile.ShmOpen(PosixShm::OpenFlag::READ_WRITE);
+        if (s.Failure()) {
+            UC_ERROR("Failed({}) to open file({}).", s, shmFile.ShmName());
+            return s;
+        }
+        void* addr = nullptr;
+        auto size = sizeof(BufferHeader);
+        s = MmapShmFile(shmFile, size, addr, false);
+        if (s.Failure()) [[unlikely]] { return s; }
+        auto header = static_cast<BufferHeader*>(addr);
+        s = WaitShmHeaderReady(header);
+        if (s.Failure()) [[unlikely]] {
+            UC_ERROR("Shm file({}) not ready.", shmFile.ShmName());
+            return s;
+        }
+        nNode_ = header->nNode;
+        shmFile.MUnmap(addr, size);
+        totalSize_ = DataOffset();
+        s = MmapShmFile(shmFile, totalSize_, addrress_, false);
+        if (s.Failure()) [[unlikely]] { return s; }
+        header_ = static_cast<BufferHeader*>(addrress_);
+        meta_ = (BufferMetaNode*)(static_cast<std::byte*>(addrress_) + MetaOffset());
+        accessed_ = reinterpret_cast<std::atomic<uint8_t>*>(static_cast<std::byte*>(addrress_) +
+                                                            AccessedOffset());
+        return Status::OK();
     }
-    // Cache Prealloc reserves a slot, not fill ownership. Radix writeback is
-    // never awaited by this speculative call; the next real Get handles pressure.
-    auto result = Alloc(key, layer, true);
-}
-bool TransBuffer::ExistAt(size_t bucket, const Key& key, size_t layer)
+    void* DataAt(size_t iNode) override { return nullptr; }
+    void* DeviceDataAt(size_t iNode) override { return nullptr; }
+    void MarkAccessed(size_t /*iNode*/) override {}
+};
+
+Status TransBuffer::Setup(const Config& config)
 {
-    auto& p = *impl_;
-    for (auto i = p.header->shardHeads[bucket]; i != nil; i = p.shards[i].next) {
-        if (p.shards[i].key == key && p.shards[i].layer == layer) { return true; }
+    backend_ = config.storeBackend;
+    retentionNs_ = config.retentionNs;
+    bypassHitOnLoad_ = config.cacheLoadBackendOnly;
+    try {
+        if (!config.shareBufferEnable) {
+            strategy_ = std::make_shared<LocalBufferStrategy>(
+                config.deviceId, config.shardSize, config.bufferCapacity,
+                config.loadExclusiveBufferNumber, config.ioDirect, config.cacheSdmaDirect);
+        } else if (config.deviceId >= 0) {
+            strategy_ = std::make_shared<SharedBufferStrategy>(
+                config.uniqueId, config.deviceId, config.shardSize, config.bufferCapacity,
+                config.loadExclusiveBufferNumber);
+        } else {
+            strategy_ = std::make_shared<SharedBufferWatcherStrategy>(config.uniqueId);
+        }
+    } catch (const std::exception& e) {
+        return Status::Error(fmt::format("failed({}) to make buffer strategy", e.what()));
+    }
+    return strategy_->Setup();
+}
+
+Expected<TransBuffer::Handle> TransBuffer::Get(const Detail::BlockId& blockId, size_t shardIdx,
+                                     bool allowReserved, bool isLoad)
+{
+    auto iBucket = Hash(blockId, shardIdx);
+    bool owner = false;
+    strategy_->BucketLock(iBucket);
+    auto iNode = FindAt(iBucket, blockId, shardIdx, owner);
+    if (iNode != invalidIndex) {
+        if (bypassHitOnLoad_ && isLoad && owner && Ready(iNode)) { MarkNotReady(iNode); }
+        strategy_->BucketUnlock(iBucket);
+        return Handle{this, iNode, owner};
+    }
+    auto allocated = Alloc(blockId, shardIdx, iBucket, allowReserved);
+    strategy_->BucketUnlock(iBucket);
+    if (!allocated) { return allocated.Error(); }
+    return Handle(this, allocated.Value(), true);
+}
+
+void TransBuffer::Prealloc(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved)
+{
+    auto iBucket = Hash(blockId, shardIdx);
+    strategy_->BucketLock(iBucket);
+    if (!ExistAt(iBucket, blockId, shardIdx)) {
+        auto pos = Alloc(blockId, shardIdx, iBucket, allowReserved);
+        if (pos) { Release(pos.Value()); }
+    }
+    strategy_->BucketUnlock(iBucket);
+}
+
+bool TransBuffer::Exist(const Detail::BlockId& blockId, size_t shardIdx)
+{
+    auto iBucket = Hash(blockId, shardIdx);
+    strategy_->BucketLock(iBucket);
+    auto exist = ExistAt(iBucket, blockId, shardIdx);
+    strategy_->BucketUnlock(iBucket);
+    return exist;
+}
+
+bool TransBuffer::ExistAt(size_t iBucket, const Detail::BlockId& blockId, size_t shardIdx)
+{
+    auto iNode = strategy_->FirstAt(iBucket);
+    while (iNode != invalidIndex) {
+        auto meta = strategy_->MetaAt(iNode);
+        if (meta->block == blockId && meta->shard == shardIdx) { return true; }
+        iNode = meta->next;
     }
     return false;
 }
-size_t TransBuffer::FindAt(size_t bucket, const Key& key, size_t layer, bool& owner)
+
+size_t TransBuffer::FindAt(size_t iBucket, const Detail::BlockId& blockId, size_t shardIdx,
+                           bool& owner)
 {
-    auto& p = *impl_;
-    for (auto i = p.header->shardHeads[bucket]; i != nil; i = p.shards[i].next) {
-        auto& node = p.shards[i];
-        if (node.key != key || node.layer != layer) { continue; }
-        std::lock_guard<SpinLock> n(node.mutex);
-        owner = node.references == 0;
-        if (owner) {
-            auto& active = p.blocks[node.block].activeShards;
-            auto count = active.load();
-            do {
-                if (count == evicting) { return nil; }
-            } while (!active.compare_exchange_weak(count, count + 1));
+    auto iNode = strategy_->FirstAt(iBucket);
+    while (iNode != invalidIndex) {
+        auto meta = strategy_->MetaAt(iNode);
+        if (meta->block == blockId && meta->shard == shardIdx) {
+            strategy_->NodeLock(iNode);
+            owner = meta->reference == 0;
+            if (owner && meta->state.load(std::memory_order_relaxed) == State::FAILED) {
+                meta->state.store(State::LOADING, std::memory_order_relaxed);
+                meta->errorCode.store(Status::OK().Underlying(), std::memory_order_relaxed);
+            }
+            ++meta->reference;
+            strategy_->MarkAccessed(iNode);
+            if (retentionNs_ >= 0) {
+                meta->lastAccessNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            }
+            strategy_->NodeUnlock(iNode);
+            break;
         }
-        if (owner && node.state.load(std::memory_order_relaxed) == State::FAILED) {
-            node.state.store(State::LOADING, std::memory_order_relaxed);
-            node.error.store(Status::OK().Underlying(), std::memory_order_relaxed);
-            p.blocks[node.block].failed.fetch_sub(1);
-            p.header->failures.fetch_sub(1);
-        }
-        ++node.references;
-        return i;
+        iNode = meta->next;
     }
-    return nil;
+    return iNode;
 }
-Expected<TransBuffer::Handle> TransBuffer::Alloc(const Key& key, size_t layer, bool prealloc)
+
+Expected<size_t> TransBuffer::Alloc(const Detail::BlockId& blockId, size_t shardIdx, size_t iBucket,
+                          bool allowReserved)
 {
-    auto& p = *impl_;
-    auto* h = p.header;
-    const auto bucket = ShardHash(key, layer);
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(p.cfg.timeoutMs);
     for (;;) {
-        bool evictingBlock = false;
-        {
-            std::lock_guard<Mutex> blockLock(h->locks[Hash(key)]);
-            std::lock_guard<Mutex> shardLock(h->shardLocks[bucket]);
-            if (prealloc) {
-                if (ExistAt(bucket, key, layer)) { return Handle{}; }
-            } else {
-                bool owner = false;
-                const auto pos = FindAt(bucket, key, layer, owner);
-                if (pos != nil) { return Handle(this, pos, owner); }
-            }
-            auto blockPos = p.Find(key);
-            evictingBlock = blockPos != nil && p.blocks[blockPos].activeShards.load() == evicting;
-            // Preallocation only extends a resident block. A preceding layer
-            // already created its metadata; no extra policy admission is needed.
-            if (prealloc && blockPos == nil) { return Status::NotFound(); }
-            if (!evictingBlock) {
-                const auto pos = p.FetchNode();
-                if (pos != nil) {
-                    auto& node = p.shards[pos];
-                    std::lock_guard<SpinLock> n(node.mutex);
-                    if (blockPos == nil) {
-                        std::lock_guard<Mutex> m(h->metadata);
-                        blockPos = h->freeBlock;
-                        auto& block = p.blocks[blockPos];
-                        h->freeBlock = block.next;
-                        ++h->blockCount;
-                        block.key = key;
-                        block.activeShards.store(0);
-                        block.ready.store(0);
-                        block.failed.store(0);
-                        block.loaded.store(false);
-                        block.firstShard = nil;
-                        block.next = h->heads[Hash(key)];
-                        h->heads[Hash(key)] = blockPos;
-                        block.pending = h->pendingHead;
-                        h->pendingHead = blockPos;
-                        h->highWater.store(std::max(h->highWater.load(), h->blockCount));
-                    }
-                    auto& block = p.blocks[blockPos];
-                    node.key = key;
-                    node.block = blockPos;
-                    node.layer = layer;
-                    node.references = prealloc ? 0 : 1;
-                    if (!prealloc) { block.activeShards.fetch_add(1); }
-                    node.state.store(State::LOADING, std::memory_order_relaxed);
-                    node.error.store(0, std::memory_order_relaxed);
-                    node.next = h->shardHeads[bucket];
-                    h->shardHeads[bucket] = pos;
-                    node.nextBlock = block.firstShard;
-                    block.firstShard = pos;
-                    return prealloc ? Handle{} : Handle(this, pos, true);
-                }
-            }
-        }
-        if (prealloc) { return Status::NoSpace(); }
-        // Only radix eviction/writeback crosses to the policy owner. Normal
-        // shard allocation and reference release do not take this mutex.
-        std::unique_lock<Mutex> a(h->allocation);
-        timespec until;
-        const auto ns =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch())
-                .count();
-        until.tv_sec = ns / 1000000000;
-        until.tv_nsec = ns % 1000000000;
-        auto wait = [&] {
-            return pthread_cond_timedwait(&h->changed, &h->allocation.value, &until);
-        };
-        if (evictingBlock) {
-            // A writeback may have completed before we took the wait mutex.
-            std::lock_guard<Mutex> b(h->locks[Hash(key)]);
-            const auto pos = p.Find(key);
-            evictingBlock = pos != nil && (p.blocks[pos].activeShards.load() == evicting);
-        }
-        if (evictingBlock) {
-            if (wait() == ETIMEDOUT) { return Status::Timeout(); }
+        auto iNode = strategy_->FetchNode(allowReserved);
+        auto meta = strategy_->MetaAt(iNode);
+        strategy_->NodeLock(iNode);
+        if (meta->reference > 0) {
+            strategy_->NodeUnlock(iNode);
             continue;
         }
-        if (h->freeCount.load()) { continue; }
-        h->pressureActive.store(true);
-        const auto request = h->pressure == h->completed ? ++h->pressure : h->pressure;
-        pthread_cond_broadcast(&h->changed);
-        while (h->completed < request && !h->freeCount.load()) {
-            if (wait() == ETIMEDOUT) { return Status::Timeout(); }
+        const auto oldBucket = meta->hash;
+        const bool lockOld = oldBucket != invalidIndex && oldBucket != iBucket;
+        if (lockOld && !strategy_->BucketTryLock(oldBucket)) {
+            strategy_->NodeUnlock(iNode);
+            continue;
         }
-        // Another rank may have admitted exactly this shard while we waited.
-        // Claim it before interpreting a subsequent policy allocation failure.
-        {
-            std::lock_guard<Mutex> b(h->shardLocks[bucket]);
-            bool owner = false;
-            const auto pos = FindAt(bucket, key, layer, owner);
-            if (pos != nil) { return Handle(this, pos, owner); }
+        // Cache's selected unreferenced shard stays locked until writeback completes.
+        // A failed write leaves the original mapping and payload intact.
+        auto evicted = Evict(iNode);
+        if (evicted.Failure()) {
+            if (lockOld) { strategy_->BucketUnlock(oldBucket); }
+            strategy_->NodeUnlock(iNode);
+            return evicted;
         }
-        if (!h->freeCount.load() && h->completed >= request && h->allocationError) {
-            if (h->allocationError != Status::Retry().Underlying()) {
-                return Status{h->allocationError, "context allocation failed"};
-            }
-            while (!h->freeCount.load() && h->released.load() == h->allocationEpoch) {
-                if (wait() == ETIMEDOUT) { return Status::Timeout(); }
-            }
+        if (oldBucket != iBucket) {
+            if (oldBucket != invalidIndex) { Remove(oldBucket, iNode); }
+            if (lockOld) { strategy_->BucketUnlock(oldBucket); }
+            MoveTo(iBucket, iNode);
         }
-    }
-}
-Detail::BlockId TransBuffer::BackendKey(const Key& key) const { return impl_->cfg.BackendKey(key); }
-Expected<std::vector<uint8_t>> TransBuffer::Lookup(const Key* keys, size_t n)
-{
-    std::vector<uint8_t> result(n);
-    std::vector<Key> missing;
-    std::vector<size_t> offsets;
-    for (size_t i = 0; i < n; ++i) {
-        result[i] = Exist(keys[i]);
-        if (!result[i]) {
-            missing.push_back(BackendKey(keys[i]));
-            offsets.push_back(i);
+        ++meta->reference;
+        strategy_->MarkAccessed(iNode);
+        meta->persisted = false;
+        if (retentionNs_ >= 0) {
+            meta->lastAccessNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
         }
+        meta->block = blockId;
+        meta->shard = shardIdx;
+        meta->state.store(State::LOADING, std::memory_order_relaxed);
+        meta->errorCode.store(Status::OK().Underlying(), std::memory_order_relaxed);
+        strategy_->NodeUnlock(iNode);
+        return iNode;
     }
-    if (!missing.empty()) {
-        auto found = impl_->cfg.storeBackend->Lookup(missing.data(), missing.size());
-        if (!found) { return found.Error(); }
-        for (size_t i = 0; i < missing.size(); ++i) { result[offsets[i]] = found.Value()[i]; }
-    }
-    return result;
 }
-bool TransBuffer::Exist(const Key& key)
+
+void TransBuffer::MoveTo(size_t iBucket, size_t iNode)
 {
-    auto& p = *impl_;
-    if (!p.header && p.Open(true).Failure()) { return false; }
-    if (!p.header->ownerAlive.load()) { return false; }
-    std::lock_guard<Mutex> b(p.header->locks[Hash(key)]);
-    auto pos = p.Find(key);
-    return pos != nil && !(p.blocks[pos].activeShards.load() == evicting) &&
-           p.blocks[pos].ready.load() == p.header->layers;
+    auto meta = strategy_->MetaAt(iNode);
+    auto& head = strategy_->FirstAt(iBucket);
+    auto n = head;
+    meta->next = n;
+    if (n != invalidIndex) {
+        auto next = strategy_->MetaAt(n);
+        strategy_->NodeLock(n);
+        next->prev = iNode;
+        strategy_->NodeUnlock(n);
+    }
+    meta->hash = iBucket;
+    head = iNode;
 }
-Status TransBuffer::Observe(const std::string& request, uint64_t observation, uint64_t time,
-                            const std::vector<Key>& path)
+
+void TransBuffer::Remove(size_t iBucket, size_t iNode)
 {
-    auto& p = *impl_;
-    if (!p.policyOwner) { return Status::OK(); }
-    auto started = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> l(p.policy);
-    auto previous = p.observed.find(request);
-    if (!path.empty() && previous != p.observed.end() && previous->second.sequence >= observation) {
-        return Status::OK();
+    auto meta = strategy_->MetaAt(iNode);
+    auto p = meta->prev;
+    if (p != invalidIndex) {
+        auto prev = strategy_->MetaAt(p);
+        strategy_->NodeLock(p);
+        prev->next = meta->next;
+        strategy_->NodeUnlock(p);
     }
-    if (!path.empty() && time < p.now) {
-        return Status::InvalidParam("context timestamps must be nondecreasing");
+    auto n = meta->next;
+    if (n != invalidIndex) {
+        auto next = strategy_->MetaAt(n);
+        strategy_->NodeLock(n);
+        next->prev = meta->prev;
+        strategy_->NodeUnlock(n);
     }
-    if (!path.empty()) {
-        auto s = p.index.Observe(path, time);
-        if (s.Failure()) { return s; }
-        p.now = time;
-    }
-    bool same = previous != p.observed.end() && previous->second.path == path;
-    if (same) {
-        previous->second.sequence = observation;
-    } else {
-        for (const auto& key : path) { ++p.retained[key]; }
-        if (previous != p.observed.end()) {
-            for (const auto& key : previous->second.path) {
-                if (--p.retained.at(key) == 0) { p.retained.erase(key); }
-                p.retired.push_back(key);
-            }
-            p.observed.erase(previous);
-        }
-        if (!path.empty()) { p.observed.emplace(request, Impl::Observation{observation, path}); }
-    }
-    p.Drain();
-    p.Prune();
-    Metrics::UpdateStats(
-        NAME_TO_METRIC_ID("context_observe_duration_ms"),
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
-            .count());
-    return Status::OK();
+    if (strategy_->FirstAt(iBucket) == iNode) { strategy_->FirstAt(iBucket) = n; }
+    meta->prev = meta->next = invalidIndex;
+    meta->hash = invalidIndex;
 }
-Status TransBuffer::BeginTask(const Detail::TaskDesc& task)
-{
-    auto& p = *impl_;
-    if (task.empty()) { return Status::InvalidParam("empty transfer"); }
-    for (const auto& s : task) {
-        if (s.index >= p.header->layers || s.addrs.size() != p.cfg.tensorSizes.size() ||
-            std::any_of(s.addrs.begin(), s.addrs.end(), [](void* x) { return !x; })) {
-            return Status::InvalidParam("invalid transfer shard");
-        }
-    }
-    if (task.size() > p.header->count) {
-        std::set<std::pair<Key, size_t>> keys;
-        for (const auto& s : task) { keys.emplace(s.owner, s.index); }
-        if (keys.size() > p.header->count) { return Status::NoSpace(); }
-    }
-    p.header->tasks.fetch_add(1);
-    return Status::OK();
-}
-void TransBuffer::EndTask() { impl_->header->tasks.fetch_sub(1); }
-std::map<std::string, uint64_t> TransBuffer::Stats()
-{
-    auto& p = *impl_;
-    std::lock_guard<std::mutex> l(p.policy);
-    if (p.policyOwner) {
-        p.Drain();
-        p.Prune();
-    }
-    auto result = p.stats;
-    if (!p.header) { return result; }
-    std::lock_guard<Mutex> a(p.header->metadata);
-    result["memory_blocks"] = p.header->blockCount;
-    result["memory_shards"] = p.header->count - p.header->freeCount;
-    result["memory_bytes"] = result["memory_shards"] * p.header->shardBytes;
-    result["memory_peak_blocks"] = p.header->highWater.load();
-    result["backend_load_blocks"] = p.backendBlocks.load();
-    result["backend_load_shards"] = p.backendShards.load();
-    result["topology_nodes"] = p.index.Size();
-    result["d2h_bytes"] = p.d2h.load();
-    result["h2d_bytes"] = p.h2d.load();
-    return result;
-}
-void* TransBuffer::DataAt(Index pos)
-{
-    auto& p = *impl_;
-    return p.data + pos * p.header->shardBytes;
-}
-void* TransBuffer::DeviceDataAt(Index pos)
-{
-    auto& p = *impl_;
-    return p.deviceData + (static_cast<char*>(DataAt(pos)) - p.data);
-}
+
+void* TransBuffer::DataAt(Index pos) { return strategy_->DataAt(pos); }
+
+void* TransBuffer::DeviceDataAt(Index pos) { return strategy_->DeviceDataAt(pos); }
+
 void TransBuffer::Acquire(Index pos)
 {
-    auto& p = *impl_;
-    std::lock_guard<SpinLock> l(p.shards[pos].mutex);
-    ++p.shards[pos].references;
+    strategy_->NodeLock(pos);
+    ++strategy_->MetaAt(pos)->reference;
+    strategy_->NodeUnlock(pos);
 }
+
 void TransBuffer::Release(Index pos)
 {
-    auto& p = *impl_;
-    bool last;
-    {
-        std::lock_guard<SpinLock> l(p.shards[pos].mutex);
-        last = --p.shards[pos].references == 0;
-        if (last) { p.blocks[p.shards[pos].block].activeShards.fetch_sub(1); }
-    }
-    if (last && p.header->pressureActive.load()) {
-        std::lock_guard<Mutex> a(p.header->allocation);
-        p.header->released.fetch_add(1);
-        pthread_cond_broadcast(&p.header->changed);
-    }
+    strategy_->NodeLock(pos);
+    --strategy_->MetaAt(pos)->reference;
+    strategy_->NodeUnlock(pos);
 }
+
 bool TransBuffer::Ready(Index pos) { return GetState(pos) == State::READY; }
+
 TransBuffer::State TransBuffer::GetState(Index pos)
-{ return impl_->shards[pos].state.load(std::memory_order_acquire); }
+{
+    return strategy_->MetaAt(pos)->state.load(std::memory_order_acquire);
+}
+
 Status TransBuffer::FailureStatus(Index pos)
 {
-    return Status{impl_->shards[pos].error.load(std::memory_order_acquire),
-                  "context shard fill failed"};
-}
-void TransBuffer::MarkReady(Index pos, bool backend)
-{
-    auto& p = *impl_;
-    if (p.shards[pos].state.exchange(State::READY, std::memory_order_acq_rel) == State::READY) {
-        return;
+    auto errorCode = strategy_->MetaAt(pos)->errorCode.load(std::memory_order_acquire);
+    if (errorCode == Status::OK().Underlying()) {
+        return Status::Error("shared buffer failed without an error status");
     }
-    auto& block = p.blocks[p.shards[pos].block];
-    block.ready.fetch_add(1);
-    if (backend) {
-        p.backendShards.fetch_add(1);
-        if (!block.loaded.exchange(true)) { p.backendBlocks.fetch_add(1); }
-    } else {
-        p.d2h.fetch_add(
-            std::accumulate(p.cfg.tensorSizes.begin(), p.cfg.tensorSizes.end(), size_t(0)));
-    }
+    return Status{errorCode, {}};
 }
-void TransBuffer::RecordRead(size_t count)
+
+void TransBuffer::MarkReady(Index pos, bool persisted)
 {
-    auto& p = *impl_;
-    p.h2d.fetch_add(count *
-                    std::accumulate(p.cfg.tensorSizes.begin(), p.cfg.tensorSizes.end(), size_t(0)));
+    auto meta = strategy_->MetaAt(pos);
+    meta->persisted = persisted;
+    meta->state.store(State::READY, std::memory_order_release);
 }
-void TransBuffer::MarkFailed(Index pos, const Status& s)
+
+Status TransBuffer::Evict(Index pos)
 {
-    auto& node = impl_->shards[pos];
-    node.error.store(s.Underlying());
-    if (node.state.exchange(State::FAILED, std::memory_order_acq_rel) != State::FAILED) {
-        impl_->blocks[node.block].failed.fetch_add(1);
-        impl_->header->failures.fetch_add(1);
+    auto meta = strategy_->MetaAt(pos);
+    if (meta->hash == invalidIndex || meta->state.load() != State::READY) {
+        return Status::OK();
     }
+    bool drop = false;
+    if (retentionNs_ >= 0) {
+        auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        drop = uint64_t(now) - meta->lastAccessNs > uint64_t(retentionNs_);
+    }
+    if (!drop && !meta->persisted) {
+        auto task = backend_->Dump({{meta->block, meta->shard, {DataAt(pos)}}});
+        auto status = task ? backend_->Wait(task.Value()) : task.Error();
+        if (status.Failure()) { return status; }
+        Metrics::UpdateStats(NAME_TO_METRIC_ID("context_writeback_shards_total"), 1);
+    }
+    Metrics::UpdateStats(NAME_TO_METRIC_ID("context_evict_shards_total"), 1);
+    Metrics::UpdateStats(drop ? NAME_TO_METRIC_ID("context_drop_shards_total")
+                              : NAME_TO_METRIC_ID("context_dump_shards_total"), 1);
+    return Status::OK();
 }
+
+void TransBuffer::MarkFailed(Index pos, const Status& status)
+{
+    auto meta = strategy_->MetaAt(pos);
+    meta->errorCode.store(status.Underlying(), std::memory_order_release);
+    meta->state.store(State::FAILED, std::memory_order_release);
+}
+
+void TransBuffer::MarkNotReady(Index pos)
+{
+    auto meta = strategy_->MetaAt(pos);
+    meta->errorCode.store(Status::OK().Underlying(), std::memory_order_release);
+    meta->state.store(State::LOADING, std::memory_order_release);
+}
+
 }  // namespace UC::Context

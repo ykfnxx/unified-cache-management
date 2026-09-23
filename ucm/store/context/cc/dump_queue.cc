@@ -33,10 +33,8 @@ namespace UC::Context {
 
 DumpQueue::~DumpQueue()
 {
-    if (dispatcher_.joinable()) {
-        waiting_.Push(TaskPair{});
-        dispatcher_.join();
-    }
+    stop_.store(true);
+    if (dispatcher_.joinable()) { dispatcher_.join(); }
 }
 
 Status DumpQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer* buffer)
@@ -94,16 +92,11 @@ void DumpQueue::DispatchStage(std::promise<Status>& started)
 
 void DumpQueue::DispatchOneTask(CopyStream& stream, TaskPair&& pair)
 {
-    if (!pair.first) {
-        stop_.store(true);
-        return;
-    }
     auto& task = pair.first;
     auto& waiter = pair.second;
     auto wait = NowTime::Now() - waiter->startTp;
-    UC_DEBUG("Context task({}) start running, wait {:.3f}ms.", task->id, wait * 1e3);
-    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_dump_queue_wait_duration_ms"),
-                             wait * 1e3);
+    UC_DEBUG("Cache task({}) start running, wait {:.3f}ms.", task->id, wait * 1e3);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_dump_queue_wait_duration_ms"), wait * 1e3);
     if (!failureSet_->Contains(task->id)) {
         auto s = DumpOneTask(stream, task);
         if (s.Failure()) [[unlikely]] {
@@ -116,10 +109,18 @@ void DumpQueue::DispatchOneTask(CopyStream& stream, TaskPair&& pair)
 
 Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
 {
-    if (task->desc.prerequisiteHandle) {
+    const auto start = NowTime::Now();
+    std::shared_ptr<std::atomic<double>> eventReadyTp;
+    if (task->desc.prerequisiteHandle != 0) {
         auto s = stream.WaitEvent(Trans::Event{task->desc.prerequisiteHandle});
         if (s.Failure()) { return s; }
+        eventReadyTp = std::make_shared<std::atomic<double>>(0.0);
+        auto callback = stream.AppendCallback([eventReadyTp](bool) {
+            eventReadyTp->store(NowTime::Now(), std::memory_order_release);
+        });
+        if (callback.Failure()) { eventReadyTp.reset(); }
     }
+    size_t copiedShards = 0;
     std::vector<TransBuffer::Handle> handles;
     auto status = Status::OK();
     for (auto& shard : task->desc) {
@@ -129,25 +130,48 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
             break;
         }
         auto handle = std::move(got.Value());
-        if (!handle.Owner() || handle.Ready()) { continue; }
-        auto* host = cacheSdmaDirect_ ? handle.DeviceData() : handle.Data();
-        status = DeviceToHostAsync(stream, shard.addrs.data(), host);
+        if (!handle.Owner()) { continue; }
+        if (!handle.Ready()) {
+            auto* host = cacheSdmaDirect_ ? handle.DeviceData() : handle.Data();
+            status = DeviceToHostAsync(stream, shard.addrs.data(), host);
+            ++copiedShards;
+        }
         handles.push_back(std::move(handle));
         if (status.Failure()) { break; }
     }
+    auto syncStart = NowTime::Now();
+    Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_dump_mkbuf_duration_ms"),
+                         (syncStart - start) * 1e3);
+    if (handles.empty()) { return status; }
     auto sync = stream.Synchronize();
     if (sync.Failure()) { status = sync; }
+    auto syncEnd = NowTime::Now();
+    if (eventReadyTp) {
+        auto ready = eventReadyTp->load(std::memory_order_acquire);
+        if (ready > 0.0) {
+            Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_dump_prereq_wait_ms"),
+                                 std::max(0.0, ready - start) * 1e3);
+        }
+    }
+    if (copiedShards > 0 && syncEnd > syncStart) {
+        Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_d2h_duration_ms"),
+                             (syncEnd - syncStart) * 1e3);
+    }
     for (auto& handle : handles) {
+        if (handle.Ready()) { continue; }
         if (status.Success()) {
             handle.MarkReady();
         } else {
             handle.MarkFailed(status);
         }
     }
+    // Backend Dump belongs only to TransBuffer eviction.
     return status;
 }
 
 Status DumpQueue::DeviceToHostAsync(CopyStream& stream, void** device, void* host)
-{ return stream.DeviceToHostAsync(device, host, tensorSizes_); }
+{
+    return stream.DeviceToHostAsync(device, host, tensorSizes_);
+}
 
 }  // namespace UC::Context

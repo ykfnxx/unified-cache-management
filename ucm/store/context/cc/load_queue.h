@@ -46,26 +46,25 @@ class LoadQueue {
         TaskPtr task;
         Detail::Shard shard;
         TransBuffer::Handle bufferHandle;
-        Detail::TaskHandle backendTaskHandle{0};
+        Detail::TaskHandle backendTaskHandle;
         WaiterPtr waiter;
-        bool wasNotReady{false};
+        bool fromPosix{false};
     };
 
 private:
-    alignas(64) std::atomic_bool stop_{false}, transferStop_{false};
+    alignas(64) std::atomic_bool stop_{false};
     TaskIdSet* failureSet_{nullptr};
     TransBuffer* buffer_{nullptr};
     StoreV1* backend_{nullptr};
     int32_t deviceId_{-1};
     std::vector<size_t> tensorSizes_{};
-    size_t timeoutMs_{30000};
+    size_t nShardPerBlock_{0};
     size_t streamNumber_{1};
     bool useGdr_{false};
     bool cacheIOAggregation_{false};
     bool cacheSdmaDirect_{false};
     std::vector<ssize_t> cpuAffinityCores_{};
     size_t localRankSize_{};
-    size_t nShardPerBlock_{};
     SpscRingQueue<TaskPair> waiting_;
     SpscRingQueue<ShardTask> running_;
     std::thread dispatcher_;

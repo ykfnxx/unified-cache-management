@@ -26,9 +26,14 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 #include "ucmstore_v1.h"
+
+#ifndef UCM_RUNTIME_ASCEND_IO_AGGREGATION
+#define UCM_RUNTIME_ASCEND_IO_AGGREGATION 0
+#endif
 
 #ifndef UCM_RUNTIME_ASCEND_SDMA_DIRECT
 #define UCM_RUNTIME_ASCEND_SDMA_DIRECT 0
@@ -43,32 +48,24 @@ struct Config {
     std::vector<size_t> tensorSizes{};
     size_t shardSize{0};
     size_t blockSize{0};
+    bool ioDirect{true};
     std::vector<ssize_t> cpuAffinityCores{};
-    size_t bufferCapacity{0};
-    bool shareBufferEnable{false};
+    size_t bufferCapacity{256ULL << 30};
+    size_t loadExclusiveBufferNumber{1024};
+    bool shareBufferEnable{true};
     size_t waitingQueueDepth{8192};
     size_t runningQueueDepth{524288};
     size_t timeoutMs{30000};
     size_t streamNumber{4};
+    bool cacheLoadBackendOnly{false};
+    int64_t retentionNs{-1};
     std::vector<uintptr_t> gpuKvBufferAddrs{};
     std::vector<size_t> gpuKvBufferSizes{};
     bool useGdr{false};
     bool cacheIOAggregation{false};
     bool cacheSdmaDirect{UCM_RUNTIME_ASCEND_SDMA_DIRECT};
     size_t localRankSize{8};
-    size_t tpRank{0}, tpSize{1};
-    double alpha{0.01};
-    int64_t retention{-1};
-    size_t evictionLimit{64};
 
-    Detail::BlockId BackendKey(Detail::BlockId key) const
-    {
-        if (!shareBufferEnable)
-            for (size_t i = 0; i < sizeof(uint64_t); ++i) {
-                key[8 + i] ^= std::byte((uint64_t(tpRank) >> (8 * i)) & 255);
-            }
-        return key;
-    }
     size_t EffectiveStreamNumber() const noexcept { return cacheSdmaDirect ? 1 : streamNumber; }
 };
 

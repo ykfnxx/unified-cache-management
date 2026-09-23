@@ -42,7 +42,6 @@ class DumpQueue {
     using WaiterPtr = std::shared_ptr<Latch>;
     using TaskPair = std::pair<TaskPtr, WaiterPtr>;
     using TaskIdSet = HashSet<Detail::TaskHandle>;
-
 private:
     alignas(64) std::atomic_bool stop_{false};
     TaskIdSet* failureSet_{nullptr};

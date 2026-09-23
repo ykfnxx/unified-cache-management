@@ -4,7 +4,6 @@ import ast
 import copy
 import dataclasses
 import importlib.util
-import multiprocessing
 import os
 import sys
 import time
@@ -55,46 +54,6 @@ def ids(*numbers):
     )
 
 
-def test_native_pipeline_on_evict_and_watcher():
-    module, library = native()
-    config = {
-        "unique_id": "python_" + uuid.uuid4().hex,
-        "device_id": 0,
-        "block_size": 64,
-        "shard_size": 64,
-        "tensor_size": 64,
-        "context_memory_capacity_bytes": 64,
-        "context_max_eviction_blocks": 1,
-        "cache_stream_number": 2,
-    }
-    watcher = module.PipelineStore()
-    watcher.Stack("Context", str(library), {"unique_id": config["unique_id"]})
-    assert watcher.Lookup(ids(1)) == b"\0"
-    worker = module.PipelineStore()
-    worker.Stack("Context", str(library), config)
-    index = np.array([0], dtype=np.uint64)
-    source = np.arange(64, dtype=np.uint8)
-    address = np.array([[source.ctypes.data]], dtype=np.uint64)
-    for n in (1, 2):
-        worker.ObserveRequest(str(n), n, n, ids(n))
-        task = worker.Dump(ids(n), index, address, 0)
-        worker.Wait(task)
-        assert watcher.Lookup(ids(n)) == b"\1"
-        assert worker.ContextStats().get("backend_dump_blocks", 0) == n - 1
-    target = np.zeros_like(source)
-    task = worker.Load(ids(1), index, np.array([[target.ctypes.data]], dtype=np.uint64))
-    worker.Wait(task)
-    # Fake.Load is a no-op: the reused slot still contains the second block.
-    np.testing.assert_array_equal(source, target)
-    assert worker.ContextStats()["backend_load_blocks"] == 1
-    assert worker.ContextStats()["memory_blocks"] == 1
-    # Retiring a context does not remove its stored payload.
-    worker.ObserveRequest("1", 0, 0, ids())
-    assert watcher.LookupOnPrefix(ids(1, 2, 3)) == 1
-    del worker
-    assert watcher.Lookup(ids(1, 2)) == b"\1\1"
-
-
 def connector_functions():
     # Execute the actual connector methods with engine objects replaced by small
     # fixtures. No vLLM installation or accelerator is needed for metadata tests.
@@ -116,7 +75,6 @@ def connector_functions():
                 and n.name
                 in {
                     "_generate_dispatch_meta",
-                    "_observe_context_requests",
                     "_store_block_ids",
                     "_consistency_manager_enabled",
                     "_create_store",
@@ -150,387 +108,6 @@ def connector_functions():
     code = ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[]))
     exec(compile(code, "connector_context_methods", "exec"), namespace)  # noqa: S102
     return namespace
-
-
-def test_connector_transmits_full_prefix_even_for_suffix_io():
-    ns = connector_functions()
-    connector = ns["Connector"]()
-    connector._context_store_enabled = True
-    connector.cp_world_size = 1
-    connector.block_size = 16
-    connector.is_mla = False
-    blocks = [bytes([n]) * 16 for n in range(4)]
-    request = ns["RequestMeta"](
-        ucm_block_ids=blocks,
-        hbm_hit_block_num=1,
-        total_hit_block_num=2,
-        num_token_ids=64,
-        token_processed=32,
-    )
-    meta = connector._generate_dispatch_meta(request, 32, [10, 11, 12, 13])
-    assert meta.load_block_ids[0] == blocks[1:2]
-    assert meta.dump_block_ids[0] == blocks[2:]
-    assert meta.context_block_ids == blocks
-    calls = []
-    connector.connector_configs = [
-        {"ucm_connector_config": {"store_pipeline": "ContextStore|Fake"}}
-    ]
-    connector.store = SimpleNamespace(observe_request=lambda *args: calls.append(args))
-    connector._observe_context_requests(SimpleNamespace(request_meta={"req": meta}))
-    assert len(calls) == 1
-    assert calls[0][0] == "req"
-    assert calls[0][1] == meta.context_observation
-    assert calls[0][3] == blocks
-    connector._context_store_enabled = False
-    connector._observe_context_requests(SimpleNamespace(request_meta={"req": meta}))
-    assert len(calls) == 1
-
-
-def test_decode_does_not_rebroadcast_or_retire_context():
-    ns = connector_functions()
-    connector = ns["Connector"]()
-    connector._context_store_enabled = True
-    connector.cp_world_size = 1
-    connector.block_size = 16
-    connector.is_mla = False
-    blocks = [bytes([n]) * 16 for n in range(4)]
-    request = ns["RequestMeta"](
-        ucm_block_ids=blocks, num_token_ids=64, token_processed=64
-    )
-    calls = []
-    connector.store = SimpleNamespace(observe_request=lambda *args: calls.append(args))
-    # A new all-HBM-hit request still supplies topology despite having no I/O.
-    first = connector._generate_dispatch_meta(request, 1, [10, 11, 12, 13])
-    connector._observe_context_requests(SimpleNamespace(request_meta={"req": first}))
-    assert first.context_block_ids == blocks
-    assert len(calls) == 1
-    for _ in range(5):
-        step = connector._generate_dispatch_meta(request, 1, [], need_load=False)
-        assert step.context_block_ids == []
-        assert step.context_observation == 0
-        connector._observe_context_requests(SimpleNamespace(request_meta={"req": step}))
-    # An empty dispatch must not become ObserveRequest(..., []), which retires it.
-    assert len(calls) == 1
-    resumed = connector._generate_dispatch_meta(request, 1, [20, 21, 22, 23])
-    connector._observe_context_requests(SimpleNamespace(request_meta={"req": resumed}))
-    assert len(calls) == 2
-    assert resumed.context_observation > first.context_observation
-
-
-def test_chunked_prefill_still_refreshes_context_when_saving():
-    ns = connector_functions()
-    connector = ns["Connector"]()
-    connector._context_store_enabled = True
-    connector.cp_world_size = 1
-    connector.block_size = 16
-    blocks = [bytes([n]) * 16 for n in range(4)]
-    request = ns["RequestMeta"](
-        ucm_block_ids=blocks,
-        num_token_ids=64,
-        token_processed=32,
-        vllm_block_ids=[10, 11],
-    )
-    step = connector._generate_dispatch_meta(request, 32, [12, 13], need_load=False)
-    assert step.dump_block_ids == (blocks[2:], [12, 13])
-    assert step.context_block_ids == blocks
-    assert step.context_observation > 0
-
-
-def rank_process(connection, config):
-    module, library = native()
-    worker = module.PipelineStore()
-    worker.Stack("Context", str(library), config)
-    connection.send("ready")
-    try:
-        while True:
-            command, key, shard = connection.recv()
-            if command == "close":
-                break
-            if command == "dump":
-                worker.ObserveRequest(str(key), key, key * 100, ids(key))
-                data = np.full(64, 30 * config["context_tp_rank"] + key, dtype=np.uint8)
-                task = worker.Dump(
-                    ids(key),
-                    np.array([shard], dtype=np.uint64),
-                    np.array([[data.ctypes.data]], dtype=np.uint64),
-                    0,
-                )
-                worker.Wait(task)
-                connection.send(worker.ContextStats())
-            elif command == "load":
-                data = np.zeros(64, dtype=np.uint8)
-                task = worker.Load(
-                    ids(key),
-                    np.array([shard], dtype=np.uint64),
-                    np.array([[data.ctypes.data]], dtype=np.uint64),
-                )
-                worker.Wait(task)
-                connection.send(data.tobytes())
-    finally:
-        del worker
-        connection.close()
-
-
-def test_tp_processes_intersect_readiness_and_independent_evictions():
-    module, library = native()
-    name = "tp_" + uuid.uuid4().hex
-    watcher = module.PipelineStore()
-    watcher.Stack("Context", str(library), {"unique_id": name, "context_tp_size": 2})
-    assert watcher.Lookup(ids(1, 2)) == b"\0\0"
-    ctx = multiprocessing.get_context("spawn")
-    processes, connections = [], []
-
-    def call(rank, command, key=1, shard=0):
-        pipe = connections[rank]
-        pipe.send((command, key, shard))
-        assert pipe.poll(30), "TP worker did not complete"
-        return pipe.recv()
-
-    try:
-        for rank in range(2):
-            parent, child = ctx.Pipe()
-            process = ctx.Process(
-                target=rank_process,
-                args=(
-                    child,
-                    {
-                        "unique_id": name,
-                        "context_tp_size": 2,
-                        "context_tp_rank": rank,
-                        "device_id": rank,
-                        "block_size": 128,
-                        "shard_size": 64,
-                        "tensor_size": 64,
-                        "context_memory_capacity_bytes": 128,
-                        "context_max_eviction_blocks": 1,
-                        "context_retention_ns": -1 if rank == 0 else 0,
-                    },
-                ),
-            )
-            process.start()
-            child.close()
-            processes.append(process)
-            connections.append(parent)
-            assert parent.poll(30)
-            assert parent.recv() == "ready"
-        call(0, "dump", 1, 0)
-        call(0, "dump", 1, 1)
-        assert watcher.Lookup(ids(1)) == b"\0"
-        call(1, "dump", 1, 0)
-        assert watcher.Lookup(ids(1)) == b"\0"  # rank 1 is only partially ready
-        call(1, "dump", 1, 1)
-        assert watcher.Lookup(ids(1)) == b"\1"
-        call(0, "dump", 2, 0)
-        stats = call(0, "dump", 2, 1)
-        assert stats["backend_dump_blocks"] == 1
-        assert watcher.LookupOnPrefix(ids(1, 2)) == 0
-        # Rank 0 readmits via Fake (old slot bytes); rank 1 reads actual resident KV.
-        assert call(0, "load") == bytes([2]) * 64
-        assert call(1, "load") == bytes([31]) * 64
-        call(1, "dump", 2, 0)
-        stats = call(1, "dump", 2, 1)
-        assert stats.get("backend_dump_blocks", 0) == 0
-        assert watcher.Lookup(ids(1, 2)) == b"\0\1"
-        assert watcher.LookupOnPrefix(ids(1, 2)) == -1
-        assert watcher.LookupOnReverse(ids(1, 2)) == 1
-        connections[1].send(("close", 0, 0))
-        processes[1].join(30)
-        assert processes[1].exitcode == 0
-        assert watcher.Lookup(ids(2)) == b"\0"
-    finally:
-        for process, pipe in zip(processes, connections):
-            if process.is_alive():
-                pipe.send(("close", 0, 0))
-                process.join(5)
-            if process.is_alive():
-                process.terminate()
-                process.join()
-            pipe.close()
-
-
-@pytest.mark.parametrize("rank", [0, 1, 3])
-@pytest.mark.parametrize("is_mla", [False, True])
-def test_context_keys_match_io_on_every_rank(rank, is_mla):
-    connector = connector_functions()["Connector"]()
-    connector._context_store_enabled = True
-    connector.tp_rank = rank
-    connector.tp_size = 4
-    connector.is_mla = is_mla
-    connector.request_hasher = lambda key: bytes(x ^ 255 for x in key)
-    blocks = [bytes([1]) * 16, bytes([2]) * 16]
-    calls = []
-    connector.store = SimpleNamespace(observe_request=lambda *args: calls.append(args))
-    connector._observe_context_requests(
-        SimpleNamespace(
-            request_meta={
-                "request": SimpleNamespace(
-                    context_observation=1, context_block_ids=blocks
-                )
-            }
-        )
-    )
-    assert connector._store_block_ids(blocks) == blocks
-    if is_mla and rank != 0:
-        assert calls == []
-    else:
-        assert calls[0][3] == blocks
-    # Existing stores retain their nonzero-rank hashing rule.
-    connector._context_store_enabled = False
-    expected = (
-        blocks if rank == 0 or is_mla else [connector.request_hasher(k) for k in blocks]
-    )
-    assert connector._store_block_ids(blocks) == expected
-
-
-@pytest.mark.parametrize("role", ["scheduler", "worker"])
-def test_connector_supplies_tp_config_and_rejects_unsupported_modes(role):
-    connector = connector_functions()["Connector"]()
-    connector.connector_configs = [
-        {
-            "ucm_connector_name": "UcmPipelineStore",
-            "ucm_connector_config": {"store_pipeline": "ContextStore|Fake"},
-        }
-    ]
-    parallel = SimpleNamespace(pipeline_parallel_size=1)
-    connector._vllm_config = SimpleNamespace(parallel_config=parallel)
-    connector.tp_size, connector.tp_rank = 4, 3
-    connector.cp_world_size = 1
-    connector.is_mla = False
-    connector._context_store_enabled = True
-    connector._role = role
-    connector.unique_id = "experiment"
-    connector._dp_rank = 2
-    connector._gc_owner = False
-    connector.device_id = 3
-    connector.blocks_per_chunk = 1
-    connector._set_default_shm_buffer_capacity = lambda config: None
-    connector._publish_block_size = lambda size: None
-    layout = SimpleNamespace(
-        tensor_size_list=[64],
-        shard_size=64,
-        block_size=128,
-        base_ptrs=np.array([4096]),
-        buffer_sizes=np.array([128]),
-    )
-    config = connector._create_store(layout if role == "worker" else None)
-    assert config["unique_id"] == "experiment_dp2"
-    assert config["context_tp_size"] == 4
-    assert config["context_tp_rank"] == (3 if role == "worker" else 0)
-    assert config["share_buffer_enable"] is False
-    connector.is_mla = True
-    mla_config = connector._create_store(layout)
-    assert mla_config["share_buffer_enable"] is True
-    if role == "worker":
-        assert mla_config["local_rank_size"] == 4
-    connector.is_mla = False
-    parallel.pipeline_parallel_size = 2
-    with pytest.raises(ValueError, match="PP=CP=1"):
-        connector._create_store(layout)
-    parallel.pipeline_parallel_size = 1
-    for field in ("prefill_context_parallel_size", "decode_context_parallel_size"):
-        setattr(parallel, field, 2)
-        with pytest.raises(ValueError, match="PP=CP=1"):
-            connector._create_store(layout)
-        setattr(parallel, field, 1)
-
-
-@pytest.mark.parametrize("layerwise", [False, True])
-@pytest.mark.parametrize("cp_size", [1, 2])
-@pytest.mark.parametrize("is_mla", [False, True])
-def test_scheduler_constructor_context_store_initialization(layerwise, cp_size, is_mla):
-    # Run the real constructors until the native-store factory boundary. Engine
-    # dependencies are fixtures; do not prepopulate cp_world_size on the object.
-    ns = connector_functions()
-    config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            rank=0,
-            tensor_parallel_size=2,
-            pipeline_parallel_size=1,
-            prefill_context_parallel_size=cp_size,
-            decode_context_parallel_size=1,
-        ),
-        cache_config=SimpleNamespace(block_size=16),
-        model_config=SimpleNamespace(
-            is_deepseek_mla=is_mla,
-            get_num_layers=lambda _: 2,
-            get_num_kv_heads=lambda _: 2,
-            get_head_size=lambda: 8,
-            dtype=SimpleNamespace(itemsize=2),
-            hf_config=SimpleNamespace(),
-        ),
-        kv_transfer_config=SimpleNamespace(engine_id="constructor_test"),
-    )
-    launch = {
-        "ucm_connectors": [
-            {
-                "ucm_connector_name": "UcmPipelineStore",
-                "ucm_connector_config": {"store_pipeline": "ContextStore|Fake"},
-            }
-        ]
-    }
-
-    class FactoryReached(Exception):
-        pass
-
-    class Base(ns["Connector"]):
-        def __init__(self, vllm_config, role, kv_cache_config):
-            self._vllm_config, self._role = vllm_config, role
-            self._dp_rank, self._gc_owner = 0, False
-
-        def _set_default_shm_buffer_capacity(self, config):
-            pass
-
-        def _make_other_rank_hashers(self, config):
-            return []
-
-        def _create_store(self, layout):
-            assert self.cp_world_size == 1
-            return super()._create_store(layout)
-
-    def factory(name, store_config, path):
-        assert store_config["context_tp_size"] == 2
-        raise FactoryReached()
-
-    ns.update(
-        {
-            "Base": Base,
-            "torch": SimpleNamespace(),
-            "current_platform": SimpleNamespace(is_cuda_alike=lambda: True),
-            "Config": lambda _: SimpleNamespace(get_config=lambda: launch),
-            "RequestHasher": lambda *args: SimpleNamespace(seed=b"seed"),
-            "UcmConnectorFactoryV1": SimpleNamespace(create_connector=factory),
-        }
-    )
-    tree = ast.parse(
-        (ROOT / "ucm/integration/vllm/ucm_connector.py").read_text(encoding="utf-8-sig")
-    )
-    classes = []
-    for name, base in [
-        ("UCMDirectConnector", "Base"),
-        ("UCMLayerWiseConnector", "UCMDirectConnector"),
-    ]:
-        source = next(
-            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name
-        )
-        constructor = next(
-            n
-            for n in source.body
-            if isinstance(n, ast.FunctionDef) and n.name == "__init__"
-        )
-        classes.append(
-            ast.ClassDef(
-                name=name,
-                bases=[ast.Name(id=base, ctx=ast.Load())],
-                keywords=[],
-                body=[constructor],
-                decorator_list=[],
-            )
-        )
-    code = ast.fix_missing_locations(ast.Module(body=classes, type_ignores=[]))
-    exec(compile(code, "connector_constructors", "exec"), ns)  # noqa: S102
-    cls = ns["UCMLayerWiseConnector" if layerwise else "UCMDirectConnector"]
-    with pytest.raises(FactoryReached if cp_size == 1 else ValueError):
-        cls(config, "scheduler", None)
 
 
 def mla_connector_methods():
@@ -581,12 +158,11 @@ def mla_connector_methods():
 
 
 @pytest.mark.parametrize("layerwise", [False, True])
-@pytest.mark.parametrize("context", [False, True])
 @pytest.mark.parametrize("rank", [0, 1])
-def test_mla_only_rank_zero_saves(layerwise, context, rank):
+def test_mla_only_rank_zero_saves(layerwise, rank):
     ns = mla_connector_methods()
     connector = ns["Connector"]()
-    connector.is_mla, connector._context_store_enabled = True, context
+    connector.is_mla = True
     connector.tp_rank, connector.tp_size = rank, 2
     block = bytes([1]) * 16
     metadata = SimpleNamespace(
@@ -650,92 +226,6 @@ def test_mla_mtp_last_layer_revisit_does_not_wait_twice():
     ns["wait_for_layer_load"](connector, "mtp")
     ns["wait_for_layer_load"](connector, "mtp")
     assert waits == ["task"]
-
-
-def test_dsa_shared_three_components_and_mtp_shard_native_readback():
-    module, library = native()
-    name = "dsa_" + uuid.uuid4().hex
-    sizes = [32, 16, 8]
-    config = {
-        "unique_id": name,
-        "share_buffer_enable": True,
-        "context_tp_size": 2,
-        "block_size": 168,
-        "shard_size": 56,
-        "tensor_size_list": sizes,
-        "context_memory_capacity_bytes": 168,
-        "context_max_eviction_blocks": 1,
-    }
-    watcher = module.PipelineStore()
-    watcher.Stack(
-        "Context", str(library), {"unique_id": name, "share_buffer_enable": True}
-    )
-    # A reader registers the shared payload before its owner even starts.
-    reader = module.PipelineStore()
-    reader.Stack("Context", str(library), dict(config, device_id=1, context_tp_rank=1))
-    owner = module.PipelineStore()
-    owner.Stack("Context", str(library), dict(config, device_id=0, context_tp_rank=0))
-    owner.ObserveRequest("r", 1, 1, ids(1))
-    reader.ObserveRequest("r", 1, 1, ids(1))
-    for layer in range(3):
-        tensors = [
-            np.full(size, layer * 3 + i, dtype=np.uint8) for i, size in enumerate(sizes)
-        ]
-        task = owner.Dump(
-            ids(1),
-            np.array([layer], dtype=np.uint64),
-            np.array([[a.ctypes.data for a in tensors]], dtype=np.uint64),
-            0,
-        )
-        owner.Wait(task)
-        assert watcher.Lookup(ids(1)) == (b"\1" if layer == 2 else b"\0")
-    with pytest.raises(RuntimeError, match="-50008"):
-        reader.Dump(
-            ids(1),
-            np.array([0], dtype=np.uint64),
-            np.array([[a.ctypes.data for a in tensors]], dtype=np.uint64),
-            0,
-        )
-    # Read shared Memory, then verify shared Fake readmission.
-    for evict in (False, True):
-        if evict:
-            owner.ObserveRequest("new", 2, 2, ids(2))
-            task = owner.Dump(
-                ids(2),
-                np.array([0], dtype=np.uint64),
-                np.array([[a.ctypes.data for a in tensors]], dtype=np.uint64),
-                0,
-            )
-            owner.Wait(task)
-            for layer in (1, 2):
-                task = owner.Dump(
-                    ids(2),
-                    np.array([layer], dtype=np.uint64),
-                    np.array([[a.ctypes.data for a in tensors]], dtype=np.uint64),
-                    0,
-                )
-                owner.Wait(task)
-            assert owner.ContextStats()["backend_dump_bytes"] == 168
-        for layer in range(3):
-            loads = []
-            for worker in (owner, reader):
-                tensors = [np.zeros(size, dtype=np.uint8) for size in sizes]
-                task = worker.Load(
-                    ids(1),
-                    np.array([layer], dtype=np.uint64),
-                    np.array([[a.ctypes.data for a in tensors]], dtype=np.uint64),
-                )
-                loads.append((worker, task, tensors))
-            for worker, task, tensors in loads:
-                worker.Wait(task)
-                if not evict:
-                    for i, tensor in enumerate(tensors):
-                        assert np.all(tensor == layer * 3 + i)
-    assert reader.ContextStats().get("d2h_bytes", 0) == 0
-    assert reader.ContextStats().get("backend_dump_bytes", 0) == 0
-    assert watcher.Lookup(ids(1, 2)) == b"\1\1"
-    del reader
-    assert watcher.Lookup(ids(1)) == b"\1"
 
 
 @pytest.mark.parametrize("layerwise", [False, True])
@@ -816,219 +306,61 @@ def test_dsa_layout_preserves_three_components_and_mtp_layer(layerwise):
     assert addresses.reshape(-1).tolist() == expected
 
 
-def shared_mla_reader_process(pipe, config):
-    module, library = native()
-    reader = module.PipelineStore()
-    reader.Stack("Context", str(library), config)
-    pipe.send("ready")
-    while True:
-        command = pipe.recv()
-        if command == "close":
-            break
-        data = np.zeros(64, dtype=np.uint8)
-        try:
-            task = reader.Load(
-                ids(1),
-                np.array([0], dtype=np.uint64),
-                np.array([[data.ctypes.data]], dtype=np.uint64),
-            )
-            reader.Wait(task)
-            pipe.send((data.tobytes(), reader.ContextStats()))
-        except RuntimeError:
-            pipe.send("missing")
-    del reader
-    pipe.close()
-
-
-def test_mla_shared_payload_across_processes_and_owner_exit():
+def test_native_context_fake_shared_layerwise():
     module, library = native()
     config = {
-        "unique_id": "shared_" + uuid.uuid4().hex,
+        "unique_id": "clock_" + uuid.uuid4().hex,
         "share_buffer_enable": True,
-        "context_tp_size": 2,
-        "block_size": 64,
-        "shard_size": 64,
-        "tensor_size": 64,
-        "context_memory_capacity_bytes": 64,
-        "context_max_eviction_blocks": 1,
-        "timeout_ms": 1000,
-    }
-    ctx = multiprocessing.get_context("spawn")
-    parent, child = ctx.Pipe()
-    process = ctx.Process(
-        target=shared_mla_reader_process,
-        args=(child, dict(config, device_id=1, context_tp_rank=1)),
-    )
-    process.start()
-    child.close()
-    try:
-        assert parent.poll(30) and parent.recv() == "ready"
-        owner = module.PipelineStore()
-        owner.Stack(
-            "Context", str(library), dict(config, device_id=0, context_tp_rank=0)
-        )
-        source = np.arange(64, dtype=np.uint8)
-        for key in (1, 2):
-            owner.ObserveRequest(str(key), key, key, ids(key))
-            task = owner.Dump(
-                ids(key),
-                np.array([0], dtype=np.uint64),
-                np.array([[source.ctypes.data]], dtype=np.uint64),
-                0,
-            )
-            owner.Wait(task)
-            parent.send("load")
-            # Each rank submits and completes its read independently.
-            target = np.zeros_like(source)
-            task = owner.Load(
-                ids(1),
-                np.array([0], dtype=np.uint64),
-                np.array([[target.ctypes.data]], dtype=np.uint64),
-            )
-            owner.Wait(task)
-            assert parent.poll(30)
-            data, stats = parent.recv()
-            assert data == source.tobytes()
-            assert stats.get("d2h_bytes", 0) == 0
-        assert owner.ContextStats()["backend_dump_bytes"] == 128
-        del owner
-        parent.send("load")
-        assert parent.poll(30) and parent.recv() == "missing"
-    finally:
-        if process.is_alive():
-            parent.send("close")
-            process.join(10)
-        if process.is_alive():
-            process.terminate()
-            process.join()
-        parent.close()
-    assert process.exitcode == 0
-
-
-def test_registered_context_fake_builder_and_readmission():
-    import copy
-
-    wrapped, library = native()
-    pipeline = wrapped.PipelineStore().store
-    tree = ast.parse((ROOT / "ucm/store/pipeline/connector.py").read_text())
-    functions = [
-        n
-        for n in tree.body
-        if isinstance(n, ast.FunctionDef)
-        and n.name in {"_context_pipeline_builder", "_fake_pipeline_builder"}
-    ]
-    ns = {
-        "copy": copy,
-        "Path": Path,
-        "Dict": dict,
-        "ucmpipelinestore": SimpleNamespace(PipelineStore=type(pipeline)),
-        "__file__": str(library.parent.parent / "pipeline/connector.py"),
-    }
-    exec(compile(ast.Module(body=functions, type_ignores=[]), "builder", "exec"), ns)  # noqa: S102
-    config = {
-        "unique_id": "builder_" + uuid.uuid4().hex,
         "device_id": 0,
-        "block_size": 64,
-        "shard_size": 64,
-        "tensor_size": 64,
-        "context_memory_capacity_bytes": 64,
-        "buffer_number": 4096,
-        "context_retention_ns": None,
-        "store_pipeline": "ContextStore|Fake",
+        "cache_buffer_capacity_gb": 1,
+        "cache_load_exclusive_buffer_number": 0,
+        "shard_size": 1 << 20,
+        "block_size": 3 << 20,
+        "tensor_size_list": [32, 16, 8],
+        "waiting_queue_depth": 64,
+        "running_queue_depth": 128,
     }
-    ns["_context_pipeline_builder"](config, pipeline)
-    assert config["context_retention_ns"] is None
-    index = np.array([0], dtype=np.uint64)
-    for key in (1, 2):
-        data = np.full(64, key, dtype=np.uint8)
-        pipeline.ObserveRequest(str(key), key, key, ids(key))
-        task = pipeline.Dump(
-            ids(key), index, np.array([[data.ctypes.data]], dtype=np.uint64), 0
-        )
-        pipeline.Wait(task)
-    assert pipeline.ContextStats()["backend_dump_blocks"] == 1
-    assert pipeline.ContextStats()["d2h_bytes"] == 128
-    for attempt in range(2):
-        out = np.zeros(64, dtype=np.uint8)
-        task = pipeline.Load(
-            ids(1), index, np.array([[out.ctypes.data]], dtype=np.uint64)
-        )
-        pipeline.Wait(task)
-        # Fake did not recover block 1. H2D really copied block 2's residual bytes.
-        assert np.all(out == 2)
-        stats = pipeline.ContextStats()
-        assert stats["backend_load_blocks"] == 1
-        assert stats["memory_blocks"] == 1
-        assert stats["d2h_bytes"] == 128
-        assert stats["h2d_bytes"] == 64 * (attempt + 1)
-        assert not any("ssd" in key for key in stats)
+    owner = module.PipelineStore()
+    owner.Stack("Context", str(library), config)
+    reader = module.PipelineStore()
+    reader.Stack("Context", str(library), dict(config, device_id=1))
+    watcher = module.PipelineStore()
+    watcher.Stack("Context", str(library), dict(config, device_id=-1))
+    for layer in range(3):
+        source = [
+            np.full(n, layer * 3 + i, dtype=np.uint8)
+            for i, n in enumerate(config["tensor_size_list"])
+        ]
+        layer_ids = np.array([layer], dtype=np.uint64)
+        ptrs = np.array([[a.ctypes.data for a in source]], dtype=np.uint64)
+        owner.Wait(owner.Dump(ids(1), layer_ids, ptrs, 0))
+        target = [np.zeros_like(a) for a in source]
+        ptrs = np.array([[a.ctypes.data for a in target]], dtype=np.uint64)
+        reader.Wait(reader.Load(ids(1), layer_ids, ptrs))
+        for before, after in zip(source, target):
+            np.testing.assert_array_equal(before, after)
+    assert watcher.Lookup(ids(1)) == b"\1"
 
 
-@pytest.mark.parametrize("partial", [False, True])
-def test_mla_late_reader_refills_independently_and_capacity_failure(partial):
-    import time
+def test_default_metrics_match_yaml_and_include_shard_counters():
+    import runpy
 
-    module, library = native()
-    config = {
-        "unique_id": "late_" + uuid.uuid4().hex,
-        "share_buffer_enable": True,
-        "context_tp_size": 2,
-        "block_size": 128,
-        "shard_size": 64,
-        "tensor_size": 64,
-        "context_memory_capacity_bytes": 128,
-        "timeout_ms": 3000,
-        "waiting_queue_depth": 2,
-    }
-    owner, reader = module.PipelineStore(), module.PipelineStore()
-    owner.Stack("Context", str(library), dict(config, device_id=0, context_tp_rank=0))
-    reader.Stack("Context", str(library), dict(config, device_id=1, context_tp_rank=1))
-    source = np.full(64, 7, dtype=np.uint8)
-    address = np.array([[source.ctypes.data]], dtype=np.uint64)
-    index = np.array([0], dtype=np.uint64)
-    for key in (1, 2):
-        owner.ObserveRequest(str(key), key, key, ids(key))
-        for layer in range(1 if partial and key == 2 else 2):
-            owner.Wait(
-                owner.Dump(ids(key), np.array([layer], dtype=np.uint64), address, 0)
-            )
-    if partial:
-        # One partial block uses only one of the two shard slots. Fill the other
-        # with another incomplete device block before testing true exhaustion.
-        owner.ObserveRequest("3", 3, 3, ids(3))
-        owner.Wait(owner.Dump(ids(3), index, address, 0))
-    out_owner, out_reader = np.zeros_like(source), np.zeros_like(source)
-    owner_task = owner.Load(
-        ids(1), index, np.array([[out_owner.ctypes.data]], dtype=np.uint64)
+    import yaml
+
+    generated = runpy.run_path(str(ROOT / "ucm/default_metrics_config.py"))[
+        "DEFAULT_METRICS_CONFIG"
+    ]
+    source = yaml.safe_load(
+        (ROOT / "examples/metrics/metrics_configs.yaml").read_text()
     )
-    if partial:
-        with pytest.raises(RuntimeError, match="-50009"):
-            owner.Wait(owner_task)
-        # The reader independently encounters the same capacity shortage.
-        start = time.monotonic()
-        reader_task = reader.Load(
-            ids(1), index, np.array([[out_reader.ctypes.data]], dtype=np.uint64)
-        )
-        with pytest.raises(RuntimeError, match="-50009"):
-            reader.Wait(reader_task)
-        assert time.monotonic() - start < 1.5
-    else:
-        deadline = time.monotonic() + 2
-        while not owner.ContextStats().get("backend_load_blocks", 0):
-            assert time.monotonic() < deadline
-            time.sleep(0.001)
-        owner.Wait(owner_task)
-        owner.ObserveRequest("3", 3, 3, ids(3))
-        # Completed local H2D releases its handles; no cross-rank batch pins remain.
-        for layer in range(2):
-            owner.Wait(
-                owner.Dump(ids(3), np.array([layer], dtype=np.uint64), address, 0)
-            )
-        # A late reader can refill from Fake itself, without another owner Load.
-        reader_task = reader.Load(
-            ids(1), index, np.array([[out_reader.ctypes.data]], dtype=np.uint64)
-        )
-        reader.Wait(reader_task)
-        np.testing.assert_array_equal(out_owner, out_reader)
-        assert reader.ContextStats()["backend_load_shards"] == 1
-        assert owner.ContextStats()["memory_blocks"] == 1
+    for kind in ("counter", "histogram", "gauge"):
+        left = {m["name"]: m for m in generated[kind]}
+        right = {m["name"]: m for m in source[kind]}
+        assert left == right
+    counters = {m["name"] for m in generated["counter"]}
+    assert {
+        "context_evict_shards_total",
+        "context_writeback_shards_total",
+        "context_drop_shards_total",
+    } <= counters
+    assert "context_evict_blocks_total" not in counters

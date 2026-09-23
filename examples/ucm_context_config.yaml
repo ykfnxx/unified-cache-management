@@ -1,5 +1,4 @@
-# ContextStore: GQA uses per-rank pools; MLA uses one shared pool owned by rank 0.
-# Single-host GQA/MLA TP, PP=CP=1, direct or layerwise attention.
+# Cache-style shard management with on-evict write.
 use_layerwise: true
 use_lite: false
 enable_event_sync: true
@@ -7,17 +6,14 @@ ucm_connectors:
   - ucm_connector_name: UcmPipelineStore
     ucm_connector_config:
       store_pipeline: ContextStore|Fake
-      # GiB: GQA per rank; MLA per TP group (one shared copy).
-      # context_tp_size/context_tp_rank are supplied by the connector.
-      context_memory_capacity_gb: 8
-      # Fake metadata slots, shared by this DP group; GQA counts each TP rank.
+      cache_buffer_capacity_gb: 64
       buffer_number: 1048576
-      context_alpha: 0.01
-      # null/-1: always write back on eviction; otherwise idle > retention drops.
+      # null/-1: always Dump. Otherwise idle > retention means Drop.
       context_retention_ns: 60000000000
-      context_max_eviction_blocks: 64
       cache_stream_number: 4
+      cache_load_exclusive_buffer_number: 1024
       waiting_queue_depth: 8192
+      running_queue_depth: 524288
       timeout_ms: 30000
       use_gdr: false
       cache_sdma_direct: false

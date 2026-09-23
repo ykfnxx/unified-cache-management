@@ -356,8 +356,6 @@ class RequestDispatchMeta:
     # Keep this keyword-only so adding the optional async flag does not change
     # positional constructor semantics for connector-specific subclasses.
     load_async: bool = field(default=False, kw_only=True)
-    context_block_ids: list[bytes] = field(default_factory=list, kw_only=True)
-    context_observation: int = field(default=0, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -1371,8 +1369,6 @@ class UCMDirectConnector(KVConnectorBase_V1):
     cross-rank consistency metadata.
     """
 
-    _context_store_enabled = False
-
     @staticmethod
     def _consistency_manager_enabled(launch_config: dict, is_mla: bool) -> bool:
         return launch_config.get("use_consistency_manager", not is_mla)
@@ -1446,16 +1442,12 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self.launch_config = ucm_config.get_config()
         self.connector_configs = self.launch_config.get("ucm_connectors", [])
         assert len(self.connector_configs) > 0, "no storage connector name in config."
-        self._context_store_enabled = (
-            self.connector_configs[0].get("ucm_connector_config", {}).get("store_pipeline")
-            == "ContextStore|Fake"
-        )
         share_buffer_enable = (
             self.connector_configs[0]
             .get("ucm_connector_config", {})
             .get("share_buffer_enable", self.is_mla)
         )
-        if share_buffer_enable and not self._context_store_enabled:
+        if share_buffer_enable:
             if role == KVConnectorRole.WORKER:
                 self.unique_id = _worker_generate_unique_id()
             else:
@@ -1609,28 +1601,12 @@ class UCMDirectConnector(KVConnectorBase_V1):
         name = self.connector_configs[0]["ucm_connector_name"]
         module_path = self.connector_configs[0].get("ucm_connector_module_path", None)
         config = copy.deepcopy(self.connector_configs[0]["ucm_connector_config"])
-        if config.get("store_pipeline") == "ContextStore|Fake":
-            parallel = self._vllm_config.parallel_config
-            if (
-                parallel.pipeline_parallel_size != 1
-                or getattr(parallel, "prefill_context_parallel_size", 1) != 1
-                or getattr(parallel, "decode_context_parallel_size", 1) != 1
-            ):
-                raise ValueError("ContextStore requires PP=CP=1")
-            config["context_tp_size"] = self.tp_size
-            config["context_tp_rank"] = (
-                self.tp_rank % self.tp_size if self._role == KVConnectorRole.WORKER else 0
-            )
-            config["share_buffer_enable"] = self.is_mla
         config.setdefault("share_buffer_enable", self.is_mla)
-        if config.get("store_pipeline") != "ContextStore|Fake":
-            self._set_default_shm_buffer_capacity(config)
+        self._set_default_shm_buffer_capacity(config)
         if "storage_backends" in config:
             backends = [path for path in config["storage_backends"].split(":")]
             config["storage_backends"] = backends
         config["unique_id"] = f"{self.unique_id}"
-        if config.get("store_pipeline") == "ContextStore|Fake":
-            config["unique_id"] += f"_dp{self._dp_rank}"
         config["tensor_layout"] = "mla" if self.is_mla else "gqa"
         if self._role == KVConnectorRole.WORKER:
             config["device_id"] = self.device_id
@@ -1768,7 +1744,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
             raise RuntimeError(f"Unsupported device platform for UCMDirectConnector.")
 
     def _prefetch_other_rank_hashes(self, rank0_block_ids: list[bytes]) -> None:
-        if self._context_store_enabled or not self._other_rank_hashers or not rank0_block_ids:
+        if not self._other_rank_hashers or not rank0_block_ids:
             return
 
         other_rank_block_ids = [
@@ -1977,10 +1953,6 @@ class UCMDirectConnector(KVConnectorBase_V1):
             load_block_ids=(load_ucm_block_ids, load_vllm_block_ids),
             dump_block_ids=([], []),
             load_async=True,
-            context_block_ids=(
-                list(req_meta.ucm_block_ids) if self._context_store_enabled else []
-            ),
-            context_observation=(time.monotonic_ns() if self._context_store_enabled else 0),
         )
         self._async_load_req_ids.add(request_id)
 
@@ -2035,16 +2007,9 @@ class UCMDirectConnector(KVConnectorBase_V1):
                 )
                 dump_vllm_block_ids = dump_vllm_block_ids[: len(dump_ucm_block_ids)]
 
-        # Decode does not access the stored prompt. Keep its context until
-        # get_finished retires it, without broadcasting or refreshing each token.
-        observe_context = self._context_store_enabled and (
-            need_load or bool(dump_ucm_block_ids)
-        )
         return RequestDispatchMeta(
             (load_ucm_block_ids, load_vllm_block_ids),
             (dump_ucm_block_ids, dump_vllm_block_ids),
-            context_block_ids=(list(ucm_block_ids) if observe_context else []),
-            context_observation=(time.monotonic_ns() if observe_context else 0),
         )
 
     def build_connector_meta(
@@ -2133,30 +2098,13 @@ class UCMDirectConnector(KVConnectorBase_V1):
         )
 
     def _store_block_ids(self, block_ids: list[bytes]) -> list[bytes]:
-        # ContextStore isolates rank payloads by namespace, so context and I/O
-        # retain the scheduler's canonical keys on every rank.
-        if self._context_store_enabled or self.is_mla or self.tp_rank % self.tp_size == 0:
+        if self.is_mla or self.tp_rank % self.tp_size == 0:
             return block_ids
         return [self.request_hasher(block_id) for block_id in block_ids]
-
-    def _observe_context_requests(self, metadata) -> None:
-        if not self._context_store_enabled:
-            return
-        # Shared MLA policy lives on the owner; avoid packing IDs on readers.
-        if self.is_mla and self.tp_rank % self.tp_size != 0:
-            return
-        timestamp = time.monotonic_ns()
-        for request_id, request in metadata.request_meta.items():
-            if not request.context_block_ids:
-                continue
-            self.store.observe_request(
-                request_id, request.context_observation, timestamp, request.context_block_ids
-            )
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, UCMConnectorMetadata)
-        self._observe_context_requests(metadata)
 
         request_to_task: dict[str, Task] = {}
         is_load = False
@@ -2544,11 +2492,6 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self,
         finished_req_ids: set[str],
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
-        if self._context_store_enabled and (
-            not self.is_mla or self.tp_rank % self.tp_size == 0
-        ):
-            for request_id in finished_req_ids:
-                self.store.observe_request(request_id, 0, 0, [])
         finished_recving = self._poll_pending_load_tasks()
         async_finished_req_ids = finished_req_ids & self._async_dump_req_ids
 
@@ -2717,7 +2660,6 @@ class UCMLayerWiseConnector(UCMDirectConnector):
         self._dumped_layer_ids.clear()
         first_layer_load_start = time.perf_counter()
         metadata = self._get_connector_metadata()
-        self._observe_context_requests(metadata)
         self.load_tasks.clear()
         self.request_data.clear()
         self._failure_req_ids.clear()
@@ -3265,13 +3207,6 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             else False
         )
 
-        context_store = any(
-            item.get("ucm_connector_config", {}).get("store_pipeline") == "ContextStore|Fake"
-            for item in (self.launch_config or {}).get("ucm_connectors", [])
-        )
-        if context_store and use_lite:
-            raise ValueError("ContextStore requires the direct or layerwise connector")
-
         if use_lite:
             from ucm.integration.vllm.hla_connector import (
                 UCMHLALiteConnector,
@@ -3299,8 +3234,6 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             if self.launch_config is not None
             else False
         )
-        if context_store and use_inference_duration_monitor:
-            raise ValueError("ContextStore requires the direct or layerwise connector")
         if use_inference_duration_monitor:
             from ucm.integration.vllm.inference_duration_monitor_connector import (
                 UCMInferenceDurationMonitorConnector,
@@ -3345,14 +3278,6 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             and use_layerwise
             and self.launch_config.get("hybrid_linear_attention_layerwise", True)
         )
-
-        if context_store and (
-            UCMFAWAConnector.can_handle_kv_cache_config(kv_cache_config)
-            or use_ratio_rate
-            or use_hybrid_linear_attention_layerwise
-            or use_hybrid_linear_attention
-        ):
-            raise ValueError("ContextStore currently supports standard direct/layerwise attention")
 
         if UCMFAWAConnector.can_handle_kv_cache_config(kv_cache_config):
             self.connector = UCMFAWAConnector(vllm_config, role, kv_cache_config)

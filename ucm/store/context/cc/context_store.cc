@@ -22,160 +22,266 @@
  * SOFTWARE.
  * */
 #include <algorithm>
-#include <cmath>
+#include <memory>
 #include <numeric>
-#include "context_index.h"
+#include "buffer_manager.h"
+#include "logger/logger.h"
 #include "trans/cuda/gdr/gdr_config.h"
 #include "trans_manager.h"
 
+#ifndef UCM_RUNTIME_ASCEND_IO_AGGREGATION
+#define UCM_RUNTIME_ASCEND_IO_AGGREGATION 0
+#endif
+
+#ifndef UCM_RUNTIME_ASCEND_SDMA_DIRECT
+#define UCM_RUNTIME_ASCEND_SDMA_DIRECT 0
+#endif
+
 namespace UC::Context {
+
 class ContextStore : public StoreV1 {
-    Config config_;
-    TransBuffer buffer_;
-    std::vector<std::unique_ptr<TransBuffer>> watchers_;
-    std::unique_ptr<Trans::GdrKVBufferConfig> registrations_;
-    TransManager transfers_;
+    BufferManager bufferMgr_;
+    bool transEnable_{false};
+    TransManager transMgr_;
+    std::unique_ptr<Trans::GdrKVBufferConfig> gpuKvBufferRegistrations_{nullptr};
 
 public:
-    Status Setup(const Detail::Dictionary& c) override
+    Status Setup(const Detail::Dictionary& inConfig) override
     {
-        auto& p = config_;
-        c.Get("store_backend", p.storeBackend);
-        c.Get("unique_id", p.uniqueId);
-        c.GetNumber("device_id", p.deviceId);
-        c.Get("share_buffer_enable", p.shareBufferEnable);
-        c.GetNumber("context_tp_size", p.tpSize);
-        c.GetNumber("context_tp_rank", p.tpRank);
-        if (!p.storeBackend || p.uniqueId.empty() ||
-            p.uniqueId.find_first_not_of(
-                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") !=
-                std::string::npos ||
-            !p.tpSize || p.tpRank >= p.tpSize || p.deviceId < -1) {
-            return Status::InvalidParam("invalid context identity/backend");
+        auto config = ParseConfig(inConfig);
+        auto s = CheckConfig(config);
+        if (s.Failure()) [[unlikely]] {
+            UC_ERROR("Failed to check config params: {}.", s);
+            return s;
         }
-        if (p.deviceId < 0) {
-            for (size_t rank = 0; rank < (p.shareBufferEnable ? 1 : p.tpSize); ++rank) {
-                auto watcher = std::make_unique<TransBuffer>();
-                auto cfg = p;
-                cfg.tpRank = rank;
-                auto s = watcher->Setup(cfg);
-                if (s.Failure()) { return s; }
-                watchers_.push_back(std::move(watcher));
+        if (config.deviceId >= 0 && !config.gpuKvBufferAddrs.empty()) {
+            gpuKvBufferRegistrations_ = std::make_unique<Trans::GdrKVBufferConfig>();
+            s = gpuKvBufferRegistrations_->Register(config.gpuKvBufferAddrs,
+                                                    config.gpuKvBufferSizes);
+            if (s.Failure()) [[unlikely]] {
+                UC_ERROR("Failed({}) to register GPU KV buffers.", s);
+                return s;
             }
-            return Status::OK();
         }
-        c.GetNumber("block_size", p.blockSize);
-        c.GetNumber("shard_size", p.shardSize);
-        c.GetNumbers("tensor_size_list", p.tensorSizes);
-        size_t tensor = 0;
-        c.GetNumber("tensor_size", tensor);
-        if (p.tensorSizes.empty() && tensor && p.shardSize % tensor == 0) {
-            p.tensorSizes.assign(p.shardSize / tensor, tensor);
+        s = bufferMgr_.Setup(config);
+        if (s.Failure()) [[unlikely]] {
+            UC_ERROR("Failed({}) to setup buffer manager.", s);
+            return s;
         }
-        ssize_t bytes = 0, gb = 0;
-        c.GetNumber("context_memory_capacity_bytes", bytes);
-        c.GetNumber("context_memory_capacity_gb", gb);
-        if (bytes < 0 || gb < 0 || (bytes && gb) || uint64_t(gb) > (uint64_t(1) << 32)) {
-            return Status::InvalidParam("invalid context capacity");
+        transEnable_ = config.deviceId >= 0;
+        if (transEnable_) {
+            s = transMgr_.Setup(config, bufferMgr_.GetTransBuffer());
+            if (s.Failure()) [[unlikely]] { return s; }
         }
-        p.bufferCapacity = bytes ? size_t(bytes) : size_t(gb) << 30;
-        c.Get("context_alpha", p.alpha);
-        c.GetNumber("context_retention_ns", p.retention);
-        c.GetNumber("context_max_eviction_blocks", p.evictionLimit);
-        c.GetNumber("cache_stream_number", p.streamNumber);
-        c.GetNumber("waiting_queue_depth", p.waitingQueueDepth);
-        c.GetNumber("running_queue_depth", p.runningQueueDepth);
-        c.GetNumber("local_rank_size", p.localRankSize);
-        c.GetNumber("timeout_ms", p.timeoutMs);
-        c.Get("cache_sdma_direct", p.cacheSdmaDirect);
-        c.Get("cache_io_aggregation", p.cacheIOAggregation);
-        c.Get("use_gdr", p.useGdr);
-        c.GetNumbers("gpu_kv_buffer_addrs", p.gpuKvBufferAddrs);
-        c.GetNumbers("gpu_kv_buffer_sizes", p.gpuKvBufferSizes);
-        c.Get("cpu_affinity_cores", p.cpuAffinityCores);
-        if (!p.blockSize || !p.shardSize || p.blockSize % p.shardSize ||
-            p.bufferCapacity < p.blockSize || p.tensorSizes.empty() ||
-            std::any_of(
-                p.tensorSizes.begin(), p.tensorSizes.end(), [](size_t n) { return !n; }) ||
-            std::accumulate(p.tensorSizes.begin(), p.tensorSizes.end(), size_t(0)) > p.shardSize) {
-            return Status::InvalidParam("invalid context block/shard/tensor layout");
-        }
-        if (!std::isfinite(p.alpha) || p.alpha <= 0 || p.alpha > 1 || p.retention < -1 ||
-            !p.evictionLimit || !p.timeoutMs || !p.localRankSize || p.streamNumber < 1 ||
-            p.streamNumber > 32 || p.waitingQueueDepth < 2 || p.runningQueueDepth < 2 ||
-            (p.cacheSdmaDirect && p.cacheIOAggregation) ||
-            (p.useGdr && (p.cacheSdmaDirect || p.cacheIOAggregation))) {
-            return Status::InvalidParam("invalid context policy/transfer configuration");
-        }
-        auto s = Trans::GdrKVBufferConfig::Validate(p.gpuKvBufferAddrs, p.gpuKvBufferSizes);
-        if (s.Failure()) { return s; }
-        if (!p.gpuKvBufferAddrs.empty()) {
-            registrations_ = std::make_unique<Trans::GdrKVBufferConfig>();
-            s = registrations_->Register(p.gpuKvBufferAddrs, p.gpuKvBufferSizes);
-            if (s.Failure()) { return s; }
-        }
-        s = buffer_.Setup(p);
-        if (s.Failure()) { return s; }
-        return transfers_.Setup(p, &buffer_);
+        ShowConfig(config);
+        return Status::OK();
     }
     std::string Readme() const override { return "ContextStore"; }
-    Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* keys, size_t n) override
+    Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num) override
     {
-        if (config_.deviceId >= 0) { return buffer_.Lookup(keys, n); }
-        std::vector<uint8_t> result(n, 1);
-        for (auto& watcher : watchers_) {
-            auto found = watcher->Lookup(keys, n);
-            if (!found) { return found.Error(); }
-            for (size_t i = 0; i < n; ++i) { result[i] &= found.Value()[i]; }
-        }
-        return result;
+        auto res = bufferMgr_.Lookup(blocks, num);
+        if (!res) [[unlikely]] { UC_ERROR("Failed({}) to lookup blocks({}).", res.Error(), num); }
+        return res;
     }
-    Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* keys, size_t n) override
+    Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num) override
     {
-        auto result = Lookup(keys, n);
-        if (!result) { return result.Error(); }
-        size_t i = 0;
-        while (i < n && result.Value()[i]) { ++i; }
-        return ssize_t(i) - 1;
+        auto res = bufferMgr_.LookupOnPrefix(blocks, num);
+        if (!res) [[unlikely]] { UC_ERROR("Failed({}) to lookup blocks({}).", res.Error(), num); }
+        return res;
     }
-    Expected<ssize_t> LookupOnReverse(const Detail::BlockId* keys, size_t n) override
+    Expected<ssize_t> LookupOnReverse(const Detail::BlockId* blocks, size_t num) override
     {
-        auto result = Lookup(keys, n);
-        if (!result) { return result.Error(); }
-        for (size_t i = n; i > 0; --i) {
-            if (result.Value()[i - 1]) { return ssize_t(i - 1); }
-        }
-        return ssize_t(-1);
+        auto res = bufferMgr_.LookupOnReverse(blocks, num);
+        if (!res) [[unlikely]] { UC_ERROR("Failed({}) to lookup blocks({}).", res.Error(), num); }
+        return res;
     }
-    void Prefetch(const Detail::BlockId* keys, size_t n) override
-    { config_.storeBackend->Prefetch(keys, n); }
-    Status ObserveRequest(const std::string& id, uint64_t observation, uint64_t time,
-                          const std::vector<Key>& path) override
+    void Prefetch(const Detail::BlockId* blocks, size_t num) override
     {
-        return config_.deviceId < 0 ? Status::Unsupported()
-                                    : buffer_.Observe(id, observation, time, path);
+        bufferMgr_.Prefetch(blocks, num);
     }
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
-    { return Submit(TransTask::Type::LOAD, std::move(task)); }
+    {
+        if (!transEnable_) { return Status::Error("transfer is not enable"); }
+        auto res = transMgr_.Submit({TransTask::Type::LOAD, std::move(task)});
+        if (!res) [[unlikely]] {
+            UC_ERROR("Failed({}) to submit load task({}).", res.Error(), task.brief);
+        }
+        return res;
+    }
     Expected<Detail::TaskHandle> Dump(Detail::TaskDesc task) override
     {
-        if (config_.shareBufferEnable && config_.tpRank != 0) { return Status::Unsupported(); }
-        return Submit(TransTask::Type::DUMP, std::move(task));
+        if (!transEnable_) { return Status::Error("transfer is not enable"); }
+        auto res = transMgr_.Submit({TransTask::Type::DUMP, std::move(task)});
+        if (!res) [[unlikely]] {
+            UC_ERROR("Failed({}) to submit dump task({}).", res.Error(), task.brief);
+        }
+        return res;
     }
-    Expected<bool> Check(Detail::TaskHandle task) override { return transfers_.Check(task); }
-    Status Wait(Detail::TaskHandle task) override { return transfers_.Wait(task); }
-    std::map<std::string, uint64_t> ContextStats() override { return buffer_.Stats(); }
+    Expected<bool> Check(Detail::TaskHandle taskId) override
+    {
+        auto res = transMgr_.Check(taskId);
+        if (!res) [[unlikely]] { UC_ERROR("Failed({}) to check task({}).", res.Error(), taskId); }
+        return res;
+    }
+    Status Wait(Detail::TaskHandle taskId) override
+    {
+        auto s = transMgr_.Wait(taskId);
+        if (s.Failure() && s != Status::StoreUnhealthy()) [[unlikely]] {
+            UC_ERROR("Failed({}) to wait task({}).", s, taskId);
+        }
+        return s;
+    }
 
 private:
-    Expected<Detail::TaskHandle> Submit(TransTask::Type type, Detail::TaskDesc task)
+    Config ParseConfig(const Detail::Dictionary& config)
     {
-        if (config_.deviceId < 0) { return Status::Unsupported(); }
-        auto s = buffer_.BeginTask(task);
+        Config param;
+        config.Get("store_backend", param.storeBackend);
+        config.Get("unique_id", param.uniqueId);
+        config.Get("cache_load_backend_only", param.cacheLoadBackendOnly);
+        config.GetNumber("context_retention_ns", param.retentionNs);
+        config.GetNumber("device_id", param.deviceId);
+        size_t tensorSize = 0;
+        config.GetNumber("tensor_size", tensorSize);
+        config.GetNumber("shard_size", param.shardSize);
+        if (tensorSize != 0) {
+            param.tensorSizes.assign(param.shardSize / tensorSize, tensorSize);
+        } else {
+            config.GetNumbers("tensor_size_list", param.tensorSizes);
+        }
+        config.GetNumber("block_size", param.blockSize);
+        config.Get("cpu_affinity_cores", param.cpuAffinityCores);
+        if (param.shardSize > 0) { param.waitingQueueDepth *= (param.blockSize / param.shardSize); }
+        config.Get("share_buffer_enable", param.shareBufferEnable);
+        if (!param.shareBufferEnable) { param.bufferCapacity /= 8; }
+        config.Get("io_direct", param.ioDirect);
+        size_t bufferCapacityGb = 0;
+        config.GetNumber("cache_buffer_capacity_gb", bufferCapacityGb);
+        if (bufferCapacityGb != 0) { param.bufferCapacity = bufferCapacityGb << 30; }
+        config.GetNumber("waiting_queue_depth", param.waitingQueueDepth);
+        config.GetNumber("running_queue_depth", param.runningQueueDepth);
+        config.GetNumber("timeout_ms", param.timeoutMs);
+        config.GetNumber("cache_stream_number", param.streamNumber);
+        config.GetNumber("cache_load_exclusive_buffer_number", param.loadExclusiveBufferNumber);
+        config.GetNumbers("gpu_kv_buffer_addrs", param.gpuKvBufferAddrs);
+        config.GetNumbers("gpu_kv_buffer_sizes", param.gpuKvBufferSizes);
+        config.Get("use_gdr", param.useGdr);
+        config.Get("cache_io_aggregation", param.cacheIOAggregation);
+        param.cacheIOAggregation = param.cacheIOAggregation && UCM_RUNTIME_ASCEND_IO_AGGREGATION;
+        config.Get("cache_sdma_direct", param.cacheSdmaDirect);
+        config.GetNumber("local_rank_size", param.localRankSize);
+        return param;
+    }
+    Status CheckSizeConfig(const Config& config)
+    {
+        if (config.tensorSizes.empty()) { return Status::InvalidParam("invalid tensor size"); }
+        if (config.shardSize == 0) { return Status::InvalidParam("invalid shard size"); }
+        if (config.blockSize == 0) { return Status::InvalidParam("invalid block size"); }
+        if (std::accumulate(config.tensorSizes.begin(), config.tensorSizes.end(), size_t(0)) >
+            config.shardSize) {
+            return Status::InvalidParam("invalid shard size({})", config.shardSize);
+        }
+        if (config.blockSize % config.shardSize != 0) {
+            return Status::InvalidParam("invalid block size({})", config.blockSize);
+        }
+        return Status::OK();
+    }
+    Status CheckConfig(const Config& config)
+    {
+        if (config.retentionNs < -1) { return Status::InvalidParam("invalid context_retention_ns"); }
+        if (!config.storeBackend) { return Status::InvalidParam("invalid store backend"); }
+        if (config.deviceId < -1) {
+            return Status::InvalidParam("invalid device({})", config.deviceId);
+        }
+        if (config.uniqueId.empty()) { return Status::InvalidParam("invalid unique id"); }
+        auto s =
+            Trans::GdrKVBufferConfig::Validate(config.gpuKvBufferAddrs, config.gpuKvBufferSizes);
         if (s.Failure()) { return s; }
-        auto result = transfers_.Submit({type, std::move(task)});
-        if (!result) { buffer_.EndTask(); }
-        return result;
+        for (const auto core : config.cpuAffinityCores) {
+            if (core < 0 || core >= CPU_SETSIZE) {
+                return Status::InvalidParam("invalid cpu core({})", core);
+            }
+        }
+        if (config.deviceId == -1) { return Status::OK(); }
+        s = CheckSizeConfig(config);
+        if (s.Failure()) { return s; }
+#if !UCM_RUNTIME_ASCEND_SDMA_DIRECT
+        if (config.cacheSdmaDirect) {
+            return Status::InvalidParam("Cache SDMA Direct requires RUNTIME_ENVIRONMENT=ascend-a3");
+        }
+#endif
+        auto bufferNumber = config.bufferCapacity / config.shardSize;
+        const size_t minBufferNumber = std::max(size_t(1024), config.loadExclusiveBufferNumber * 2);
+        if (bufferNumber < minBufferNumber) {
+            const size_t minBufferCapacityGb =
+                (minBufferNumber * config.shardSize + (size_t(1) << 30) - 1) >> 30;
+            return Status::InvalidParam(
+                "too small buffer({}) on shard({}), please set cache_buffer_capacity_gb >= {}GB",
+                config.bufferCapacity, config.shardSize, minBufferCapacityGb);
+        }
+        if (config.waitingQueueDepth <= 1 || config.runningQueueDepth <= 1) {
+            return Status::InvalidParam("invalid queue depth({},{})", config.waitingQueueDepth,
+                                        config.runningQueueDepth);
+        }
+        if (config.cacheIOAggregation && config.cacheSdmaDirect) {
+            return Status::InvalidParam(
+                "Cache IO aggregation is incompatible with Cache SDMA Direct");
+        }
+        if (config.streamNumber < 1 || config.streamNumber > 32) {
+            return Status::InvalidParam("invalid stream number({})", config.streamNumber);
+        }
+        if (config.localRankSize == 0) {
+            return Status::InvalidParam("invalid local rank size({})", config.localRankSize);
+        }
+        return Status::OK();
+    }
+    void ShowConfig(const Config& config)
+    {
+        constexpr const char* ns = "ContextStore";
+        std::string buildType = UCM_BUILD_TYPE;
+        if (buildType.empty()) { buildType = "Release"; }
+        UC_INFO("{}-{}({}).", ns, UCM_COMMIT_ID, buildType);
+        UC_INFO("{}::RetentionNs={}; eviction unit=shard.", ns, config.retentionNs);
+        UC_INFO("Set {}::StoreBackend to {}.", ns, config.storeBackend->Readme());
+        UC_INFO("Set {}::UniqueId to {}.", ns, config.uniqueId);
+        UC_INFO("Set {}::CacheLoadBackendOnly to {}.", ns, config.cacheLoadBackendOnly);
+        UC_INFO("Set {}::DeviceId to {}.", ns, config.deviceId);
+        const auto& v = config.tensorSizes;
+        if (v.empty()) {
+            UC_INFO("Set {}::TensorSizes to [].", ns);
+        } else if (std::all_of(v.begin(), v.end(), [&](auto d) { return d == v[0]; })) {
+            UC_INFO("Set {}::TensorSizes to {}(*{}).", ns, v[0], v.size());
+        } else {
+            UC_INFO("Set {}::TensorSizes to {}.", ns, v);
+        }
+        UC_INFO("Set {}::ShardSize to {}.", ns, config.shardSize);
+        UC_INFO("Set {}::BlockSize to {}.", ns, config.blockSize);
+        UC_INFO("Set {}::IoDirect to {}.", ns, config.ioDirect);
+        UC_INFO("Set {}::CpuAffinityCores to {}.", ns, config.cpuAffinityCores);
+        UC_INFO("Set {}::BufferCapacity to {}GB.", ns, config.bufferCapacity >> 30);
+        UC_INFO("Set {}::ShareBufferEnable to {}.", ns, config.shareBufferEnable);
+        UC_INFO("Set {}::CacheIOAggregation to {}.", ns, config.cacheIOAggregation);
+        if (config.cacheIOAggregation) {
+            UC_INFO("Set {}::AggregationObject to CacheStoreShard.", ns);
+        }
+        UC_INFO("Set {}::WaitingQueueDepth to {}.", ns, config.waitingQueueDepth);
+        UC_INFO("Set {}::RunningQueueDepth to {}.", ns, config.runningQueueDepth);
+        UC_INFO("Set {}::TimeoutMs to {}.", ns, config.timeoutMs);
+        if (config.cacheSdmaDirect) {
+            UC_INFO(
+                "Set {}::StreamNumber to {} (configured={}, Cache SDMA Direct uses one stream).",
+                ns, config.EffectiveStreamNumber(), config.streamNumber);
+        } else {
+            UC_INFO("Set {}::StreamNumber to {}.", ns, config.EffectiveStreamNumber());
+        }
+        UC_INFO("Set {}::CacheSdmaDirect to {}.", ns, config.cacheSdmaDirect);
+        UC_INFO("Set {}::LoadExclusiveBufferNumber to {}.", ns, config.loadExclusiveBufferNumber);
+        UC_INFO("Set {}::GpuKvBufferNumber to {}.", ns, config.gpuKvBufferAddrs.size());
+        UC_INFO("Set {}::UseGdr to {}.", ns, config.useGdr);
+        UC_INFO("Set {}::LocalRankSize to {}.", ns, config.localRankSize);
     }
 };
+
 }  // namespace UC::Context
+
 extern "C" UC::StoreV1* MakeContextStore() { return new UC::Context::ContextStore(); }

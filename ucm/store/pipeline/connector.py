@@ -97,17 +97,6 @@ class UcmPipelineStore(UcmKVStoreBaseV1):
             raise ValueError(f"unknown store pipeline: {config['store_pipeline']}")
         builder(config, self.store_)
 
-    def observe_request(
-        self, request_id: str, observation: int, timestamp_ns: int, block_ids: list[bytes]
-    ) -> None:
-        if any(len(block) != 16 for block in block_ids):
-            raise ValueError("ContextStore requires 16-byte block IDs")
-        ids = np.frombuffer(b"".join(block_ids), dtype=np.uint8)
-        self.store_.ObserveRequest(request_id, observation, timestamp_ns, ids)
-
-    def context_stats(self) -> dict[str, int]:
-        return self.store_.ContextStats()
-
     def cc_store(self) -> int:
         return self.store_.Self()
 
@@ -423,6 +412,7 @@ def _context_pipeline_builder(config, pipeline):
         config.pop("context_retention_ns", None)
     store_dir = Path(__file__).resolve().parent.parent
     _fake_pipeline_builder(config, pipeline)
+    _preload_metrics(store_dir)
     pipeline.Stack("Context", str(store_dir / "context/libcontextstore.so"), config)
 
 

@@ -25,7 +25,6 @@
 #define UNIFIEDCACHE_CONTEXT_STORE_CC_TRANS_BUFFER_H
 
 #include <limits>
-#include <map>
 #include <memory>
 #include "global_config.h"
 #include "status/status.h"
@@ -33,9 +32,15 @@
 
 namespace UC::Context {
 
+class BufferStrategy;
+
 class TransBuffer {
     using Index = std::size_t;
     static constexpr Index npos = std::numeric_limits<Index>::max();
+    std::shared_ptr<BufferStrategy> strategy_{nullptr};
+    bool bypassHitOnLoad_{false};
+    StoreV1* backend_{nullptr};
+    int64_t retentionNs_{-1};
 
 public:
     enum class State : uint8_t { LOADING, READY, FAILED };
@@ -86,7 +91,7 @@ public:
         bool Ready() const { return buf_->Ready(pos_); };
         State GetState() const { return buf_->GetState(pos_); }
         Status FailureStatus() const { return buf_->FailureStatus(pos_); }
-        void MarkReady(bool backend = false) { buf_->MarkReady(pos_, backend); };
+        void MarkReady(bool persisted = false) { buf_->MarkReady(pos_, persisted); };
         void MarkFailed(const Status& status) { buf_->MarkFailed(pos_, status); }
 
     private:
@@ -105,27 +110,19 @@ public:
     };
 
 public:
-    TransBuffer();
-    ~TransBuffer();
     Status Setup(const Config& config);
-    Expected<Handle> Get(const Detail::BlockId& blockId, size_t shardIdx);
-    void Prealloc(const Detail::BlockId& blockId, size_t shardIdx);
-    Detail::BlockId BackendKey(const Detail::BlockId& key) const;
-    Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* keys, size_t n);
-    bool Exist(const Detail::BlockId& blockId);
-    Status Observe(const std::string& request, uint64_t observation, uint64_t time,
-                   const std::vector<Detail::BlockId>& path);
-    Status BeginTask(const Detail::TaskDesc& task);
-    void EndTask();
-    void RecordRead(size_t count);
-    std::map<std::string, uint64_t> Stats();
+    Expected<Handle> Get(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false,
+               bool isLoad = false);
+    void Prealloc(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false);
+    bool Exist(const Detail::BlockId& blockId, size_t shardIdx);
 
 private:
-    Expected<Handle> Alloc(const Detail::BlockId& key, size_t layer, bool prealloc);
-    bool ExistAt(size_t bucket, const Detail::BlockId& key, size_t layer);
-    size_t FindAt(size_t bucket, const Detail::BlockId& key, size_t layer, bool& owner);
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
+    bool ExistAt(size_t iBucket, const Detail::BlockId& blockId, size_t shardIdx);
+    size_t FindAt(size_t iBucket, const Detail::BlockId& blockId, size_t shardIdx, bool& owner);
+    Expected<size_t> Alloc(const Detail::BlockId& blockId, size_t shardIdx, size_t iBucket,
+                 bool allowReserved = false);
+    void MoveTo(size_t iBucket, size_t iNode);
+    void Remove(size_t iBucket, size_t iNode);
     void* DataAt(Index pos);
     void* DeviceDataAt(Index pos);
     void Acquire(Index pos);
@@ -133,8 +130,12 @@ private:
     bool Ready(Index pos);
     State GetState(Index pos);
     Status FailureStatus(Index pos);
-    void MarkReady(Index pos, bool backend);
+    void MarkReady(Index pos, bool persisted);
+    Status Evict(Index pos);
     void MarkFailed(Index pos, const Status& status);
+    void MarkNotReady(Index pos);
 };
+
 }  // namespace UC::Context
+
 #endif

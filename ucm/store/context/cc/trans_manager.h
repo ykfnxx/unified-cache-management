@@ -35,14 +35,12 @@ namespace UC::Context {
 
 class TransManager : public Detail::TaskWrapper<TransTask, Detail::TaskHandle> {
     size_t shardSize_;
-    TransBuffer* buffer_;
     LoadQueue loadQ_;
     DumpQueue dumpQ_;
 
 public:
     Status Setup(const Config& config, TransBuffer* buffer)
     {
-        buffer_ = buffer;
         timeoutMs_ = config.timeoutMs;
         shardSize_ = config.shardSize;
         auto s = loadQ_.Setup(config, &failureSet_, buffer);
@@ -60,26 +58,21 @@ protected:
         const auto size = shardSize_ * num;
         const auto tp = w->startTp;
         const auto isLoad = t->type == TransTask::Type::LOAD;
-        UC_DEBUG("Context task({},{},{},{}) dispatching.", id, brief, num, size);
-        w->SetEpilog([this, id, brief = std::move(brief), num, size, tp, isLoad] {
-            buffer_->EndTask();
+        UC_DEBUG("Cache task({},{},{},{}) dispatching.", id, brief, num, size);
+        w->SetEpilog([id, brief = std::move(brief), num, size, tp, isLoad] {
             auto cost = NowTime::Now() - tp;
             auto costMs = cost * 1e3;
             auto bwGbps = cost > 0 ? static_cast<double>(size) / cost / 1e9 : 0.0;
-            UC_DEBUG("Context task({},{},{},{}) finished, cost {:.3f}ms.", id, brief, num, size,
+            UC_DEBUG("Cache task({},{},{},{}) finished, cost {:.3f}ms.", id, brief, num, size,
                      costMs);
             if (isLoad) {
-                UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_load_duration_ms"),
-                                         costMs);
-                UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_load_bandwidth_gbps"),
-                                         bwGbps);
+                UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_load_duration_ms"), costMs);
+                UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_load_bandwidth_gbps"), bwGbps);
                 UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_load_bytes_total"),
                                          static_cast<double>(size));
             } else {
-                UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_dump_duration_ms"),
-                                         costMs);
-                UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_dump_bandwidth_gbps"),
-                                         bwGbps);
+                UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_dump_duration_ms"), costMs);
+                UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_dump_bandwidth_gbps"), bwGbps);
                 UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_dump_shards_total"),
                                          static_cast<double>(num));
                 UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("context_transfer_dump_bytes_total"),

@@ -177,13 +177,6 @@ public:
      */
     virtual Status Wait(Detail::TaskHandle taskId) = 0;
 
-    // Optional request-aware store extension. Hashes describe the complete prefix.
-    virtual Status ObserveRequest(const std::string& requestId, uint64_t observation,
-                                  uint64_t timestampNs, const std::vector<Detail::BlockId>& blocks)
-    {
-        return Status::Unsupported();
-    }
-    virtual std::map<std::string, uint64_t> ContextStats() { return {}; }
 
 protected:
     /**

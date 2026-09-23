@@ -18,37 +18,48 @@ consumers:
 
 # Counter metrics configuration
 counter:
-  - name: "context_transfer_load_shards_total"
-    documentation: "Total shards whose Context buffer state was inspected during load"
-  - name: "context_transfer_load_wait_shards_total"
-    documentation: "Shards whose Context buffer was not ready when acquired and required waiting"
-  - name: "context_transfer_load_backend_shards_total"
-    documentation: "Shards that descended to the backend on load (true cache miss at the buffer-allocation stage; aka backend-load count)"
-  - name: "context_transfer_load_success_shards_total"
-    documentation: "Shards successfully loaded from an already-ready Context buffer to device"
-  - name: "context_transfer_wait_load_success_shards_total"
-    documentation: "Shards copied to device after waiting for a shared shard to become ready; not a backend submission count"
-  - name: "context_transfer_load_failed_shards_total"
-    documentation: "Context load shards that did not complete device delivery"
-  - name: "context_transfer_dump_shards_total"
-    documentation: "Total shard descriptors processed by Context dump, including failed tasks"
-  - name: "context_transfer_load_queue_full_total"
-    documentation: "Number of Context load submissions rejected because the waiting queue was full"
-  - name: "context_transfer_dump_queue_full_total"
-    documentation: "Number of Context dump submissions rejected because the waiting queue was full"
+  - name: "context_transfer_backend_load_submit_errors_total"
+    documentation: "Number of Cache load backend submit failures"
   - name: "context_transfer_backend_load_wait_errors_total"
-    documentation: "Number of Context load backend wait failures"
-  - name: "context_transfer_load_bytes_total"
-    documentation: "Total bytes loaded through the Context stage (per-task size summed)"
+    documentation: "Number of Cache load backend wait failures"
   - name: "context_transfer_dump_bytes_total"
     documentation: "Total bytes dumped through the Context stage (per-task size summed)"
-  # -- ContextStore: completed logical-block evictions (not unique IDs) -----
-  - name: "context_evict_blocks_total"
-    documentation: "Logical blocks successfully evicted from ContextStore Memory (Dump plus Drop)"
-  - name: "context_dump_blocks_total"
-    documentation: "Logical blocks evicted by ContextStore Dump policy, including backend-already-present skips; excludes device-to-Memory saves"
-  - name: "context_drop_blocks_total"
-    documentation: "Logical blocks evicted by ContextStore Drop policy without backend writes"
+  - name: "context_transfer_dump_queue_full_total"
+    documentation: "Number of Cache dump submissions rejected because the waiting queue was full"
+  - name: "context_transfer_dump_shards_total"
+    documentation: "Total shard descriptors processed by Cache dump, including failed tasks"
+  - name: "context_transfer_h2d_errors_total"
+    documentation: "Number of Cache host-to-device transfer or sync failures"
+  - name: "context_transfer_load_backend_shards_total"
+    documentation: "Shards that descended to the backend on load (true cache miss at the buffer-allocation stage; aka backend-load count)"
+  - name: "context_transfer_load_bytes_total"
+    documentation: "Total bytes loaded through the Context stage (per-task size summed)"
+  - name: "context_transfer_load_failed_shards_total"
+    documentation: "Cache load shards that did not complete device delivery"
+  - name: "context_transfer_load_queue_full_total"
+    documentation: "Number of Cache load submissions rejected because the waiting queue was full"
+  - name: "context_transfer_load_shards_total"
+    documentation: "Total shards whose Context buffer state was inspected during load"
+  - name: "context_transfer_load_success_shards_total"
+    documentation: "Shards successfully loaded from an already-ready Context buffer to device"
+  - name: "context_transfer_load_wait_shards_total"
+    documentation: "Shards whose Context buffer was not ready when acquired and required waiting"
+  - name: "context_transfer_lookup_hit_blocks_total"
+    documentation: "Number of lookup hits served by the Context stage (no descent to backend)"
+  - name: "context_transfer_lookup_miss_blocks_total"
+    documentation: "Number of lookup misses at the Context stage (had to query the backend)"
+  - name: "context_transfer_posix_load_success_shards_total"
+    documentation: "Shards successfully loaded to device after waiting for Posix to fill Cache"
+  - name: "context_evict_shards_total"
+    documentation: "READY shards successfully evicted (Dump plus Drop)"
+  - name: "context_dump_shards_total"
+    documentation: "READY shards evicted within retention, including already-persisted shards"
+  - name: "context_drop_shards_total"
+    documentation: "READY shards evicted after retention without backend writes"
+  - name: "context_writeback_shards_total"
+    documentation: "Dirty shards successfully written to backend during eviction"
+
+
 
   # -- Pipeline Cache stage: lookup hit/miss breakdown ----------------------
   # Hit counters let Prometheus compute hit rate without losing precision:
@@ -276,37 +287,53 @@ gauge:
 
 # Histogram metrics configuration
 histogram:
-  - name: "context_transfer_load_duration_ms"
-    documentation: "End-to-end Context stage load task duration (ms)"
-    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
-  - name: "context_transfer_dump_duration_ms"
-    documentation: "End-to-end Context stage dump task duration (ms)"
-    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
-  - name: "context_transfer_load_bandwidth_gbps"
-    documentation: "Context stage effective load bandwidth (GB/s)"
-    buckets: [0.5, 1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
+  - name: "context_transfer_d2h_duration_ms"
+    documentation: "Cache dump stream synchronize duration including prerequisite compute wait and D2H copy (ms). Use cache_dump_prereq_wait_ms to estimate the compute-gated portion."
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
   - name: "context_transfer_dump_bandwidth_gbps"
     documentation: "Context stage effective dump bandwidth (GB/s)"
     buckets: [0.5, 1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
-  - name: "context_transfer_load_queue_wait_duration_ms"
-    documentation: "Time a Context load task spent queued before dispatch worker pickup (ms)"
-    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
+  - name: "context_transfer_dump_duration_ms"
+    documentation: "End-to-end Context stage dump task duration (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
+  - name: "context_transfer_dump_mkbuf_duration_ms"
+    documentation: "Cache dump mk_buf phase: buffer allocation/reuse + D2H async submit before stream sync (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "context_transfer_dump_prereq_wait_ms"
+    documentation: "Cache dump time waiting for the prerequisite compute event (layer KV ready) to fire before D2H can start (ms). Large => dump is compute-gated, not copy-gated."
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
   - name: "context_transfer_dump_queue_wait_duration_ms"
-    documentation: "Time a Context dump task spent queued before dispatch worker pickup (ms)"
+    documentation: "Time a Cache dump task spent queued before dispatch worker pickup (ms)"
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
-  - name: "context_transfer_load_backend_submit_duration_ms"
-    documentation: "Context load backend submit duration: buffer allocation plus synchronous backend load submission (ms)."
-    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
-  - name: "context_transfer_shard_backend_wait_ms"
-    documentation: "Context load per-shard time spent in WaitBackendTaskReady before H2D submit (ms). This is not a task-level duration."
+  - name: "context_transfer_h2d_submit_ms"
+    documentation: "Cache load per-shard H2D async submit CPU cost after backend wait (ms). Submission only; NOT the actual transfer time (see cache_h2d_sync_ms)."
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
   - name: "context_transfer_h2d_sync_ms"
-    documentation: "Context load residual H2D stream drain after the last shard submit (ms). Large => H2D copy is the bottleneck; ~0 with large cache_shard_backend_wait_ms => storage read is the bottleneck."
+    documentation: "Cache load residual H2D stream drain after the last shard submit (ms). Large => H2D copy is the bottleneck; ~0 with large cache_shard_backend_wait_ms => storage read is the bottleneck."
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
-  # -- ContextStore read pipeline -----------------------------------------
-  - name: "context_observe_duration_ms"
-    documentation: "ContextStore non-deduplicated ObserveRequest duration including lock wait (ms)"
-    buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000]
+  - name: "context_transfer_load_backend_submit_duration_ms"
+    documentation: "Cache load backend submit duration: buffer allocation plus synchronous backend load submission (ms)."
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
+  - name: "context_transfer_load_bandwidth_gbps"
+    documentation: "Context stage effective load bandwidth (GB/s)"
+    buckets: [0.5, 1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256]
+  - name: "context_transfer_load_duration_ms"
+    documentation: "End-to-end Context stage load task duration (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
+  - name: "context_transfer_load_queue_wait_duration_ms"
+    documentation: "Time a Cache load task spent queued before dispatch worker pickup (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
+  - name: "context_transfer_lookup_backend_duration_ms"
+    documentation: "Backend lookup wall-clock time when descending due to no buffer or buffer miss (ms)"
+    buckets: [0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "context_transfer_lookup_duration_ms"
+    documentation: "Context buffer lookup wall-clock time per `Lookup` / `LookupOnPrefix` call (ms)"
+    buckets: [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100]
+  - name: "context_transfer_shard_backend_wait_ms"
+    documentation: "Cache load per-shard time spent in WaitBackendTaskReady before H2D submit (ms). This is not a task-level duration."
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+
+
 
   # -- End-to-end connector metrics -----------------------------------------
   - name: "save_duration"

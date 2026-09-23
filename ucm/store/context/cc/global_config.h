@@ -1,0 +1,77 @@
+/**
+ * MIT License
+ *
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ * */
+#ifndef UNIFIEDCACHE_CONTEXT_STORE_CC_GLOBAL_CONFIG_H
+#define UNIFIEDCACHE_CONTEXT_STORE_CC_GLOBAL_CONFIG_H
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+#include "ucmstore_v1.h"
+
+#ifndef UCM_RUNTIME_ASCEND_SDMA_DIRECT
+#define UCM_RUNTIME_ASCEND_SDMA_DIRECT 0
+#endif
+
+namespace UC::Context {
+
+struct Config {
+    StoreV1* storeBackend{};
+    std::string uniqueId{};
+    int32_t deviceId{-1};
+    std::vector<size_t> tensorSizes{};
+    size_t shardSize{0};
+    size_t blockSize{0};
+    std::vector<ssize_t> cpuAffinityCores{};
+    size_t bufferCapacity{0};
+    bool shareBufferEnable{false};
+    size_t waitingQueueDepth{8192};
+    size_t runningQueueDepth{524288};
+    size_t timeoutMs{30000};
+    size_t streamNumber{4};
+    std::vector<uintptr_t> gpuKvBufferAddrs{};
+    std::vector<size_t> gpuKvBufferSizes{};
+    bool useGdr{false};
+    bool cacheIOAggregation{false};
+    bool cacheSdmaDirect{UCM_RUNTIME_ASCEND_SDMA_DIRECT};
+    size_t localRankSize{8};
+    size_t tpRank{0}, tpSize{1};
+    double alpha{0.01};
+    int64_t retention{-1};
+    size_t evictionLimit{64};
+
+    Detail::BlockId BackendKey(Detail::BlockId key) const
+    {
+        if (!shareBufferEnable)
+            for (size_t i = 0; i < sizeof(uint64_t); ++i) {
+                key[8 + i] ^= std::byte((uint64_t(tpRank) >> (8 * i)) & 255);
+            }
+        return key;
+    }
+    size_t EffectiveStreamNumber() const noexcept { return cacheSdmaDirect ? 1 : streamNumber; }
+};
+
+}  // namespace UC::Context
+
+#endif

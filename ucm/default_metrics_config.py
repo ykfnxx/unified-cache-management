@@ -13,6 +13,57 @@ from typing import Any
 # fmt: off
 _COUNTER_METRICS = [
     (
+        "context_transfer_load_shards_total",
+        "Total shards whose Context buffer state was inspected during load",
+    ),
+    (
+        "context_transfer_load_wait_shards_total",
+        "Shards whose Context buffer was not ready when acquired and required waiting",
+    ),
+    (
+        "context_transfer_load_backend_shards_total",
+        (
+            "Shards that descended to the backend on load (true cache miss at the "
+            "buffer-allocation stage; aka backend-load count)"
+        ),
+    ),
+    (
+        "context_transfer_load_success_shards_total",
+        "Shards successfully loaded from an already-ready Context buffer to device",
+    ),
+    (
+        "context_transfer_wait_load_success_shards_total",
+        "Shards copied to device after waiting for a shared shard to become ready; not a backend submission count",
+    ),
+    (
+        "context_transfer_load_failed_shards_total",
+        "Context load shards that did not complete device delivery",
+    ),
+    (
+        "context_transfer_dump_shards_total",
+        "Total shard descriptors processed by Context dump, including failed tasks",
+    ),
+    (
+        "context_transfer_load_queue_full_total",
+        "Number of Context load submissions rejected because the waiting queue was full",
+    ),
+    (
+        "context_transfer_dump_queue_full_total",
+        "Number of Context dump submissions rejected because the waiting queue was full",
+    ),
+    (
+        "context_transfer_backend_load_wait_errors_total",
+        "Number of Context load backend wait failures",
+    ),
+    (
+        "context_transfer_load_bytes_total",
+        "Total bytes loaded through the Context stage (per-task size summed)",
+    ),
+    (
+        "context_transfer_dump_bytes_total",
+        "Total bytes dumped through the Context stage (per-task size summed)",
+    ),
+    (
         "context_evict_blocks_total",
         "Logical blocks successfully evicted from ContextStore Memory (Dump plus Drop)",
     ),
@@ -461,38 +512,63 @@ _CONNECTOR_INTERFACE_DURATION_BUCKETS = [
 ]
 _HISTOGRAM_METRICS = [
     (
+        "context_transfer_load_duration_ms",
+        "End-to-end Context stage load task duration (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "context_transfer_dump_duration_ms",
+        "End-to-end Context stage dump task duration (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "context_transfer_load_bandwidth_gbps",
+        "Context stage effective load bandwidth (GB/s)",
+        [0.5, 1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256],
+    ),
+    (
+        "context_transfer_dump_bandwidth_gbps",
+        "Context stage effective dump bandwidth (GB/s)",
+        [0.5, 1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256],
+    ),
+    (
+        "context_transfer_load_queue_wait_duration_ms",
+        "Time a Context load task spent queued before dispatch worker pickup (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "context_transfer_dump_queue_wait_duration_ms",
+        "Time a Context dump task spent queued before dispatch worker pickup (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "context_transfer_load_backend_submit_duration_ms",
+        (
+            "Context load backend submit duration: buffer allocation plus synchronous "
+            "backend load submission (ms)."
+        ),
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "context_transfer_shard_backend_wait_ms",
+        (
+            "Context load per-shard time spent in WaitBackendTaskReady before H2D submit "
+            "(ms). This is not a task-level duration."
+        ),
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "context_transfer_h2d_sync_ms",
+        (
+            "Context load residual H2D stream drain after the last shard submit (ms). "
+            "Large => H2D copy is the bottleneck; ~0 with large "
+            "cache_shard_backend_wait_ms => storage read is the bottleneck."
+        ),
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
         "context_observe_duration_ms",
         "ContextStore non-deduplicated ObserveRequest duration including lock wait (ms)",
-        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000],
-    ),
-    (
-        "context_load_prepare_queue_wait_ms",
-        "ContextStore Load submission to prepare start (ms)",
-        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000],
-    ),
-    (
-        "context_load_prepare_duration_ms",
-        "ContextStore Load preparation including lookup, eviction, admission, MLA readiness and transfer queue backpressure (ms)",
-        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000],
-    ),
-    (
-        "context_load_mla_ready_wait_ms",
-        "ContextStore MLA reader time waiting for ready blocks per Load task (ms)",
-        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000],
-    ),
-    (
-        "context_load_mla_completion_wait_ms",
-        "ContextStore MLA owner time waiting for readers after local H2D sync (ms)",
-        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000],
-    ),
-    (
-        "context_load_first_h2d_ms",
-        "ContextStore Load submission to first successful H2D submission (ms)",
-        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000],
-    ),
-    (
-        "context_load_h2d_sync_ms",
-        "ContextStore Load final H2D stream synchronization time (ms), not total DMA duration",
         [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 5000, 30000],
     ),
     (

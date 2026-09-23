@@ -108,10 +108,10 @@ public:
         streams_.clear();
         auto stream = device.MakeSdmaDirectStream();
         if (!stream) [[unlikely]] {
-            UC_ERROR("Failed to make Context SDMA Direct stream on device({}).", deviceId);
+            UC_ERROR("Failed to make Cache SDMA Direct stream on device({}).", deviceId);
             return Status::Error();
         }
-        // Context SDMA Direct intentionally uses one stream for stable performance.
+        // Cache SDMA Direct intentionally uses one stream for stable performance.
         streams_.push_back(std::move(stream));
         deviceId_ = deviceId;
         streamNumber_ = streams_.size();

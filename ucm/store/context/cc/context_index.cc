@@ -80,6 +80,8 @@ Status ContextIndex::Observe(const std::vector<Key>& path, uint64_t timestamp)
 {
     std::optional<Key> parent;
     std::set<Key> seen;
+    std::vector<Node*> nodes;
+    nodes.reserve(path.size());
     for (const auto& id : path) {
         auto found = nodes_.find(id);
         if (found != nodes_.end()) {
@@ -91,26 +93,40 @@ Status ContextIndex::Observe(const std::vector<Key>& path, uint64_t timestamp)
         } else if (!seen.insert(id).second) {
             return Status::InvalidParam("repeated block in prefix");
         }
+        nodes.push_back(found == nodes_.end() ? nullptr : &found->second);
         parent = id;
     }
     // Finish topology changes before collecting segment IDs: Add can split a segment.
     parent.reset();
-    for (const auto& id : path) {
-        if (!nodes_.count(id)) { Add(id, parent); }
-        parent = id;
-    }
-    std::set<size_t> touched;
-    for (const auto& id : path) {
-        auto& n = nodes_.at(id);
-        if (n.resident) {
-            if (touched.insert(n.segment).second) { Unpublish(n.segment); }
-            segments_.at(n.segment).members.erase({n.sequence, id});
+    for (size_t i = 0; i < path.size(); ++i) {
+        if (!nodes[i]) {
+            Add(path[i], parent);
+            nodes[i] = &nodes_.at(path[i]);
         }
-        n.sequence = ++sequence_;
-        n.timestamp = timestamp;
-        if (n.resident) { segments_.at(n.segment).members.insert({n.sequence, id}); }
+        parent = path[i];
     }
-    for (auto segment : touched) { Publish(segment); }
+    // A validated prefix visits each segment contiguously. Reuse set nodes
+    // when changing recency instead of allocating one per resident block.
+    std::optional<size_t> touched;
+    for (size_t i = 0; i < path.size(); ++i) {
+        auto& n = *nodes[i];
+        if (n.resident) {
+            if (touched != n.segment) {
+                if (touched) { Publish(*touched); }
+                Unpublish(n.segment);
+                touched = n.segment;
+            }
+            auto& members = segments_.at(n.segment).members;
+            auto member = members.extract({n.sequence, path[i]});
+            n.sequence = ++sequence_;
+            member.value().first = n.sequence;
+            members.insert(std::move(member));
+        } else {
+            n.sequence = ++sequence_;
+        }
+        n.timestamp = timestamp;
+    }
+    if (touched) { Publish(*touched); }
     return Status::OK();
 }
 void ContextIndex::ChangeAncestors(const Key& id, bool insert)

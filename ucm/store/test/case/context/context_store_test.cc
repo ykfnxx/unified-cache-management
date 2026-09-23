@@ -32,10 +32,8 @@
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
-#include "buffer_pool.h"
 #include "context_index.h"
 #include "metrics_api.h"
-#include "shared_metadata.h"
 #include "ucmstore_v1.h"
 extern "C" UC::StoreV1* MakeContextStore();
 namespace {
@@ -162,108 +160,6 @@ protected:
         return status;
     }
 };
-TEST_F(ContextStoreTest, RejectedSubmitRollsBackReferencesAndRetiredResidentStillLoads)
-{
-    Open();
-    Observe({1});
-    std::array<unsigned char, 64> output{};
-    auto rejected = store->Load({
-        {Id(1),  0, {output.data()}},
-        {Id(1),  0, {output.data()}},
-        {Id(99), 0, {output.data()}}
-    });
-    ASSERT_FALSE(rejected);
-    EXPECT_EQ(rejected.Error(), Status::InvalidParam());
-    ASSERT_TRUE(store->ObserveRequest("1", 2, 2, {}).Success());
-    EXPECT_EQ(store->ContextStats()["topology_nodes"], 0);
-    Observe({2}, 3);
-    ASSERT_TRUE(Dump(2).Success());
-    ASSERT_TRUE(store->ObserveRequest("2", 4, 4, {}).Success());
-    EXPECT_TRUE(Load(2).Success());
-}
-TEST_F(ContextStoreTest, ShardOrderMatchesCacheWithSmallTransferQueue)
-{
-    Detail::Dictionary config;
-    config.Set("unique_id", "shard_order_" + std::to_string(getpid()));
-    config.Set<StoreV1*>("store_backend", &backend);
-    config.SetNumber("device_id", 1);
-    config.SetNumber("local_rank_size", 2);
-    config.SetNumber("running_queue_depth", 2);
-    config.SetNumber("cache_stream_number", 1);
-    config.SetNumber("block_size", 384);
-    config.SetNumber("shard_size", 64);
-    config.SetNumber("tensor_size", 64);
-    config.SetNumber("context_memory_capacity_bytes", 384);
-    store.reset(MakeContextStore());
-    ASSERT_TRUE(store->Setup(config).Success());
-    Observe({1});
-    for (size_t layer = 0; layer < 6; ++layer) { ASSERT_TRUE(Dump(1, layer, layer + 1).Success()); }
-    // CPU-simu + one stream permits observing the submission order via one destination.
-    // Cache rank/device 1 with local size 2 submits rows 1,3,5,0,2,4.
-    std::array<unsigned char, 64> output{};
-    for (unsigned repeat = 0; repeat < 20; ++repeat) {
-        Detail::TaskDesc desc;
-        for (size_t layer = 0; layer < 6; ++layer) {
-            desc.push_back({Id(1), layer, {output.data()}});
-        }
-        auto task = store->Load(std::move(desc));
-        ASSERT_TRUE(task);
-        ASSERT_TRUE(store->Wait(task.Value()).Success());
-        EXPECT_EQ(output[0], 5);
-    }
-    // Multiple non-contiguous shard items must release exactly one block reference.
-    Observe({2});
-    EXPECT_TRUE(Dump(2).Success());
-}
-TEST_F(ContextStoreTest, BatchedReadmissionRollsBackAndRetries)
-{
-    Open(70, -1, 2);
-    std::vector<Key> path;
-    std::vector<std::array<unsigned char, 64>> output(70);
-    Detail::TaskDesc desc;
-    for (unsigned i = 1; i <= 70; ++i) {
-        path.push_back(Id(i));
-        for (size_t shard = 0; shard < 2; ++shard) { backend.data[{Id(i), shard}].fill(i); }
-        desc.push_back({Id(i), 0, {output[i - 1].data()}});
-    }
-    ASSERT_TRUE(store->ObserveRequest("batch", 1, 1, path).Success());
-    backend.failLoad = true;
-    auto failed = store->Load(desc);
-    ASSERT_TRUE(failed);
-    EXPECT_TRUE(store->Wait(failed.Value()).Failure());
-    EXPECT_EQ(store->ContextStats()["memory_blocks"], 0);
-    EXPECT_EQ(backend.loads, 1);
-    backend.failLoad = false;
-    backend.loads = backend.lookups = 0;
-    backend.beforeLoad = [&] {
-        if (backend.loads == 1) { backend.failLoad = true; }
-    };
-    auto partial = store->Load(desc);
-    ASSERT_TRUE(partial);
-    EXPECT_TRUE(store->Wait(partial.Value()).Failure());
-    EXPECT_EQ(store->ContextStats()["memory_blocks"], 32);
-    EXPECT_EQ(backend.loads, 2);
-    size_t completed = 0;
-    for (size_t slice = 0; slice < 8; ++slice) {
-        for (size_t i = slice; i < output.size(); i += 8) {
-            EXPECT_EQ(output[i][0], completed++ < 32 ? i + 1 : 0);
-        }
-    }
-    backend.beforeLoad = nullptr;
-    backend.failLoad = false;
-    backend.loads = backend.lookups = 0;
-    auto task = store->Load(desc);
-    ASSERT_TRUE(task);
-    ASSERT_TRUE(store->Wait(task.Value()).Success());
-    EXPECT_EQ(backend.lookups, 1);
-    EXPECT_EQ(backend.loads, 2);
-    EXPECT_EQ(store->ContextStats()["backend_load_shards"], 140);
-    for (size_t i = 0; i < output.size(); ++i) {
-        EXPECT_TRUE(std::all_of(output[i].begin(), output[i].end(),
-                                [i](unsigned char b) { return b == i + 1; }));
-    }
-}
-
 TEST_F(ContextStoreTest, MetricsCountCompletedBlockEvictions)
 {
     Metrics::SetUp();
@@ -291,7 +187,8 @@ TEST_F(ContextStoreTest, MetricsCountCompletedBlockEvictions)
     ASSERT_TRUE(Dump(2, 0).Success());
     ASSERT_TRUE(Dump(2, 1).Success());
     check(1, 1, 0);  // Both layers form one logical block.
-    ASSERT_TRUE(Load(1).Success());
+    ASSERT_TRUE(Load(1, 0).Success());
+    ASSERT_TRUE(Load(1, 1).Success());
     check(1, 1, 0);  // Admission can also trigger an eviction.
     Observe({3}, 3);
     ASSERT_TRUE(Dump(3, 0).Success());
@@ -304,171 +201,6 @@ TEST_F(ContextStoreTest, MetricsCountCompletedBlockEvictions)
     check(0, 0, 0);  // Collection drains deltas, without counting them twice.
 }
 
-TEST_F(ContextStoreTest, H2dStartsBeforeLaterBlockAdmissionCompletes)
-{
-    Metrics::SetUp();
-    Metrics::CreateStats("context_load_first_h2d_ms", "histogram", {1, 1000});
-    Open(2);
-    Observe({1});
-    ASSERT_TRUE(Dump(1).Success());
-    Observe({2});
-    backend.data[{Id(2), 0}].fill(83);
-    std::promise<void> entered, unblock;
-    auto enteredFuture = entered.get_future();
-    auto released = unblock.get_future().share();
-    backend.beforeLoad = [&] {
-        entered.set_value();
-        released.wait();
-    };
-    std::array<unsigned char, 64> first{}, second{};
-    auto task = store->Load(Detail::TaskDesc{
-        Detail::Shard{Id(1), 0, {first.data()} },
-        Detail::Shard{Id(2), 0, {second.data()}}
-    });
-    ASSERT_TRUE(bool(task));
-    auto preparing = enteredFuture.wait_for(std::chrono::seconds(2));
-    bool submitted = false;
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (preparing == std::future_status::ready && !submitted &&
-           std::chrono::steady_clock::now() < deadline) {
-        auto histograms = std::get<2>(Metrics::GetAllStatsAndClear());
-        auto it = histograms.find("context_load_first_h2d_ms");
-        submitted = it != histograms.end() &&
-                    std::accumulate(it->second.bucketCounts.begin(), it->second.bucketCounts.end(),
-                                    uint64_t(0)) > 0;
-        if (!submitted) { std::this_thread::yield(); }
-    }
-    // Always unblock before assertions so a regression cannot hang store destruction.
-    unblock.set_value();
-    EXPECT_EQ(preparing, std::future_status::ready);
-    EXPECT_TRUE(submitted);
-    ASSERT_TRUE(store->Wait(task.Value()).Success());
-    for (auto value : first) { EXPECT_EQ(value, 71); }
-    for (auto value : second) { EXPECT_EQ(value, 83); }
-}
-TEST_F(ContextStoreTest, PartialPrepareFailureDrainsEarlierCopies)
-{
-    Open(2);
-    Observe({1});
-    ASSERT_TRUE(Dump(1).Success());
-    Observe({2});
-    std::array<unsigned char, 64> first{}, second{};
-    auto task = store->Load(Detail::TaskDesc{
-        Detail::Shard{Id(1), 0, {first.data()} },
-        Detail::Shard{Id(2), 0, {second.data()}}
-    });
-    ASSERT_TRUE(bool(task));
-    EXPECT_EQ(store->Wait(task.Value()), Status::NotFound());
-    for (auto value : first) { EXPECT_EQ(value, 71); }
-    for (auto value : second) { EXPECT_EQ(value, 0); }
-    // No leaked local read references after the failed task.
-    ASSERT_TRUE(Dump(2).Success());
-    Observe({3});
-    ASSERT_TRUE(Dump(3).Success());
-}
-TEST_F(ContextStoreTest, OversizedLoadFailsBeforeEviction)
-{
-    Open(1);
-    Observe({1});
-    ASSERT_TRUE(Dump(1).Success());
-    Observe({2});
-    std::array<unsigned char, 64> first{}, second{};
-    auto task = store->Load(Detail::TaskDesc{
-        Detail::Shard{Id(1), 0, {first.data()} },
-        Detail::Shard{Id(2), 0, {second.data()}}
-    });
-    ASSERT_FALSE(bool(task));
-    EXPECT_EQ(task.Error(), Status::NoSpace());
-    EXPECT_NE(task.Error().ToString().find("load requires 2 blocks; Memory holds 1"),
-              std::string::npos);
-    EXPECT_EQ(store->ContextStats()["evicted_blocks"], 0);
-    EXPECT_TRUE(Found(1));
-}
-TEST_F(ContextStoreTest, MlaReaderRegistersBeforeFirstLoad)
-{
-    const auto id = "early_reader_" + std::to_string(getpid());
-    Detail::Dictionary config;
-    config.Set("unique_id", id);
-    config.Set<StoreV1*>("store_backend", &backend);
-    config.Set("share_buffer_enable", true);
-    config.SetNumber("context_tp_size", 2);
-    config.SetNumber("block_size", 64);
-    config.SetNumber("shard_size", 64);
-    config.SetNumber("tensor_size", 64);
-    config.SetNumber("context_memory_capacity_bytes", 64);
-    config.SetNumber("timeout_ms", 2000);
-    config.SetNumber("device_id", 1);
-    config.SetNumber("context_tp_rank", 1);
-    std::unique_ptr<StoreV1> reader(MakeContextStore());
-    ASSERT_TRUE(reader->Setup(config).Success());  // No owner exists yet.
-    auto ownerConfig = config;
-    ownerConfig.SetNumber("device_id", 0);
-    ownerConfig.SetNumber("context_tp_rank", 0);
-    store.reset(MakeContextStore());
-    ASSERT_TRUE(store->Setup(ownerConfig).Success());
-    // Existing mappings survive unlink. A lazy first-Load mapping would now fail.
-    ASSERT_EQ(shm_unlink(("/ucm_context_" + id + "_mla_memory").c_str()), 0);
-    Observe({1});
-    ASSERT_TRUE(Dump(1).Success());
-    std::array<unsigned char, 64> ownerOut{}, readerOut{};
-    auto ownerTask = store->Load({
-        Detail::Shard{Id(1), 0, {ownerOut.data()}}
-    });
-    auto readerTask = reader->Load({
-        Detail::Shard{Id(1), 0, {readerOut.data()}}
-    });
-    ASSERT_TRUE(bool(ownerTask));
-    ASSERT_TRUE(bool(readerTask));
-    EXPECT_TRUE(reader->Wait(readerTask.Value()).Success());
-    EXPECT_TRUE(store->Wait(ownerTask.Value()).Success());
-    EXPECT_EQ(ownerOut, readerOut);
-}
-TEST_F(ContextStoreTest, MlaReadReleasesRepeatedBlockShardsAcrossBatches)
-{
-    Detail::Dictionary config;
-    auto id = "repeated_shards_" + std::to_string(getpid());
-    config.Set("unique_id", id);
-    config.Set<StoreV1*>("store_backend", &backend);
-    config.Set("share_buffer_enable", true);
-    config.SetNumber("context_tp_size", 2);
-    config.SetNumber("block_size", 128);
-    config.SetNumber("shard_size", 64);
-    config.SetNumber("tensor_size", 64);
-    config.SetNumber("context_memory_capacity_bytes", 128);
-    config.SetNumber("timeout_ms", 2000);
-    config.SetNumber("device_id", 0);
-    store.reset(MakeContextStore());
-    ASSERT_TRUE(store->Setup(config).Success());
-    config.SetNumber("device_id", 1);
-    config.SetNumber("context_tp_rank", 1);
-    std::unique_ptr<StoreV1> reader(MakeContextStore());
-    ASSERT_TRUE(reader->Setup(config).Success());
-    Observe({1});
-    ASSERT_TRUE(Dump(1, 0, 11).Success());
-    ASSERT_TRUE(Dump(1, 1, 22).Success());
-    std::array<std::array<unsigned char, 64>, 40> ownerOut{}, readerOut{};
-    Detail::TaskDesc ownerDesc, readerDesc;
-    for (size_t i = 0; i < ownerOut.size(); ++i) {
-        ownerDesc.push_back({Id(1), i % 2, {ownerOut[i].data()}});
-        readerDesc.push_back({Id(1), i % 2, {readerOut[i].data()}});
-    }
-    auto ownerTask = store->Load(std::move(ownerDesc));
-    auto readerTask = reader->Load(std::move(readerDesc));
-    ASSERT_TRUE(ownerTask);
-    ASSERT_TRUE(readerTask);
-    ASSERT_TRUE(reader->Wait(readerTask.Value()).Success());
-    ASSERT_TRUE(store->Wait(ownerTask.Value()).Success());
-    for (size_t i = 0; i < ownerOut.size(); ++i) {
-        EXPECT_EQ(readerOut[i], ownerOut[i]);
-        EXPECT_TRUE(std::all_of(readerOut[i].begin(), readerOut[i].end(),
-                                [i](auto b) { return b == (i % 2 ? 22 : 11); }));
-    }
-    Context::SharedMetadata leases;
-    ASSERT_TRUE(leases.Setup(id + "_mla", false).Success());
-    auto available = leases.Lookup(nullptr, 0);  // Establish the watcher mapping.
-    ASSERT_TRUE(available);
-    EXPECT_TRUE(leases.Evictable(Id(1)));
-}
 TEST_F(ContextStoreTest, RepeatedObservationRefreshesRecencyAndRetiresReferences)
 {
     Open(2, 10);
@@ -499,206 +231,6 @@ TEST(ContextIndexTest, RejectsRepeatedExistingAndNewNodes)
     EXPECT_EQ(tree.Size(), 2);
     EXPECT_TRUE(tree.Observe({Id(1), Id(2)}, 3).Success());
 }
-TEST(ContextBufferTest, RanksCanInitializeSharedPayloadConcurrently)
-{
-    std::array<Context::BufferPool, 4> pools;
-    std::array<std::future<Status>, 4> initialized;
-    const auto name = "parallel_payload_" + std::to_string(getpid());
-    for (size_t rank = 0; rank < pools.size(); ++rank) {
-        initialized[rank] = std::async(std::launch::async, [&, rank] {
-            return pools[rank].SetupShared(name, rank, 8, 4096, rank == 0, false);
-        });
-    }
-    for (auto& result : initialized) { ASSERT_TRUE(result.get().Success()); }
-    std::memset(pools[0].Data(7), 97, 4096);
-    for (size_t rank = 0; rank < pools.size(); ++rank) {
-        EXPECT_EQ(static_cast<unsigned char*>(pools[rank].Data(7))[4095], 97);
-        EXPECT_EQ(pools[rank].FreeCount(), rank == 0 ? 8 : 0);
-    }
-}
-TEST(ContextBufferTest, ReaderCreatedPayloadIsNotTruncatedByOwner)
-{
-    Context::BufferPool reader, owner, mismatch;
-    auto name = "reader_payload_" + std::to_string(getpid());
-    ASSERT_TRUE(reader.SetupShared(name, 1, 1, 64, false, false).Success());
-    EXPECT_EQ(reader.FreeCount(), 0);
-    std::memset(reader.Data(0), 83, 64);
-    ASSERT_TRUE(owner.SetupShared(name, 0, 1, 64, true, false).Success());
-    EXPECT_EQ(owner.FreeCount(), 1);
-    EXPECT_EQ(static_cast<unsigned char*>(owner.Data(0))[0], 83);
-    EXPECT_EQ(mismatch.SetupShared(name, 2, 1, 128, false, false), Status::InvalidParam());
-    EXPECT_EQ(static_cast<unsigned char*>(owner.Data(0))[0], 83);
-}
-TEST_F(ContextStoreTest, MlaCompletedBatchReleasesSlotsBehindPendingBatch)
-{
-    Detail::Dictionary config;
-    config.Set("unique_id", "release_order_" + std::to_string(getpid()));
-    config.Set<StoreV1*>("store_backend", &backend);
-    config.Set("share_buffer_enable", true);
-    config.SetNumber("context_tp_size", 2);
-    config.SetNumber("block_size", 64);
-    config.SetNumber("shard_size", 64);
-    config.SetNumber("tensor_size", 64);
-    config.SetNumber("context_memory_capacity_bytes", 128);
-    config.SetNumber("waiting_queue_depth", 2);
-    config.SetNumber("timeout_ms", 5000);
-    config.SetNumber("device_id", 0);
-    config.SetNumber("context_tp_rank", 0);
-    store.reset(MakeContextStore());
-    ASSERT_TRUE(store->Setup(config).Success());
-    config.SetNumber("device_id", 1);
-    config.SetNumber("context_tp_rank", 1);
-    std::unique_ptr<StoreV1> reader(MakeContextStore());
-    ASSERT_TRUE(reader->Setup(config).Success());
-    Observe({1, 2, 3});
-    ASSERT_TRUE(Dump(1, 0, 11).Success());
-    ASSERT_TRUE(Dump(2, 0, 22).Success());
-    ASSERT_TRUE(Load(1, 0, 11).Success());
-    ASSERT_TRUE(Load(2, 0, 22).Success());
-    std::array<unsigned char, 64> output{};
-    auto read = [&](unsigned key, unsigned char value) {
-        auto task = reader->Load({
-            {Id(key), 0, {output.data()}}
-        });
-        ASSERT_TRUE(task);
-        ASSERT_TRUE(reader->Wait(task.Value()).Success());
-        for (auto byte : output) { EXPECT_EQ(byte, value); }
-    };
-    read(2, 22);
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-    Status saved = Status::NoSpace();
-    do {
-        saved = Dump(3, 0, 33);
-        if (saved.Success()) { break; }
-        ASSERT_EQ(saved, Status::NoSpace());
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    } while (std::chrono::steady_clock::now() < deadline);
-    ASSERT_TRUE(saved.Success()) << saved.ToString();
-    ASSERT_TRUE(Load(3, 0, 33).Success());
-    read(3, 33);  // The small completion queue continues to make progress.
-    read(1, 11);  // The pending batch's slot was never reclaimed early.
-    ASSERT_TRUE(Load(1, 0, 11).Success());
-    // Shutdown must drain a pending completion without waiting for its 5s deadline.
-    auto stopped = std::async(std::launch::async, [&] { store.reset(); });
-    EXPECT_EQ(stopped.wait_for(std::chrono::seconds(1)), std::future_status::ready);
-    stopped.get();
-}
-TEST_F(ContextStoreTest, MlaReaderCompletionDoesNotBlockNextLayerH2d)
-{
-    Metrics::SetUp();
-    Metrics::CreateStats("context_load_h2d_sync_ms", "histogram", {1000000});
-    Detail::Dictionary config;
-    config.Set("unique_id", "layers_" + std::to_string(getpid()));
-    config.Set<StoreV1*>("store_backend", &backend);
-    config.Set("share_buffer_enable", true);
-    config.SetNumber("context_tp_size", 2);
-    config.SetNumber("block_size", 128);
-    config.SetNumber("shard_size", 64);
-    config.SetNumber("tensor_size", 64);
-    config.SetNumber("context_memory_capacity_bytes", 128);
-    config.SetNumber("timeout_ms", 5000);
-    config.SetNumber("device_id", 0);
-    config.SetNumber("context_tp_rank", 0);
-    store.reset(MakeContextStore());
-    ASSERT_TRUE(store->Setup(config).Success());
-    config.SetNumber("device_id", 1);
-    config.SetNumber("context_tp_rank", 1);
-    std::unique_ptr<StoreV1> reader(MakeContextStore());
-    ASSERT_TRUE(reader->Setup(config).Success());
-    Observe({1});
-    ASSERT_TRUE(Dump(1, 0, 11).Success());
-    ASSERT_TRUE(Dump(1, 1, 22).Success());
-    Metrics::GetAllStatsAndClear();
-    std::array<std::array<unsigned char, 64>, 2> ownerOut{}, readerOut{};
-    std::vector<size_t> ownerTasks;
-    for (size_t layer = 0; layer < 2; ++layer) {
-        auto task = store->Load({
-            Detail::Shard{Id(1), layer, {ownerOut[layer].data()}}
-        });
-        ASSERT_TRUE(task);
-        ownerTasks.push_back(task.Value());
-    }
-    uint64_t synced = 0;
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (synced < 2 && std::chrono::steady_clock::now() < deadline) {
-        auto histograms = std::get<2>(Metrics::GetAllStatsAndClear());
-        auto it = histograms.find("context_load_h2d_sync_ms");
-        if (it != histograms.end()) {
-            synced += std::accumulate(it->second.bucketCounts.begin(),
-                                      it->second.bucketCounts.end(), uint64_t(0));
-        }
-        std::this_thread::yield();
-    }
-    for (auto task : ownerTasks) {
-        auto ready = store->Check(task);
-        while (ready && !ready.Value() && std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::yield();
-            ready = store->Check(task);
-        }
-        EXPECT_TRUE(ready && ready.Value());
-    }
-    // Join readers even on a regression, before asserting the overlap result.
-    for (size_t layer = 0; layer < 2; ++layer) {
-        auto task = reader->Load({
-            Detail::Shard{Id(1), layer, {readerOut[layer].data()}}
-        });
-        ASSERT_TRUE(task);
-        EXPECT_TRUE(reader->Wait(task.Value()).Success());
-        EXPECT_TRUE(store->Wait(ownerTasks[layer]).Success());
-        EXPECT_EQ(ownerOut[layer], readerOut[layer]);
-    }
-    EXPECT_EQ(synced, 2);
-}
-
-TEST_F(ContextStoreTest, SharedMlaLeasePreventsEviction)
-{
-    Open(1, -1, 1, true);
-    Observe({1});
-    ASSERT_TRUE(Dump(1).Success());
-    Context::SharedMetadata peer;
-    ASSERT_TRUE(peer.Setup(name + "_mla", false).Success());
-    uint64_t layout = 1469598103934665603ULL ^ 1;
-    for (size_t value : {64, 64, 1, 64}) { layout = (layout ^ uint64_t(value)) * 1099511628211ULL; }
-    EXPECT_FALSE(bool(peer.Acquire(Id(1), layout + 1)));
-    auto lease = peer.Acquire(Id(1), layout);
-    ASSERT_TRUE(bool(lease));
-    EXPECT_EQ(lease.Value().slot, 0);
-    Observe({2});
-    EXPECT_EQ(Dump(2), Status::NoSpace());
-    EXPECT_TRUE(Found(1));
-    peer.Release(Id(1));
-    ASSERT_TRUE(Dump(2).Success());
-    lease = peer.Acquire(Id(1), layout);
-    EXPECT_FALSE(bool(lease));
-    EXPECT_EQ(store->ContextStats()["backend_dump_bytes"], 64);
-    ASSERT_TRUE(Load(1).Success());
-}
-
-TEST_F(ContextStoreTest, SharedMlaEvictionReservationExcludesReaders)
-{
-    Context::SharedMetadata owner, peer;
-    std::string id = "lease_" + std::to_string(getpid());
-    ASSERT_TRUE(owner.Setup(id, true, 8, 123).Success());
-    ASSERT_TRUE(peer.Setup(id, false).Success());
-    ASSERT_TRUE(owner.Publish(Id(1), 1, 4).Success());
-    ASSERT_TRUE(owner.Publish(Id(2), 1, 5).Success());
-    ASSERT_TRUE(bool(peer.Acquire(Id(2), 123)));
-    EXPECT_FALSE(owner.ReserveEviction({Id(1), Id(2)}));
-    // Failed reservation is atomic: it must not leave the first entry busy.
-    ASSERT_TRUE(bool(peer.Acquire(Id(1), 123)));
-    peer.Release(Id(1));
-    peer.Release(Id(2));
-    ASSERT_TRUE(owner.ReserveEviction({Id(1), Id(2)}));
-    EXPECT_FALSE(bool(peer.Acquire(Id(1), 123)));
-    ASSERT_TRUE(owner.Publish(Id(1), 1, 6).Success());
-    auto lease = peer.Acquire(Id(1), 123);
-    ASSERT_TRUE(bool(lease));
-    EXPECT_EQ(lease.Value().slot, 6);
-    peer.Release(Id(1));
-    owner.Deactivate();
-    EXPECT_FALSE(bool(peer.Acquire(Id(1), 123)));
-}
-
 TEST_F(ContextStoreTest, WritesOnlyOnEvictionAndReadmitsBackendBytes)
 {
     Open();
@@ -761,7 +293,7 @@ TEST_F(ContextStoreTest, WholeBlockReadinessAndNoSpace)
     Observe({1});
     ASSERT_TRUE(Dump(1, 0).Success());
     EXPECT_FALSE(Found(1));
-    EXPECT_TRUE(Load(1).Failure());
+    ASSERT_TRUE(Load(1).Success());
     Observe({2});
     EXPECT_EQ(Dump(2), Status::NoSpace());
     ASSERT_TRUE(Dump(1, 1, 83).Success());
@@ -788,25 +320,6 @@ TEST_F(ContextStoreTest, BackendReadmissionPreservesAlreadySavedLayers)
     ASSERT_TRUE(Load(1, 1, 83).Success());
     ASSERT_TRUE(Load(1, 0, 99).Success());
     EXPECT_EQ(store->ContextStats()["backend_load_shards"], 1);
-}
-TEST_F(ContextStoreTest, BackendFailurePreservesVictimAndReadmissionRetries)
-{
-    Open(1, -1, 1, true);
-    Observe({1});
-    ASSERT_TRUE(Dump(1).Success());
-    Observe({2});
-    backend.failDump = true;
-    EXPECT_TRUE(Dump(2).Failure());
-    EXPECT_TRUE(Found(1));
-    ASSERT_TRUE(Load(1).Success());
-    backend.failDump = false;
-    ASSERT_TRUE(Dump(2).Success());
-    backend.failLoad = true;
-    EXPECT_TRUE(Load(1).Failure());
-    EXPECT_EQ(store->ContextStats()["memory_blocks"], 0);
-    backend.failLoad = false;
-    ASSERT_TRUE(Load(1).Success());
-    EXPECT_EQ(store->ContextStats()["memory_blocks"], 1);
 }
 TEST_F(ContextStoreTest, WatcherWorksInAnotherProcessAndOwnerCloses)
 {
@@ -854,41 +367,7 @@ TEST(ContextIndexTest, CandidateDepthBudgetAndBranchMerge)
     tree.Prune(Id(4), [](const Key&) { return false; });
     EXPECT_EQ(tree.Select(4, 2, eligible).blocks, (std::vector<Key>{Id(2), Id(3)}));
 }
-}  // namespace
 
-namespace {
-TEST_F(ContextStoreTest, MissingContextAndPartialFailureNeverPublishData)
-{
-    Open(1, -1, 2);
-    EXPECT_TRUE(Dump(1).Failure());
-    Observe({1});
-    std::array<unsigned char, 64> input{};
-    auto invalid = store->Dump(Detail::TaskDesc{
-        Detail::Shard{Id(1), 2, {input.data()}}
-    });
-    EXPECT_FALSE(bool(invalid));
-    EXPECT_FALSE(Found(1));
-    ASSERT_TRUE(Dump(1, 0).Success());
-    ASSERT_TRUE(Dump(1, 1).Success());
-    EXPECT_TRUE(Found(1));
-}
-TEST_F(ContextStoreTest, RetiringRequestDoesNotInvalidateQueuedTransfer)
-{
-    Open();
-    ASSERT_TRUE(store->ObserveRequest("request", 1, 1, {Id(1)}).Success());
-    std::array<unsigned char, 64> input{};
-    auto task = store->Dump(Detail::TaskDesc{
-        Detail::Shard{Id(1), 0, {input.data()}}
-    });
-    ASSERT_TRUE(bool(task));
-    ASSERT_TRUE(store->ObserveRequest("request", 0, 0, {}).Success());
-    ASSERT_TRUE(store->Wait(task.Value()).Success());
-    EXPECT_TRUE(Found(1));
-    EXPECT_EQ(store->ContextStats()["topology_nodes"], 1);
-    ASSERT_TRUE(store->ObserveRequest("ghost", 1, 2, {Id(9), Id(10)}).Success());
-    ASSERT_TRUE(store->ObserveRequest("ghost", 0, 0, {}).Success());
-    EXPECT_EQ(store->ContextStats()["topology_nodes"], 1);
-}
 TEST_F(ContextStoreTest, WatcherExitDoesNotRemoveOwnerAndLookupDoesNotPin)
 {
     Open(1, 0);
@@ -923,9 +402,7 @@ TEST(ContextIndexTest, ProtectedTailAndDeterministicTies)
     EXPECT_TRUE(tree.Observe({Id(4), Id(2)}, 3).Failure());
     EXPECT_FALSE(tree.Contains(Id(4)));
 }
-}  // namespace
 
-namespace {
 TEST(ContextIndexTest, IncrementalIndexMatchesTreeScan)
 {
     struct Node {
@@ -1029,230 +506,246 @@ TEST(ContextIndexTest, IncrementalIndexMatchesTreeScan)
         }
     }
 }
-}  // namespace
 
-namespace {
-TEST(ContextMetadataTest, ProbeChainsSurviveCollisionsAndChurn)
+TEST_F(ContextStoreTest, DuplicateDumpsDoNotCompleteMissingLayers)
 {
-    Context::SharedMetadata metadata;
-    ASSERT_TRUE(metadata.Setup("churn_" + std::to_string(getpid()), true, 7, 1).Success());
-    std::vector<Key> collisions;
-    for (unsigned i = 0; i < 256 && collisions.size() < 5; ++i) {
-        if (Detail::BlockIdHasher{}(Id(i)) % 7 == 6) { collisions.push_back(Id(i)); }
-    }
-    ASSERT_EQ(collisions.size(), 5);
-    for (size_t round = 0; round < 100; ++round) {
-        for (size_t i = 0; i < collisions.size(); ++i) {
-            ASSERT_TRUE(metadata.Publish(collisions[i], 1, i).Success());
-        }
-        // Pin the entry that deletion will shift across the table boundary.
-        ASSERT_TRUE(bool(metadata.Acquire(collisions[4], 1)));
-        ASSERT_TRUE(metadata.Publish(collisions[1], 0).Success());
-        ASSERT_TRUE(metadata.Publish(collisions[0], 0).Success());
-        auto found = metadata.Lookup(collisions.data(), collisions.size());
-        ASSERT_TRUE(bool(found));
-        EXPECT_EQ(found.Value(), (std::vector<uint8_t>{0, 0, 1, 1, 1}));
-        EXPECT_FALSE(metadata.Evictable(collisions[4]));
-        metadata.Release(collisions[4]);
-        for (size_t i = 2; i < collisions.size(); ++i) {
-            auto held = metadata.Acquire(collisions[i], 1);
-            ASSERT_TRUE(bool(held));
-            EXPECT_EQ(held.Value().slot, i);
-            metadata.Release(collisions[i]);
-            ASSERT_TRUE(metadata.Publish(collisions[i], 0).Success());
-        }
-    }
-}
-TEST(ContextMetadataTest, NonblockingCompletionHonorsDeadlineAndFailure)
-{
-    Context::SharedMetadata owner, peer;
-    ASSERT_TRUE(owner.Setup("poll_" + std::to_string(getpid()), true, 7, 123, 2, 4).Success());
-    ASSERT_TRUE(peer.Setup("poll_" + std::to_string(getpid()), false).Success());
-    auto batch = owner.BeginLoad(Id(1), 0, 50);
-    ASSERT_TRUE(batch);
-    EXPECT_EQ(owner.WaitReaders(batch.Value(), false), Status::Retry());
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    EXPECT_EQ(owner.WaitReaders(batch.Value(), false), Status::Timeout());
-    owner.FailLoad(batch.Value(), Status::NoSpace());
-    EXPECT_EQ(owner.WaitReaders(batch.Value(), false), Status::NoSpace());
-    owner.EndLoad(batch.Value(), 0);
-    auto next = owner.BeginLoad(Id(2), 0, 1000);
-    ASSERT_TRUE(next);
-    auto reader = peer.BeginLoad(Id(2), 1, 1000);
-    ASSERT_TRUE(reader);
-    ASSERT_EQ(reader.Value(), next.Value());
-    peer.EndLoad(reader.Value(), 1);
-    EXPECT_TRUE(owner.WaitReaders(next.Value(), false).Success());
-    owner.EndLoad(next.Value(), 0);
-    EXPECT_TRUE(owner.WaitReaders(next.Value(), false).Success());
-    owner.Deactivate();
-    EXPECT_EQ(owner.WaitReaders(next.Value(), false), Status::Error());
-}
-TEST(ContextMetadataTest, CompletedTailReusePreservesPendingBatchOrder)
-{
-    Context::SharedMetadata owner, peer;
-    const auto name = "trim_" + std::to_string(getpid());
-    ASSERT_TRUE(owner.Setup(name, true, 7, 123, 2, 64).Success());
-    ASSERT_TRUE(peer.Setup(name, false).Success());
-    auto pending = owner.BeginLoad(Id(1), 0, 5000);
-    ASSERT_TRUE(pending);
-    std::vector<uint64_t> batches;
-    for (unsigned i = 2; i < 64; ++i) {
-        auto batch = owner.BeginLoad(Id(i), 0, 5000);
-        ASSERT_TRUE(batch);
-        batches.push_back(batch.Value());
-    }
-    for (unsigned i = 2; i < 64; ++i) {
-        auto batch = peer.BeginLoad(Id(i), 1, 5000);
-        ASSERT_TRUE(batch);
-        EXPECT_EQ(batch.Value(), batches[i - 2]);
-        peer.EndLoad(batch.Value(), 1);
-        owner.EndLoad(batch.Value(), 0);
-    }
-    auto newer = owner.BeginLoad(Id(1), 0, 5000);
-    ASSERT_TRUE(newer);
-    EXPECT_NE(newer.Value(), pending.Value());
-    for (auto expected : {pending.Value(), newer.Value()}) {
-        auto batch = peer.BeginLoad(Id(1), 1, 5000);
-        ASSERT_TRUE(batch);
-        EXPECT_EQ(batch.Value(), expected);
-        peer.EndLoad(batch.Value(), 1);
-        EXPECT_TRUE(owner.WaitReaders(expected, false).Success());
-        owner.EndLoad(expected, 0);
-    }
-}
-TEST(ContextMetadataTest, NotificationsFailuresAndBatchReuse)
-{
-    Context::SharedMetadata owner, peer;
-    auto name = "notify_" + std::to_string(getpid());
-    ASSERT_TRUE(owner.Setup(name, true, 7, 123, 2, 2).Success());
-    ASSERT_TRUE(peer.Setup(name, false).Success());
-    auto reader = peer.BeginLoad(Id(9), 1, 1000);
-    auto writer = owner.BeginLoad(Id(9), 0, 1000);
-    ASSERT_TRUE(bool(reader));
-    ASSERT_TRUE(bool(writer));
-    ASSERT_EQ(reader.Value(), writer.Value());
-    auto waiting = std::async(std::launch::async,
-                              [&] { return peer.WaitAcquire(Id(1), 123, reader.Value()); });
-    ASSERT_TRUE(owner.Publish(Id(1), 1, 4).Success());
-    auto location = waiting.get();
-    ASSERT_TRUE(bool(location));
-    EXPECT_EQ(location.Value().slot, 4);
-    EXPECT_FALSE(owner.ReserveEviction({Id(1)}));
-    peer.Release(Id(1));
-    ASSERT_TRUE(owner.ReserveEviction({Id(1)}));
-    auto busy = std::async(std::launch::async,
-                           [&] { return peer.WaitAcquire(Id(1), 123, reader.Value()); });
-    EXPECT_EQ(busy.wait_for(std::chrono::milliseconds(10)), std::future_status::timeout);
-    // Identical copies/slot still requires notification when clearing busy.
-    ASSERT_TRUE(owner.Publish(Id(1), 1, 4).Success());
-    auto republished = busy.get();
-    ASSERT_TRUE(republished);
-    EXPECT_EQ(republished.Value().slot, 4);
-    peer.Release(Id(1));
-    peer.EndLoad(reader.Value(), 1);
-    EXPECT_TRUE(owner.WaitReaders(writer.Value()).Success());
-    owner.EndLoad(writer.Value(), 0);
-    writer = owner.BeginLoad(Id(9), 0, 1000);
-    ASSERT_TRUE(bool(writer));
-    owner.FailLoad(writer.Value(), Status::NoSpace());
-    // A late reader sees the failed batch, not an old ready copy of this key.
-    reader = peer.BeginLoad(Id(9), 1, 1000);
-    ASSERT_TRUE(bool(reader));
-    EXPECT_EQ(reader.Value(), writer.Value());
-    auto failed = peer.WaitAcquire(Id(1), 123, reader.Value());
-    ASSERT_FALSE(bool(failed));
-    EXPECT_EQ(failed.Error(), Status::NoSpace());
-    peer.EndLoad(reader.Value(), 1);
-    owner.EndLoad(writer.Value(), 0);
-    writer = owner.BeginLoad(Id(10), 0, 20);
-    ASSERT_TRUE(bool(writer));
-    EXPECT_EQ(owner.WaitReaders(writer.Value()), Status::Timeout());
-    owner.FailLoad(writer.Value(), Status::Timeout());
-    owner.EndLoad(writer.Value(), 0);
-}
-TEST(ContextMetadataTest, ReadyPrefixDoesNotWaitForLaterKeys)
-{
-    Context::SharedMetadata owner, peer;
-    auto name = "ready_prefix_" + std::to_string(getpid());
-    ASSERT_TRUE(owner.Setup(name, true, 17, 123, 2, 2).Success());
-    ASSERT_TRUE(peer.Setup(name, false).Success());
-    auto batch = owner.BeginLoad(Id(9), 0, 1000);
-    auto reader = peer.BeginLoad(Id(9), 1, 1000);
-    ASSERT_TRUE(batch);
-    ASSERT_TRUE(reader);
-    Context::Key keys[] = {Id(1), Id(2), Id(3)};
-    Context::SharedMetadata::Location locations[3];
-    ASSERT_TRUE(owner.Publish(keys[0], 1, 4).Success());
-    ASSERT_TRUE(owner.Publish(keys[2], 1, 6).Success());
-    // Key 2 is missing: acquire key 1 without waiting, and do not pin key 3.
-    auto prefix = peer.WaitAcquire(keys, 3, locations, 123, reader.Value());
-    ASSERT_TRUE(prefix);
-    ASSERT_EQ(prefix.Value(), 1);
-    EXPECT_EQ(locations[0].slot, 4);
-    EXPECT_FALSE(owner.Evictable(keys[0]));
-    EXPECT_TRUE(owner.Evictable(keys[2]));
-    peer.Release(keys, 1);
-    EXPECT_TRUE(owner.Evictable(keys[0]));
-    ASSERT_TRUE(owner.Publish(keys[1], 1, 5).Success());
-    ASSERT_TRUE(owner.ReserveEviction({keys[1]}));
-    prefix = peer.WaitAcquire(keys, 3, locations, 123, reader.Value());
-    ASSERT_TRUE(prefix);
-    ASSERT_EQ(prefix.Value(), 1);
-    peer.Release(keys, 1);
-    auto waiting = std::async(std::launch::async, [&] {
-        return peer.WaitAcquire(keys + 1, 2, locations, 123, reader.Value());
+    Open(2, -1, 3);
+    Observe({1});
+    std::array<unsigned char, 64> input;
+    input.fill(71);
+    auto task = store->Dump(Detail::TaskDesc{
+        Detail::Shard{Id(1), 0, {input.data()}},
+        Detail::Shard{Id(1), 0, {input.data()}}
     });
-    EXPECT_EQ(waiting.wait_for(std::chrono::milliseconds(10)), std::future_status::timeout);
-    ASSERT_TRUE(owner.Publish(keys[1], 1, 5).Success());
-    auto ready = waiting.get();
-    ASSERT_TRUE(ready);
-    ASSERT_EQ(ready.Value(), 2);
-    EXPECT_EQ(locations[0].slot, 5);
-    EXPECT_EQ(locations[1].slot, 6);
-    EXPECT_FALSE(owner.ReserveEviction({keys[1], keys[2]}));
-    peer.Release(keys + 1, 2);
-    EXPECT_TRUE(owner.ReserveEviction({keys[1], keys[2]}));
-    owner.FailLoad(batch.Value(), Status::NoSpace());
-    auto failed = peer.WaitAcquire(keys, 3, locations, 123, reader.Value());
-    ASSERT_FALSE(failed);
-    EXPECT_EQ(failed.Error(), Status::NoSpace());
-    EXPECT_TRUE(owner.Evictable(keys[0]));
-    peer.EndLoad(reader.Value(), 1);
-    owner.EndLoad(batch.Value(), 0);
+    ASSERT_TRUE(task);
+    ASSERT_TRUE(store->Wait(task.Value()).Success());
+    EXPECT_FALSE(Found(1));
+    ASSERT_TRUE(Dump(1, 0).Success());
+    ASSERT_TRUE(Dump(1, 1).Success());
+    ASSERT_TRUE(Dump(1, 1).Success());
+    EXPECT_FALSE(Found(1));
+    ASSERT_TRUE(Dump(1, 2).Success());
+    EXPECT_TRUE(Found(1));
+    EXPECT_EQ(store->ContextStats()["d2h_bytes"], 3 * 64);
+    for (size_t layer = 0; layer < 3; ++layer) { ASSERT_TRUE(Load(1, layer).Success()); }
+}
+
+TEST_F(ContextStoreTest, ConcurrentObserveLoadAndEviction)
+{
+    Open(16, -1, 2);
+    std::vector<Key> keys;
+    for (unsigned key = 1; key <= 64; ++key) { keys.push_back(Id(key)); }
+    ASSERT_TRUE(store->ObserveRequest("seed", 1, 1, keys).Success());
+    for (unsigned key = 1; key <= 16; ++key) {
+        for (size_t layer = 0; layer < 2; ++layer) {
+            ASSERT_TRUE(Dump(key, layer, key * 3 + layer).Success());
+        }
+    }
+    std::vector<Key> prefix(keys.begin(), keys.begin() + 8);
+    auto observe = std::async(std::launch::async, [&] {
+        for (uint64_t step = 2; step < 202; ++step) {
+            EXPECT_TRUE(store->ObserveRequest("reads", step, step, prefix).Success());
+            std::this_thread::yield();
+        }
+    });
+    auto write = std::async(std::launch::async, [&] {
+        for (unsigned key = 17; key <= 64; ++key) {
+            for (size_t layer = 0; layer < 2; ++layer) {
+                EXPECT_TRUE(Dump(key, layer, key * 3 + layer).Success());
+            }
+        }
+    });
+    for (size_t step = 0; step < 40; ++step) {
+        std::array<std::array<unsigned char, 64>, 8> output{};
+        Detail::TaskDesc desc;
+        for (size_t i = 0; i < output.size(); ++i) {
+            desc.push_back({Id(i + 1), step % 2, {output[i].data()}});
+        }
+        auto task = store->Load(std::move(desc));
+        ASSERT_TRUE(task);
+        ASSERT_TRUE(store->Wait(task.Value()).Success());
+        for (size_t i = 0; i < output.size(); ++i) {
+            EXPECT_TRUE(std::all_of(output[i].begin(), output[i].end(),
+                                    [&](auto v) { return v == (i + 1) * 3 + step % 2; }));
+        }
+    }
+    observe.get();
+    write.get();
+    EXPECT_EQ(store->ContextStats()["failed_tasks"], 0);
+}
+
+TEST_F(ContextStoreTest, NonzeroRankLoadsWithoutOwnerLoadAndOnlyRequestedLayer)
+{
+    Open(2, -1, 3, true);
+    Observe({1});
+    for (size_t layer = 0; layer < 3; ++layer) { backend.data[{Id(1), layer}].fill(10 + layer); }
+    Detail::Dictionary config;
+    config.Set("unique_id", name);
+    config.Set<StoreV1*>("store_backend", &backend);
+    config.Set("share_buffer_enable", true);
+    config.SetNumber("context_tp_size", 16);
+    config.SetNumber("context_tp_rank", 15);
+    config.SetNumber("device_id", 15);
+    config.SetNumber("block_size", 192);
+    config.SetNumber("shard_size", 64);
+    config.SetNumber("tensor_size", 64);
+    config.SetNumber("context_memory_capacity_bytes", 384);
+    config.SetNumber("local_rank_size", 16);
+    std::unique_ptr<StoreV1> reader(MakeContextStore());
+    ASSERT_TRUE(reader->Setup(config).Success());
+    std::array<unsigned char, 64> out{};
+    auto t = reader->Load({
+        {Id(1), 0, {out.data()}}
+    });
+    ASSERT_TRUE(t);
+    ASSERT_TRUE(reader->Wait(t.Value()).Success());
+    EXPECT_EQ(backend.loads, 1);
+    EXPECT_EQ(out[0], 10);
+    EXPECT_EQ(reader->ContextStats()["backend_load_shards"], 1);
+    EXPECT_EQ(store->ContextStats()["backend_load_shards"], 0);
+    ASSERT_TRUE(Load(1, 0, 10).Success());
+    EXPECT_EQ(backend.loads, 1);
+    // Reading layer 0 does not pull in layers 1 and 2.
+    for (size_t layer = 1; layer < 3; ++layer) {
+        auto task = reader->Load({
+            {Id(1), layer, {out.data()}}
+        });
+        ASSERT_TRUE(task);
+        ASSERT_TRUE(reader->Wait(task.Value()).Success());
+        EXPECT_EQ(out[0], 10 + layer);
+    }
+    EXPECT_EQ(backend.loads, 3);
+}
+
+TEST_F(ContextStoreTest, FailedFillRetriesAndDoesNotConsumeCapacityForever)
+{
+    Open(1);
+    Observe({1, 2, 3});
+    backend.data[{Id(1), 0}].fill(71);
+    backend.failLoad = true;
+    EXPECT_TRUE(Load(1).Failure());
+    backend.failLoad = false;
+    ASSERT_TRUE(Load(1).Success());
+    ASSERT_TRUE(Dump(2).Success());
+    backend.failLoad = true;
+    EXPECT_TRUE(Load(1).Failure());
+    backend.failLoad = false;
+    ASSERT_TRUE(Dump(3).Success());
+    ASSERT_TRUE(Load(3).Success());
+}
+
+TEST_F(ContextStoreTest, Tp16SingleFillPerShardAndIndependentCompletion)
+{
+    Open(4, -1, 2, true);
+    Observe({1, 2, 3, 4});
+    for (unsigned key = 1; key <= 4; ++key)
+        for (size_t layer = 0; layer < 2; ++layer) {
+            backend.data[{Id(key), layer}].fill(key * 10 + layer);
+        }
+    std::vector<std::unique_ptr<StoreV1>> peers;
+    for (size_t rank = 1; rank < 16; ++rank) {
+        Detail::Dictionary c;
+        c.Set("unique_id", name);
+        c.Set<StoreV1*>("store_backend", &backend);
+        c.Set("share_buffer_enable", true);
+        c.SetNumber("context_tp_rank", rank);
+        c.SetNumber("context_tp_size", 16);
+        c.SetNumber("device_id", rank);
+        c.SetNumber("block_size", 128);
+        c.SetNumber("shard_size", 64);
+        c.SetNumber("tensor_size", 64);
+        c.SetNumber("context_memory_capacity_bytes", 512);
+        c.SetNumber("local_rank_size", 16);
+        auto peer = std::unique_ptr<StoreV1>(MakeContextStore());
+        ASSERT_TRUE(peer->Setup(c).Success());
+        peers.push_back(std::move(peer));
+    }
+    std::promise<void> start;
+    auto gate = start.get_future().share();
+    std::vector<std::future<void>> jobs;
+    for (size_t rank = 0; rank < 16; ++rank) {
+        jobs.push_back(std::async(std::launch::async, [&, rank] {
+            gate.wait();
+            auto* worker = rank ? peers[rank - 1].get() : store.get();
+            for (size_t layer = 0; layer < 2; ++layer) {
+                std::array<std::array<unsigned char, 64>, 4> out{};
+                Detail::TaskDesc desc;
+                for (unsigned key = 1; key <= 4; ++key) {
+                    desc.push_back({Id(key), layer, {out[key - 1].data()}});
+                }
+                auto t = worker->Load(std::move(desc));
+                ASSERT_TRUE(t);
+                ASSERT_TRUE(worker->Wait(t.Value()).Success());
+                for (unsigned key = 1; key <= 4; ++key) {
+                    EXPECT_TRUE(std::all_of(out[key - 1].begin(), out[key - 1].end(),
+                                            [=](auto v) { return v == key * 10 + layer; }));
+                }
+            }
+        }));
+    }
+    start.set_value();
+    for (auto& job : jobs) { job.get(); }
+    EXPECT_EQ(backend.loads, 8);
+}
+TEST_F(ContextStoreTest, LaterSubmitFailureDrainsEarlierBackendWrite)
+{
+    class DelayedBackend : public TestBackend {
+    public:
+        std::promise<void> entered, release;
+        std::shared_future<void> gate = release.get_future().share();
+        std::future<void> pending;
+        Expected<size_t> Load(Detail::TaskDesc desc) override
+        {
+            if (desc[0].owner == Id(2)) { return Status::Error("later shard rejected"); }
+            pending = std::async(std::launch::async, [this, desc = std::move(desc)] {
+                entered.set_value();
+                gate.wait();
+                std::memset(desc[0].addrs[0], 71, 64);
+            });
+            return size_t(1);
+        }
+        Status Wait(size_t) override
+        {
+            if (pending.valid()) { pending.get(); }
+            return Status::OK();
+        }
+    } delayed;
+    Detail::Dictionary c;
+    c.Set("unique_id", "drain_" + std::to_string(getpid()));
+    c.Set<StoreV1*>("store_backend", &delayed);
+    c.SetNumber("device_id", 0);
+    c.SetNumber("block_size", 64);
+    c.SetNumber("shard_size", 64);
+    c.SetNumber("tensor_size", 64);
+    c.SetNumber("context_memory_capacity_bytes", 128);
+    c.SetNumber("local_rank_size", 1);
+    auto worker = std::unique_ptr<StoreV1>(MakeContextStore());
+    ASSERT_TRUE(worker->Setup(c).Success());
+    ASSERT_TRUE(worker->ObserveRequest("r", 1, 1, {Id(1), Id(2)}).Success());
+    std::array<unsigned char, 128> output{};
+    auto task = worker->Load({
+        {Id(1), 0, {output.data()}     },
+        {Id(2), 0, {output.data() + 64}}
+    });
+    ASSERT_TRUE(task);
+    delayed.entered.get_future().wait();
+    auto finished = std::async(std::launch::async, [&] { return worker->Wait(task.Value()); });
+    EXPECT_EQ(finished.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    delayed.release.set_value();
+    EXPECT_TRUE(finished.get().Failure());
+}
+
+TEST_F(ContextStoreTest, DestructionDrainsSubmittedLoads)
+{
+    Open();
+    Observe({1});
+    backend.data[{Id(1), 0}].fill(77);
+    std::array<unsigned char, 64> output{};
+    auto task = store->Load({
+        {Id(1), 0, {output.data()}}
+    });
+    ASSERT_TRUE(task);
+    store.reset();
+    EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](auto v) { return v == 77; }));
 }
 }  // namespace
-
-TEST_F(ContextStoreTest, LayerMajorLayoutSurvivesEvictionAndReadmission)
-{
-    Open(3, -1, 3);
-    Observe({1, 2, 3});
-    for (unsigned key = 1; key <= 3; ++key) {
-        for (size_t layer = 0; layer < 3; ++layer) {
-            ASSERT_TRUE(Dump(key, layer, key * 10 + layer).Success());
-        }
-    }
-    std::map<std::pair<Key, size_t>, uintptr_t> addresses;
-    backend.beforeDump = [&](const Detail::TaskDesc& desc) {
-        for (const auto& shard : desc) {
-            addresses[{shard.owner, shard.index}] = reinterpret_cast<uintptr_t>(shard.addrs[0]);
-        }
-    };
-    for (unsigned key : {4, 5}) {
-        Observe({key});
-        for (size_t layer = 0; layer < 3; ++layer) {
-            ASSERT_TRUE(Dump(key, layer, key * 10 + layer).Success());
-        }
-    }
-    ASSERT_EQ(addresses.size(), 6);
-    for (unsigned key : {2, 3}) {
-        ASSERT_TRUE(addresses.count({Id(key), 0}));
-        EXPECT_EQ((addresses.at({Id(key), 1}) - addresses.at({Id(key), 0})), 3 * 64);
-        EXPECT_EQ((addresses.at({Id(key), 2}) - addresses.at({Id(key), 1})), 3 * 64);
-    }
-    EXPECT_EQ((addresses.at({Id(3), 0}) - addresses.at({Id(2), 0})), 64);
-    for (size_t layer = 0; layer < 3; ++layer) {
-        ASSERT_TRUE(Load(3, layer, 30 + layer).Success());
-    }
-    backend.beforeDump = {};
-}

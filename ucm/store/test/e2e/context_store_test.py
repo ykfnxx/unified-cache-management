@@ -646,7 +646,7 @@ def test_dsa_shared_three_components_and_mtp_shard_native_readback():
             np.array([[a.ctypes.data for a in tensors]], dtype=np.uint64),
             0,
         )
-    # Read shared Memory, then verify Fake readmission on rank 0.
+    # Read shared Memory, then verify shared Fake readmission.
     for evict in (False, True):
         if evict:
             owner.ObserveRequest("new", 2, 2, ids(2))
@@ -828,7 +828,7 @@ def test_mla_shared_payload_across_processes_and_owner_exit():
             )
             owner.Wait(task)
             parent.send("load")
-            # Both ranks participate, including on a resident Memory hit.
+            # Each rank submits and completes its read independently.
             target = np.zeros_like(source)
             task = owner.Load(
                 ids(1),
@@ -840,7 +840,6 @@ def test_mla_shared_payload_across_processes_and_owner_exit():
             data, stats = parent.recv()
             assert data == source.tobytes()
             assert stats.get("d2h_bytes", 0) == 0
-            assert stats.get("backend_load_blocks", 0) == 0
         assert owner.ContextStats()["backend_dump_bytes"] == 128
         del owner
         parent.send("load")
@@ -916,7 +915,7 @@ def test_registered_context_fake_builder_and_readmission():
 
 
 @pytest.mark.parametrize("partial", [False, True])
-def test_mla_late_reader_protection_and_owner_failure(partial):
+def test_mla_late_reader_refills_independently_and_capacity_failure(partial):
     import time
 
     module, library = native()
@@ -950,7 +949,7 @@ def test_mla_late_reader_protection_and_owner_failure(partial):
     if partial:
         with pytest.raises(RuntimeError, match="-50009"):
             owner.Wait(owner_task)
-        # The reader joins after the failed prepare and sees its error immediately.
+        # The reader independently encounters the same capacity shortage.
         start = time.monotonic()
         reader_task = reader.Load(
             ids(1), index, np.array([[out_reader.ctypes.data]], dtype=np.uint64)
@@ -963,21 +962,16 @@ def test_mla_late_reader_protection_and_owner_failure(partial):
         while not owner.ContextStats().get("backend_load_blocks", 0):
             assert time.monotonic() < deadline
             time.sleep(0.001)
-        owner.Wait(owner_task)  # Local H2D completes before the reader submits.
+        owner.Wait(owner_task)
         owner.ObserveRequest("3", 3, 3, ids(3))
-        with pytest.raises(RuntimeError, match="-50009"):
-            owner.Wait(owner.Dump(ids(3), index, address, 0))
+        # Completed local H2D releases its handles; no cross-rank batch pins remain.
+        for layer in range(2):
+            owner.Wait(owner.Dump(ids(3), np.array([layer], dtype=np.uint64), address, 0))
+        # A late reader can refill from Fake itself, without another owner Load.
         reader_task = reader.Load(
             ids(1), index, np.array([[out_reader.ctypes.data]], dtype=np.uint64)
         )
         reader.Wait(reader_task)
         np.testing.assert_array_equal(out_owner, out_reader)
-        deadline = time.monotonic() + 2
-        while True:
-            try:
-                owner.Wait(owner.Dump(ids(3), index, address, 0))
-                break
-            except RuntimeError as error:
-                assert "-50009" in str(error) and time.monotonic() < deadline
-                time.sleep(0.001)
+        assert reader.ContextStats()["backend_load_shards"] == 1
         assert owner.ContextStats()["memory_blocks"] == 1

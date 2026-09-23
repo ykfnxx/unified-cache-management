@@ -22,10 +22,12 @@
  * SOFTWARE.
  * */
 #include <array>
+#include <future>
 #include <gtest/gtest.h>
 #include <random>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "buffer_pool.h"
 #include "context_index.h"
 #include "shared_metadata.h"
 #include "ucmstore_v1.h"
@@ -105,6 +107,76 @@ protected:
         return status;
     }
 };
+TEST_F(ContextStoreTest, MlaReaderMapsBothPoolsBeforeFirstLoad)
+{
+    const auto id = "early_both_" + std::to_string(getpid());
+    Detail::Dictionary config;
+    config.Set("unique_id", id);
+    config.Set("share_buffer_enable", true);
+    config.SetNumber("context_tp_size", 16);
+    config.SetNumber("block_size", 64);
+    config.SetNumber("shard_size", 64);
+    config.SetNumber("tensor_size", 64);
+    config.SetNumber("context_memory_capacity_bytes", 64);
+    config.SetNumber("context_simulated_ssd_capacity_bytes", 128);
+    config.SetNumber("context_max_eviction_blocks", 1);
+    config.SetNumber("device_id", 15);
+    config.SetNumber("context_tp_rank", 15);
+    std::unique_ptr<StoreV1> reader(MakeContextStore());
+    ASSERT_TRUE(reader->Setup(config).Success());  // Reader may start before owner.
+    config.SetNumber("device_id", 0);
+    config.SetNumber("context_tp_rank", 0);
+    store.reset(MakeContextStore());
+    ASSERT_TRUE(store->Setup(config).Success());
+    Observe({1});
+    ASSERT_TRUE(Dump(1, 0, 11).Success());
+    Observe({2});
+    ASSERT_TRUE(Dump(2, 0, 22).Success());
+    ASSERT_EQ(store->ContextStats()["ssd_write_blocks"], 1);
+    // Existing mappings survive unlink; any lazy mapping during Load will fail.
+    ASSERT_EQ(shm_unlink(("/ucm_context_" + id + "_mla_memory").c_str()), 0);
+    ASSERT_EQ(shm_unlink(("/ucm_context_" + id + "_mla_ssd").c_str()), 0);
+    for (unsigned key : {1, 2}) {
+        std::array<unsigned char, 64> output{};
+        auto task = reader->Load({
+            {Id(key), 0, {output.data()}}
+        });
+        ASSERT_TRUE(task);
+        auto status = reader->Wait(task.Value());
+        ASSERT_TRUE(status.Success()) << status.ToString();
+        for (auto byte : output) { EXPECT_EQ(byte, key == 1 ? 11 : 22); }
+    }
+}
+TEST(ContextBufferTest, RanksCanInitializeSharedPayloadConcurrently)
+{
+    std::array<Context::BufferPool, 4> pools;
+    std::array<std::future<Status>, 4> initialized;
+    const auto name = "parallel_payload_" + std::to_string(getpid());
+    for (size_t rank = 0; rank < pools.size(); ++rank) {
+        initialized[rank] = std::async(std::launch::async, [&, rank] {
+            return pools[rank].SetupShared(name, rank, 8, 4096, rank == 0, false);
+        });
+    }
+    for (auto& result : initialized) { ASSERT_TRUE(result.get().Success()); }
+    std::memset(pools[0].Data(7), 97, 4096);
+    for (size_t rank = 0; rank < pools.size(); ++rank) {
+        EXPECT_EQ(static_cast<unsigned char*>(pools[rank].Data(7))[4095], 97);
+        EXPECT_EQ(pools[rank].FreeCount(), rank == 0 ? 8 : 0);
+    }
+}
+TEST(ContextBufferTest, ReaderCreatedPayloadIsNotTruncatedByOwner)
+{
+    Context::BufferPool reader, owner, mismatch;
+    auto name = "reader_payload_" + std::to_string(getpid());
+    ASSERT_TRUE(reader.SetupShared(name, 1, 1, 64, false, false).Success());
+    EXPECT_EQ(reader.FreeCount(), 0);
+    std::memset(reader.Data(0), 83, 64);
+    ASSERT_TRUE(owner.SetupShared(name, 0, 1, 64, true, false).Success());
+    EXPECT_EQ(owner.FreeCount(), 1);
+    EXPECT_EQ(static_cast<unsigned char*>(owner.Data(0))[0], 83);
+    EXPECT_EQ(mismatch.SetupShared(name, 2, 1, 128, false, false), Status::InvalidParam());
+    EXPECT_EQ(static_cast<unsigned char*>(owner.Data(0))[0], 83);
+}
 TEST_F(ContextStoreTest, SharedMlaLeasePreventsEviction)
 {
     Open(1, 8, -1, 1, true);

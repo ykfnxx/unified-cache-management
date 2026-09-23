@@ -22,7 +22,9 @@
  * SOFTWARE.
  * */
 #pragma once
+#include <cerrno>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -61,15 +63,15 @@ public:
                        bool owner, bool deviceAddress)
     {
         name_ = "/ucm_context_" + name;
-        owner_ = owner;
         deviceId_ = deviceId;
         bytes_ = bytes;
         total_ = count * bytes;
         deviceAddress_ = deviceAddress;
-        if (!owner) { return Status::OK(); }  // Readers may initialize before rank 0.
         auto status = MapShared();
         if (status.Failure()) { return status; }
-        for (size_t i = count; i > 0; --i) { free_.push_back(i - 1); }
+        if (owner) {
+            for (size_t i = count; i > 0; --i) { free_.push_back(i - 1); }
+        }
         return Status::OK();
     }
     Status MapShared()
@@ -78,22 +80,46 @@ public:
         Trans::Device device;
         auto status = device.Setup(deviceId_);
         if (status.Failure()) { return status; }
-        int fd = shm_open(name_.c_str(), O_RDWR | (owner_ ? O_CREAT | O_EXCL : 0), 0600);
-        if (fd < 0) { return Status::Error("cannot open context shared payload"); }
-        if (owner_) { created_ = true; }
-        if (owner_ && ftruncate(fd, total_) != 0) {
-            close(fd);
-            return Status::Error("cannot size context shared payload");
+        // Any rank may create the payload, as in CacheStore. Do not wait for rank 0
+        // to finish device registration before another rank can initialize.
+        int fd = shm_open(name_.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) {
+            created_ = true;
+        } else if (errno == EEXIST) {
+            fd = shm_open(name_.c_str(), O_RDWR, 0600);
         }
-        // Reserve tmpfs backing now: otherwise a later DMA/memcpy could SIGBUS.
-        if (owner_ && posix_fallocate(fd, 0, total_) != 0) {
+        if (fd < 0) { return Status::Error("cannot open context shared payload"); }
+        int rc;
+        do {
+            rc = flock(fd, LOCK_EX);
+        } while (rc != 0 && errno == EINTR);
+        if (rc != 0) {
             close(fd);
-            return Status::NoSpace();
+            return Status::Error("cannot lock context shared payload initialization");
         }
         struct stat info{};
-        if (fstat(fd, &info) != 0 || size_t(info.st_size) != total_) {
+        if (fstat(fd, &info) != 0) {
+            close(fd);
+            return Status::Error("cannot stat context shared payload");
+        }
+        // Hold the file lock only for sizing/backing allocation, never device registration.
+        // A rank that opens the new file before its creator obtains the lock may initialize it.
+        if (info.st_size == 0) {
+            if (posix_fallocate(fd, 0, total_) != 0) {
+                close(fd);
+                return Status::NoSpace();
+            }
+        } else if (size_t(info.st_size) != total_) {
             close(fd);
             return Status::InvalidParam("context shared payload layout mismatch");
+        }
+        // mmap retains the file description: explicitly unlock before mapping/closing.
+        do {
+            rc = flock(fd, LOCK_UN);
+        } while (rc != 0 && errno == EINTR);
+        if (rc != 0) {
+            close(fd);
+            return Status::Error("cannot unlock context shared payload initialization");
         }
         void* address = mmap(nullptr, total_, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         close(fd);
@@ -123,7 +149,7 @@ public:
 
 private:
     std::string name_;
-    bool owner_ = false, created_ = false, deviceAddress_ = false;
+    bool created_ = false, deviceAddress_ = false;
     int deviceId_ = -1;
     size_t total_ = 0;
     std::shared_ptr<void> data_;

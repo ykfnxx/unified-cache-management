@@ -154,8 +154,23 @@ public:
         bool timeout =
             result.wait_for(std::chrono::milliseconds(timeoutMs_)) != std::future_status::ready;
         // A deadline does not revoke device access to the caller's tensor addresses.
+        if (timeout) {
+            UC_ERROR(
+                "Context task deadline exceeded; draining in-flight transfer: "
+                "device={}, task={}, timeout_ms={}",
+                deviceId_, task, timeoutMs_);
+        }
         auto status = result.get();
-        return timeout ? Status::Timeout() : status;
+        if (status.Failure()) {
+            UC_ERROR("Context task failed: device={}, task={}, deadline_exceeded={}, status={}",
+                     deviceId_, task, timeout, status);
+            return status;
+        }
+        return timeout ? Status{Status::Timeout().Underlying(),
+                                fmt::format("context task exceeded deadline but finished draining: "
+                                            "device={}, task={}, timeout_ms={}",
+                                            deviceId_, task, timeoutMs_)}
+                       : status;
     }
     Status ObserveRequest(const std::string& id, uint64_t observation, uint64_t time,
                           const std::vector<Key>& blocks) override
@@ -492,8 +507,6 @@ Status ContextStore::LoadShared(CopyStream& stream, Detail::TaskDesc& task)
         }
         held.emplace(shard.owner, location.Value());
     }
-    if (status.Success()) { status = memory_.MapShared(); }
-    if (status.Success()) { status = ssd_.MapShared(); }
     for (auto& shard : task) {
         if (status.Failure()) { break; }
         const auto& location = held.at(shard.owner);

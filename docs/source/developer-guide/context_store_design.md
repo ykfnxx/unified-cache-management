@@ -203,7 +203,7 @@ Lookup 返回查询时的可用状态，不持有传输引用。worker 的 Load 
 
 GQA 每个 TP rank 独立拥有策略索引、Memory、模拟 SSD 和元数据表，native 命名追加 `_tp<rank>`。scheduler 对各 rank 可用性逐 block 取交集。
 
-MLA 沿用 CacheStore 的单 rank 写、多 rank 读。connector 自动设置 `share_buffer_enable: true`，native 命名追加 `_mla`；只有 rank 0 分配 Memory／模拟 SSD 的 POSIX 共享 payload，维护策略索引并执行 D2H、Dump/Drop。其他 rank 延迟映射同一份 payload，分别注册到自己的设备并执行 H2D。scheduler 只查询这份 owner 元数据。
+MLA 沿用 CacheStore 的单 rank 写、多 rank 读。connector 自动设置 `share_buffer_enable: true`，native 命名追加 `_mla`；任意 rank 可先创建 Memory／模拟 SSD 的 POSIX 共享 payload，只有 rank 0 管理空闲槽位、维护策略索引并执行 D2H、Dump/Drop。所有 rank 在 Setup 阶段完成两个池的映射和设备注册，Load 不再进行整池注册。初始化文件锁只覆盖空间预分配和容量校验，不覆盖设备注册，也不等待 owner 元数据。scheduler 只查询这份 owner 元数据。
 
 共享表除了可用性，还记录 Memory/SSD slot、布局签名、在途读引用和淘汰占用状态。reader 在取得位置时增加引用，实际传输同步后释放；owner 筛选 victim 后在共享锁下再次原子确认并占用，避免查询与淘汰间的竞态。写回期间不接纳新的读取，完成后发布 SSD 位置并释放 Memory slot。若所有候选均被读取保护，可返回 NoSpace，不强制回收。
 

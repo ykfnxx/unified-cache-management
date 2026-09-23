@@ -110,11 +110,11 @@ TP rank、设备编号和 block/shard/tensor 布局由 connector 自动提供，
 
 - **GQA**：各 TP rank 独立拥有数据池和策略索引，独立淘汰。scheduler 取各 rank 可用性的交集；副本可以分别位于 Memory 或模拟 SSD。
 - **MLA**：沿用 CacheStore 的单 rank 写、各 rank 读方式。rank 0 唯一拥有分配器、context_lru 索引、D2H 和 Dump/Drop；其他 rank 不保存、不执行淘汰，只映射同一份 Memory／模拟 SSD 并执行 H2D。scheduler 查询 rank 0 的共享状态。
-- 每个 rank 为自己的设备注册共享 host buffer，使用自己的传输 stream。共享表记录 slot 位置和读取引用；H2D 全部完成后才释放引用，rank 0 不会回收在途读取的 slot。MLA reader 的 ObserveRequest 不修改策略索引。
+- 所有 rank 在 Setup 阶段映射并注册 Memory 和模拟 SSD 两个共享池，不把整池注册推迟到第一次 Load。任意 rank 可先创建 payload，只有 rank 0 管理空闲槽位；初始化文件锁仅保护容量检查和空间预分配，各 rank 独立完成设备注册，不等待 owner 元数据。每个 rank 使用自己的传输 stream。共享表记录 slot 位置和读取引用；H2D 全部完成后才释放引用，rank 0 不会回收在途读取的 slot。MLA reader 的 ObserveRequest 不修改策略索引。
 - 使用 DP 隔离的命名空间；GQA 追加 `_tp<rank>`，MLA 追加 `_mla`。各 rank 上下文和 I/O 均使用 scheduler 的逻辑 block ID。
 - scheduler 只映射元数据，不映射 payload。Lookup 不预留数据，后续 Load 的缺失仍由原有重算路径处理。
 
-正常退出由 owner 撤销可用性并删除共享内存名称；reader 退出只解除自己的映射。硬崩溃后，仅在对应旧进程全部退出后清理实验残留：GQA 为 `/dev/shm/ucm_context_<unique_id>_tp<rank>`；MLA 为 `/dev/shm/ucm_context_<unique_id>_mla` 及其 `_memory`、`_ssd` payload 对象。硬崩溃后的读引用回收和进程热重启不在实验支持范围内。
+正常退出由元数据 owner 撤销可用性并删除元数据名称，payload 创建者删除对应名称；各 rank 解除自己的映射。硬崩溃后，仅在对应旧进程全部退出后清理实验残留：GQA 为 `/dev/shm/ucm_context_<unique_id>_tp<rank>`；MLA 为 `/dev/shm/ucm_context_<unique_id>_mla` 及其 `_memory`、`_ssd` payload 对象。硬崩溃后的读引用回收和进程热重启不在实验支持范围内。
 
 ## GLM-5.1-W4A8：TP + MTP
 

@@ -26,6 +26,7 @@
 
 #include <limits>
 #include <memory>
+#include <optional>
 #include "global_config.h"
 #include "status/status.h"
 #include "type/types.h"
@@ -41,6 +42,7 @@ class TransBuffer {
     bool bypassHitOnLoad_{false};
     StoreV1* backend_{nullptr};
     int64_t retentionNs_{-1};
+    bool updateAccessTime_{true};
 
 public:
     enum class State : uint8_t { LOADING, READY, FAILED };
@@ -113,7 +115,9 @@ public:
 public:
     Status Setup(const Config& config);
     Handle Get(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false,
-               bool isLoad = false);
+               bool isLoad = false, std::optional<uint64_t> accessTimeNs = std::nullopt);
+    // Reuse one timestamp per task. Zero disables touches without reading the clock.
+    uint64_t BatchAccessTime() const;
     void Prealloc(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false);
     bool Exist(const Detail::BlockId& blockId, size_t shardIdx);
 

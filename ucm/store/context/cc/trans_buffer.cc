@@ -560,6 +560,7 @@ Status TransBuffer::Setup(const Config& config)
 {
     backend_ = config.storeBackend;
     retentionNs_ = config.retentionNs;
+    updateAccessTime_ = !config.shareBufferEnable || config.updateAccessTime;
     bypassHitOnLoad_ = config.cacheLoadBackendOnly;
     try {
         if (!config.shareBufferEnable) {
@@ -579,8 +580,16 @@ Status TransBuffer::Setup(const Config& config)
     return strategy_->Setup();
 }
 
+uint64_t TransBuffer::BatchAccessTime() const
+{
+    if (retentionNs_ < 0 || !updateAccessTime_) { return 0; }
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 TransBuffer::Handle TransBuffer::Get(const Detail::BlockId& blockId, size_t shardIdx,
-                                     bool allowReserved, bool isLoad)
+                                     bool allowReserved, bool isLoad,
+                                     std::optional<uint64_t> accessTimeNs)
 {
     auto iBucket = Hash(blockId, shardIdx);
     bool owner = false;
@@ -599,11 +608,14 @@ TransBuffer::Handle TransBuffer::Get(const Detail::BlockId& blockId, size_t shar
         owner = true;
     }
     strategy_->BucketUnlock(iBucket);
-    if (retentionNs_ >= 0) {
-        // Get already holds a reference, so the slot cannot be reused during this update.
-        const uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        strategy_->MetaAt(iNode)->lastAccessNs.store(now, std::memory_order_relaxed);
+    if (retentionNs_ >= 0 && updateAccessTime_) {
+        // The reference protects this slot. Load and dump may carry timestamps
+        // sampled in a different order, so never move the last access backwards.
+        const uint64_t now = accessTimeNs ? *accessTimeNs : BatchAccessTime();
+        auto& lastAccess = strategy_->MetaAt(iNode)->lastAccessNs;
+        auto previous = lastAccess.load(std::memory_order_relaxed);
+        while (now > previous &&
+               !lastAccess.compare_exchange_weak(previous, now, std::memory_order_relaxed)) {}
     }
     return Handle{this, iNode, owner};
 }
@@ -695,6 +707,7 @@ Expected<size_t> TransBuffer::Alloc(const Detail::BlockId& blockId, size_t shard
         ++meta->reference;
         strategy_->MarkAccessed(iNode);
         meta->persisted = false;
+        meta->lastAccessNs.store(0, std::memory_order_relaxed);
         meta->block = blockId;
         meta->shard = shardIdx;
         meta->state.store(State::LOADING, std::memory_order_relaxed);

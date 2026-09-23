@@ -127,8 +127,9 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
     size_t copiedShards = 0;
     BufferHandles handles;
     auto status = Status::OK();
+    const auto accessTime = buffer_->BatchAccessTime();
     for (auto& shard : task->desc) {
-        auto handle = buffer_->Get(shard.owner, shard.index);
+        auto handle = buffer_->Get(shard.owner, shard.index, false, false, accessTime);
         if (!handle) {
             status = Status::Error("failed to allocate Context buffer");
             break;

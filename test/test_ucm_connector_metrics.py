@@ -2980,3 +2980,36 @@ def test_context_eviction_counters_export_per_worker():
         counter = FakeCounter.created["ucm:" + name]
         assert counter.labelnames == ["model_name", "engine", "worker_rank"]
         assert counter.children[("model-a", "0", "0")].increments == [value]
+
+
+@pytest.mark.parametrize(
+    "tp_size,ranks_per_host,world_size,expected",
+    [
+        (16, 16, 16, [0]),
+        (16, 8, 16, [0, 8]),
+        (4, 8, 16, [0, 4, 8, 12]),
+    ],
+)
+def test_shared_mla_context_access_time_writers(
+    tp_size, ranks_per_host, world_size, expected
+):
+    writers = [
+        rank
+        for rank in range(world_size)
+        if ucm_connector_module._should_update_context_access_time(
+            True, True, rank, tp_size, rank % ranks_per_host
+        )
+    ]
+    assert writers == expected
+
+
+@pytest.mark.parametrize(
+    "is_mla,shared", [(False, True), (True, False), (False, False)]
+)
+def test_independent_context_access_time_writers(is_mla, shared):
+    assert all(
+        ucm_connector_module._should_update_context_access_time(
+            is_mla, shared, rank, 16, rank
+        )
+        for rank in range(16)
+    )

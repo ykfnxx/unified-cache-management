@@ -156,6 +156,91 @@ TEST_F(ContextBufferTest, ReadRefreshesRetention)
     Save(2);
     EXPECT_EQ(backend.writes, 1);
 }
+TEST_F(ContextBufferTest, OlderBatchDoesNotUndoRetentionRefresh)
+{
+    Open(1, 600000000000);
+    Save(1);
+    {
+        auto h = buffer.Get(Id(1), 0, false, true, 1);
+        ASSERT_TRUE(h);
+    }
+    Save(2);
+    EXPECT_EQ(backend.writes, 1);
+}
+TEST_F(ContextBufferTest, ReusedSlotDoesNotInheritPreviousAccessTime)
+{
+    Open(1, 600000000000);
+    Save(1);
+    {
+        auto h = buffer.Get(Id(2), 0, false, false, 1);
+        ASSERT_TRUE(h);
+        h.MarkReady();
+    }
+    ASSERT_EQ(backend.writes, 1);
+    Save(3);
+    // The replacement's deliberately old batch timestamp must allow expiry.
+    EXPECT_EQ(backend.writes, 1);
+}
+TEST_F(ContextBufferTest, SharedFollowerDoesNotRefreshRetention)
+{
+    Open(1, 600000000000, true);
+    {
+        auto h = buffer.Get(Id(1), 0, false, false, 1);
+        ASSERT_TRUE(h);
+        std::memset(h.Data(), 7, 64);
+        h.MarkReady();
+    }
+    cfg.deviceId = 1;
+    cfg.updateAccessTime = false;
+    Context::TransBuffer follower;
+    ASSERT_TRUE(follower.Setup(cfg).Success());
+    EXPECT_EQ(follower.BatchAccessTime(), 0);
+    {
+        auto h = follower.Get(Id(1), 0);
+        ASSERT_TRUE(h);
+        EXPECT_TRUE(h.Ready());
+        EXPECT_EQ(*static_cast<char*>(h.Data()), 7);
+    }
+    Save(2);
+    EXPECT_EQ(backend.writes, 0);
+}
+TEST_F(ContextBufferTest, SharedWriterRefreshesAfterFollowerAccess)
+{
+    Open(1, 600000000000, true);
+    cfg.deviceId = 1;
+    cfg.updateAccessTime = false;
+    Context::TransBuffer follower;
+    ASSERT_TRUE(follower.Setup(cfg).Success());
+    {
+        auto h = follower.Get(Id(1), 0);
+        ASSERT_TRUE(h);
+        std::memset(h.Data(), 7, 64);
+        h.MarkReady();
+    }
+    const auto batchTime = buffer.BatchAccessTime();
+    ASSERT_GT(batchTime, 0);
+    {
+        auto h = buffer.Get(Id(1), 0, false, true, batchTime);
+        ASSERT_TRUE(h);
+        EXPECT_EQ(*static_cast<char*>(h.Data()), 7);
+    }
+    Save(2);
+    EXPECT_EQ(backend.writes, 1);
+}
+TEST_F(ContextBufferTest, PrivateBufferAlwaysUpdatesAccessTime)
+{
+    cfg.updateAccessTime = false;
+    Open(1, 600000000000);
+    EXPECT_GT(buffer.BatchAccessTime(), 0);
+    Save(1);
+    Save(2);
+    EXPECT_EQ(backend.writes, 1);
+}
+TEST_F(ContextBufferTest, DisabledRetentionDoesNotSampleBatchClock)
+{
+    Open();
+    EXPECT_EQ(buffer.BatchAccessTime(), 0);
+}
 TEST_F(ContextBufferTest, LoadedCleanShardDoesNotWriteAgain)
 {
     Open(1);

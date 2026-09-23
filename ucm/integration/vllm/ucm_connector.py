@@ -242,6 +242,16 @@ def _use_ucm_connector_cpu_affinity() -> bool:
     )
 
 
+def _should_update_context_access_time(
+    is_mla: bool, shared: bool, tp_rank: int, tp_size: int, local_rank: int
+) -> bool:
+    if not is_mla or not shared:
+        return True
+    # vLLM places TP ranks consecutively. Keep a writer at each TP boundary
+    # and at each host boundary when a TP group spans multiple shared buffers.
+    return tp_rank % tp_size == 0 or local_rank == 0
+
+
 def _worker_generate_unique_id() -> str:
     """Worker-side: broadcast a uuid and write to a per-instance file."""
     world_group = get_world_group()
@@ -1625,6 +1635,16 @@ class UCMDirectConnector(KVConnectorBase_V1):
         config["tensor_layout"] = "mla" if self.is_mla else "gqa"
         if self._role == KVConnectorRole.WORKER:
             config["device_id"] = self.device_id
+            config.setdefault(
+                "context_update_access_time",
+                _should_update_context_access_time(
+                    self.is_mla,
+                    bool(config["share_buffer_enable"]),
+                    self.tp_rank,
+                    self.tp_size,
+                    self.local_rank,
+                ),
+            )
             tensor_size_list = kv_cache_layout.tensor_size_list * self.blocks_per_chunk
             logical_shard_size = kv_cache_layout.shard_size * self.blocks_per_chunk
             logical_block_size = kv_cache_layout.block_size * self.blocks_per_chunk

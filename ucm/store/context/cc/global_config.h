@@ -59,6 +59,7 @@ struct Config {
     size_t streamNumber{4};
     bool cacheLoadBackendOnly{false};
     int64_t retentionNs{-1};
+    bool updateAccessTime{true};
     std::vector<uintptr_t> gpuKvBufferAddrs{};
     std::vector<size_t> gpuKvBufferSizes{};
     bool useGdr{false};

@@ -12,6 +12,10 @@ ucm_connectors:
       buffer_number: 1048576
       # null/-1: always Dump. Otherwise idle > retention means Drop.
       context_retention_ns: 60000000000
+      # Shared MLA: the connector selects one access-time writer per local TP
+      # group (also at host boundaries). Each task reuses one timestamp.
+      # Set true explicitly to restore updates on every rank for comparison.
+      # context_update_access_time: true
       cache_stream_number: 4
       cache_load_exclusive_buffer_number: 1024
       waiting_queue_depth: 8192

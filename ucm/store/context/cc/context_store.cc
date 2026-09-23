@@ -149,6 +149,7 @@ private:
         config.Get("unique_id", param.uniqueId);
         config.Get("cache_load_backend_only", param.cacheLoadBackendOnly);
         config.GetNumber("context_retention_ns", param.retentionNs);
+        config.Get("context_update_access_time", param.updateAccessTime);
         config.GetNumber("device_id", param.deviceId);
         size_t tensorSize = 0;
         config.GetNumber("tensor_size", tensorSize);
@@ -248,6 +249,7 @@ private:
         if (buildType.empty()) { buildType = "Release"; }
         UC_INFO("{}-{}({}).", ns, UCM_COMMIT_ID, buildType);
         UC_INFO("{}::RetentionNs={}; eviction unit=shard.", ns, config.retentionNs);
+        UC_INFO("{}::UpdateAccessTime={}.", ns, config.updateAccessTime);
         UC_INFO("Set {}::StoreBackend to {}.", ns, config.storeBackend->Readme());
         UC_INFO("Set {}::UniqueId to {}.", ns, config.uniqueId);
         UC_INFO("Set {}::CacheLoadBackendOnly to {}.", ns, config.cacheLoadBackendOnly);

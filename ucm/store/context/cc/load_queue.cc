@@ -113,11 +113,12 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
     size_t backendSubmitCount = 0;
     size_t waitShardCount = 0;
     const auto indexes = RearrangeIndex(nShard, deviceId_, localRankSize_);
+    const auto accessTime = buffer_->BatchAccessTime();
     for (size_t i = 0; i < nShard; i++) {
         auto& shard = task->desc[indexes[i]];
         ShardTask shardTask;
         shardTask.backendTaskHandle = 0;
-        shardTask.bufferHandle = buffer_->Get(shard.owner, shard.index, true, true);
+        shardTask.bufferHandle = buffer_->Get(shard.owner, shard.index, true, true, accessTime);
         if (!shardTask.bufferHandle) {
             task->Fail(Status::Error("failed to allocate Context buffer"));
             shardTask.task = task;
